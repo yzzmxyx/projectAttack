@@ -1,0 +1,507 @@
+import argparse
+import importlib
+import os
+import random
+import uuid
+
+import numpy as np
+import torch
+from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
+from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
+from prismatic.extern.hf.processing_prismatic import PrismaticProcessor
+from transformers import AutoConfig, AutoModelForVision2Seq, AutoProcessor
+
+from white_patch.UADA_rollout_online_env import OpenVLAOnlineEnvAttacker
+
+try:
+    import wandb
+except Exception:
+    wandb = None
+
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def check_online_env_dependencies():
+    try:
+        if importlib.util.find_spec("libero") is None:
+            raise ModuleNotFoundError("libero")
+        from libero.libero.envs import OffScreenRenderEnv  # noqa: F401
+    except Exception as exc:
+        raise RuntimeError(
+            "Online env rollout requires LIBERO dependencies, but they are not available. "
+            "Please install `libero` and ensure `OffScreenRenderEnv` is importable."
+        ) from exc
+
+
+def resolve_vla_path(dataset: str) -> str:
+    if "bridge_orig" in dataset:
+        return "openvla/openvla-7b"
+    if "libero_spatial" in dataset:
+        return "openvla/openvla-7b-finetuned-libero-spatial"
+    if "libero_object" in dataset:
+        return "openvla/openvla-7b-finetuned-libero-object"
+    if "libero_goal" in dataset:
+        return "openvla/openvla-7b-finetuned-libero-goal"
+    if "libero_10" in dataset:
+        return "openvla/openvla-7b-finetuned-libero-10"
+    raise ValueError("Invalid dataset")
+
+
+def main(args):
+    check_online_env_dependencies()
+
+    pwd = os.getcwd()
+    exp_id = str(uuid.uuid4())
+    vla_path = resolve_vla_path(args.dataset)
+
+    set_seed(42)
+    target = "all" if args.use_all_joints else "".join(str(i) for i in args.maskidx)
+    projection_size = args.projection_size if args.projection_size is not None else args.patch_size
+    task_suite_name = (
+        args.task_suite_name
+        if str(args.task_suite_name).lower() not in ("auto", "", "none", "null")
+        else f"auto({args.dataset})"
+    )
+    name = (
+        f"{args.dataset}_UADA_rollout_onlineEnv_atk{args.attack_mode}_lr{format(args.lr, '.0e')}_iter{args.iter}_"
+        f"phase1R{args.phase1_rollout}_phase2R{args.phase2_rollout}_"
+        f"lamA{args.lambda_action_gap}_lamH{args.lambda_history}_lamHL{args.lambda_history_legacy}_"
+        f"ceMode{args.online_ce_mode}_probe{int(args.probe_mode)}_{args.probe_variant}_"
+        f"autoTune{int(args.auto_gpu_tune)}_{args.gpu_tune_mode}_"
+        f"valDet{int(args.val_deterministic)}_valSeed{args.val_seed}_valNoLight{int(args.val_disable_lighting)}_"
+        f"allJ{int(args.use_all_joints)}_gripW{args.gripper_weight}_"
+        f"envAction{args.env_action_source}_taskBudget{args.online_train_tasks_per_iter}x{args.online_train_episodes_per_task}_"
+        f"valEps{args.online_val_episodes}_suite{task_suite_name}_"
+        f"lightAug{int(args.lighting_aug_enabled)}_{args.lighting_backend}_scope{args.ic_light_scope}_bg{args.ic_light_bg_control}_"
+        f"trainOnly{int(args.lighting_aug_train_only)}_pool{args.lighting_pool_size}_"
+        f"p1NoLight{int(args.phase1_disable_lighting)}_p1NoProjRand{int(args.phase1_disable_projection_randomization)}_"
+        f"target{target}_proj{projection_size}_seed42-{exp_id}"
+    )
+    if args.use_all_joints:
+        print("[Deprecation] --maskidx is ignored when --use_all_joints=true.")
+
+    use_wandb = args.wandb_project != "false" and wandb is not None
+    if args.wandb_project != "false" and wandb is None:
+        print("Warning: wandb is not available, fallback to local logging only.")
+
+    if use_wandb:
+        wandb.init(entity=args.wandb_entity, project=args.wandb_project, name=name, tags=args.tags)
+        wandb.config = {
+            "iteration": args.iter,
+            "learning_rate": args.lr,
+            "attack_target": "all" if args.use_all_joints else args.maskidx,
+            "use_all_joints": args.use_all_joints,
+            "gripper_weight": args.gripper_weight,
+            "accumulate_steps": args.accumulate,
+            "phase1_ratio": args.phase1_ratio,
+            "phase1_rollout": args.phase1_rollout,
+            "phase2_rollout": args.phase2_rollout,
+            "lambda_action_gap": args.lambda_action_gap,
+            "lambda_history": args.lambda_history,
+            "lambda_history_legacy": args.lambda_history_legacy,
+            "lambda_ce": args.lambda_ce,
+            "probe_mode": args.probe_mode,
+            "probe_variant": args.probe_variant,
+            "save_interval": args.save_interval,
+            "eval_enabled": args.eval_enabled,
+            "val_deterministic": args.val_deterministic,
+            "val_seed": args.val_seed,
+            "val_disable_lighting": args.val_disable_lighting,
+            "lighting_aug_enabled": args.lighting_aug_enabled,
+            "lighting_aug_train_only": args.lighting_aug_train_only,
+            "phase1_disable_lighting": args.phase1_disable_lighting,
+            "phase1_disable_projection_randomization": args.phase1_disable_projection_randomization,
+            "lighting_backend": args.lighting_backend,
+            "lighting_model_id": args.lighting_model_id,
+            "lighting_pool_size": args.lighting_pool_size,
+            "lighting_refresh_interval": args.lighting_refresh_interval,
+            "lighting_num_inference_steps": args.lighting_num_inference_steps,
+            "lighting_guidance_scale": args.lighting_guidance_scale,
+            "lighting_blend_min": args.lighting_blend_min,
+            "lighting_blend_max": args.lighting_blend_max,
+            "lighting_apply_prob": args.lighting_apply_prob,
+            "lighting_seed": args.lighting_seed,
+            "ic_light_repo": args.ic_light_repo,
+            "ic_light_model_path": args.ic_light_model_path,
+            "ic_light_scope": args.ic_light_scope,
+            "ic_light_bg_control": args.ic_light_bg_control,
+            "attack_mode": args.attack_mode,
+            "projection_size": projection_size,
+            "projection_alpha": args.projection_alpha,
+            "projection_alpha_jitter": args.projection_alpha_jitter,
+            "projection_soft_edge": args.projection_soft_edge,
+            "projection_angle": args.projection_angle,
+            "projection_fixed_angle": args.projection_fixed_angle,
+            "projection_shear": args.projection_shear,
+            "projection_scale_min": args.projection_scale_min,
+            "projection_scale_max": args.projection_scale_max,
+            "projection_region": args.projection_region,
+            "projection_lower_start": args.projection_lower_start,
+            "projection_width_ratio": args.projection_width_ratio,
+            "projection_height_ratio": args.projection_height_ratio,
+            "projection_margin_x": args.projection_margin_x,
+            "projection_keystone": args.projection_keystone,
+            "projection_keystone_jitter": args.projection_keystone_jitter,
+            "projector_gamma": args.projector_gamma,
+            "projector_gain": args.projector_gain,
+            "projector_channel_gain": args.projector_channel_gain,
+            "projector_ambient": args.projector_ambient,
+            "projector_vignetting": args.projector_vignetting,
+            "projector_distance_falloff": args.projector_distance_falloff,
+            "projector_psf": args.projector_psf,
+            "viz_enabled": args.viz_enabled,
+            "viz_policy": args.viz_policy,
+            "viz_samples": args.viz_samples,
+            "viz_save_best": args.viz_save_best,
+            "viz_save_last": args.viz_save_last,
+            "record_online_videos": args.record_online_videos,
+            "record_online_videos_last_only": args.record_online_videos_last_only,
+            "record_online_train_video": args.record_online_train_video,
+            "record_online_val_video": args.record_online_val_video,
+            "record_online_video_frame_source": args.record_online_video_frame_source,
+            "record_online_video_fps": args.record_online_video_fps,
+            "task_suite_name": args.task_suite_name,
+            "online_train_tasks_per_iter": args.online_train_tasks_per_iter,
+            "online_train_episodes_per_task": args.online_train_episodes_per_task,
+            "online_val_episodes": args.online_val_episodes,
+            "num_steps_wait": args.num_steps_wait,
+            "max_env_steps": args.max_env_steps,
+            "env_resolution": args.env_resolution,
+            "online_ce_mode": args.online_ce_mode,
+            "env_action_source": args.env_action_source,
+            "env_seed": args.env_seed,
+            "auto_gpu_tune": args.auto_gpu_tune,
+            "gpu_tune_mode": args.gpu_tune_mode,
+            "gpu_mem_low": args.gpu_mem_low,
+            "gpu_mem_high": args.gpu_mem_high,
+            "gpu_mem_hard_cap": args.gpu_mem_hard_cap,
+            "gpu_util_low": args.gpu_util_low,
+            "gpu_tune_cooldown_iters": args.gpu_tune_cooldown_iters,
+            "gpu_tune_min_rollout": args.gpu_tune_min_rollout,
+            "gpu_tune_max_rollout": args.gpu_tune_max_rollout,
+            "gpu_tune_min_tasks_per_iter": args.gpu_tune_min_tasks_per_iter,
+            "gpu_tune_max_tasks_per_iter": args.gpu_tune_max_tasks_per_iter,
+        }
+
+    print(f"exp_id:{exp_id}")
+    path = f"{pwd}/run/UADA_rollout_online_env/{exp_id}"
+    os.makedirs(path, exist_ok=True)
+
+    AutoConfig.register("openvla", OpenVLAConfig)
+    AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
+    AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+
+    processor = AutoProcessor.from_pretrained(vla_path, trust_remote_code=True)
+    vla = AutoModelForVision2Seq.from_pretrained(
+        vla_path,
+        torch_dtype=torch.bfloat16,
+        quantization_config=None,
+        low_cpu_mem_usage=True,
+        trust_remote_code=True,
+    )
+    device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
+    vla = vla.to(device)
+
+    attacker = OpenVLAOnlineEnvAttacker(vla, processor, path, optimizer="adamW", resize_patch=args.resize_patch)
+    attacker.online_attack_unconstrained(
+        num_iter=args.iter,
+        patch_size=args.patch_size,
+        projection_size=projection_size,
+        lr=args.lr,
+        accumulate_steps=args.accumulate,
+        maskidx=args.maskidx,
+        use_all_joints=args.use_all_joints,
+        gripper_weight=args.gripper_weight,
+        warmup=args.warmup,
+        geometry=args.geometry,
+        args=args,
+        phase1_ratio=args.phase1_ratio,
+        phase1_rollout=args.phase1_rollout,
+        phase2_rollout=args.phase2_rollout,
+        lambda_action_gap=args.lambda_action_gap,
+        lambda_history=args.lambda_history,
+        lambda_history_legacy=args.lambda_history_legacy,
+        lambda_ce=args.lambda_ce,
+        save_interval=args.save_interval,
+        eval_enabled=args.eval_enabled,
+        lighting_aug_enabled=args.lighting_aug_enabled,
+        lighting_aug_train_only=args.lighting_aug_train_only,
+        lighting_backend=args.lighting_backend,
+        lighting_model_id=args.lighting_model_id,
+        lighting_pool_size=args.lighting_pool_size,
+        lighting_refresh_interval=args.lighting_refresh_interval,
+        lighting_num_inference_steps=args.lighting_num_inference_steps,
+        lighting_guidance_scale=args.lighting_guidance_scale,
+        lighting_blend_min=args.lighting_blend_min,
+        lighting_blend_max=args.lighting_blend_max,
+        lighting_apply_prob=args.lighting_apply_prob,
+        lighting_seed=args.lighting_seed,
+        ic_light_repo=args.ic_light_repo,
+        ic_light_model_path=args.ic_light_model_path,
+        ic_light_scope=args.ic_light_scope,
+        ic_light_bg_control=args.ic_light_bg_control,
+        attack_mode=args.attack_mode,
+        phase1_disable_lighting=args.phase1_disable_lighting,
+        phase1_disable_projection_randomization=args.phase1_disable_projection_randomization,
+        projection_alpha=args.projection_alpha,
+        projection_alpha_jitter=args.projection_alpha_jitter,
+        projection_soft_edge=args.projection_soft_edge,
+        projection_angle=args.projection_angle,
+        projection_fixed_angle=args.projection_fixed_angle,
+        projection_shear=args.projection_shear,
+        projection_scale_min=args.projection_scale_min,
+        projection_scale_max=args.projection_scale_max,
+        projection_region=args.projection_region,
+        projection_lower_start=args.projection_lower_start,
+        projection_width_ratio=args.projection_width_ratio,
+        projection_height_ratio=args.projection_height_ratio,
+        projection_margin_x=args.projection_margin_x,
+        projection_keystone=args.projection_keystone,
+        projection_keystone_jitter=args.projection_keystone_jitter,
+        projector_gamma=args.projector_gamma,
+        projector_gain=args.projector_gain,
+        projector_channel_gain=args.projector_channel_gain,
+        projector_ambient=args.projector_ambient,
+        projector_vignetting=args.projector_vignetting,
+        projector_distance_falloff=args.projector_distance_falloff,
+        projector_psf=args.projector_psf,
+        viz_enabled=args.viz_enabled,
+        viz_policy=args.viz_policy,
+        viz_samples=args.viz_samples,
+        viz_save_best=args.viz_save_best,
+        viz_save_last=args.viz_save_last,
+        record_online_videos=args.record_online_videos,
+        record_online_videos_last_only=args.record_online_videos_last_only,
+        record_online_train_video=args.record_online_train_video,
+        record_online_val_video=args.record_online_val_video,
+        record_online_video_frame_source=args.record_online_video_frame_source,
+        record_online_video_fps=args.record_online_video_fps,
+        task_suite_name=args.task_suite_name,
+        online_train_tasks_per_iter=args.online_train_tasks_per_iter,
+        online_train_episodes_per_task=args.online_train_episodes_per_task,
+        online_val_episodes=args.online_val_episodes,
+        num_steps_wait=args.num_steps_wait,
+        max_env_steps=args.max_env_steps,
+        env_resolution=args.env_resolution,
+        online_ce_mode=args.online_ce_mode,
+        env_action_source=args.env_action_source,
+        env_seed=args.env_seed,
+        val_deterministic=args.val_deterministic,
+        val_seed=args.val_seed,
+        val_disable_lighting=args.val_disable_lighting,
+        probe_mode=args.probe_mode,
+        probe_variant=args.probe_variant,
+        auto_gpu_tune=args.auto_gpu_tune,
+        gpu_tune_mode=args.gpu_tune_mode,
+        gpu_mem_low=args.gpu_mem_low,
+        gpu_mem_high=args.gpu_mem_high,
+        gpu_mem_hard_cap=args.gpu_mem_hard_cap,
+        gpu_util_low=args.gpu_util_low,
+        gpu_tune_cooldown_iters=args.gpu_tune_cooldown_iters,
+        gpu_tune_min_rollout=args.gpu_tune_min_rollout,
+        gpu_tune_max_rollout=args.gpu_tune_max_rollout,
+        gpu_tune_min_tasks_per_iter=args.gpu_tune_min_tasks_per_iter,
+        gpu_tune_max_tasks_per_iter=args.gpu_tune_max_tasks_per_iter,
+    )
+    print("Online env rollout attack done!")
+
+
+def arg_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--maskidx", default="0,1,2", type=list_of_ints)
+    parser.add_argument("--use_all_joints", type=str2bool, default=False)
+    parser.add_argument("--gripper_weight", default=0.5, type=float)
+    parser.add_argument("--lr", default=1e-3, type=float)
+    parser.add_argument("--device", default=0, type=int)
+    parser.add_argument("--iter", default=2000, type=int)
+    parser.add_argument("--accumulate", default=1, type=int)
+    parser.add_argument("--bs", default=1, type=int)
+    parser.add_argument("--warmup", default=20, type=int)
+    parser.add_argument("--tags", nargs="+", default=[""])
+    parser.add_argument("--geometry", type=str2bool, nargs="?", default=True)
+    parser.add_argument("--patch_size", default="3,50,50", type=list_of_ints)
+    parser.add_argument("--attack_mode", default="projection", type=str)
+    parser.add_argument("--projection_size", default=None, type=list_of_ints_or_none)
+    parser.add_argument("--projection_alpha", default=0.55, type=float)
+    parser.add_argument("--projection_alpha_jitter", default=0.10, type=float)
+    parser.add_argument("--projection_soft_edge", default=1.2, type=float)
+    parser.add_argument("--projection_angle", default=25.0, type=float)
+    parser.add_argument("--projection_fixed_angle", type=str2bool, default=False)
+    parser.add_argument("--projection_shear", default=0.15, type=float)
+    parser.add_argument("--projection_scale_min", default=0.8, type=float)
+    parser.add_argument("--projection_scale_max", default=1.2, type=float)
+    parser.add_argument("--projection_region", default="lower_half_fixed", type=str)
+    parser.add_argument("--projection_lower_start", default=0.5, type=float)
+    parser.add_argument("--projection_width_ratio", default=0.96, type=float)
+    parser.add_argument("--projection_height_ratio", default=1.0, type=float)
+    parser.add_argument("--projection_margin_x", default=0.02, type=float)
+    parser.add_argument("--projection_keystone", default=0.12, type=float)
+    parser.add_argument("--projection_keystone_jitter", default=0.03, type=float)
+    parser.add_argument("--projector_gamma", default=1.8, type=float)
+    parser.add_argument("--projector_gain", default=1.35, type=float)
+    parser.add_argument("--projector_channel_gain", default="1.08,1.04,1.00", type=list_of_floats)
+    parser.add_argument("--projector_ambient", default=0.08, type=float)
+    parser.add_argument("--projector_vignetting", default=0.08, type=float)
+    parser.add_argument("--projector_distance_falloff", default=0.10, type=float)
+    parser.add_argument("--projector_psf", type=str2bool, default=False)
+    parser.add_argument("--wandb_project", default="false", type=str)
+    parser.add_argument("--wandb_entity", default="xxx", type=str)
+    parser.add_argument("--dataset", default="libero_spatial", type=str)
+    parser.add_argument("--resize_patch", type=str2bool, default=False)
+    parser.add_argument("--server", default="/home/yxx/projectAttack", type=str)
+
+    parser.add_argument("--phase1_ratio", default=0.4, type=float)
+    parser.add_argument("--phase1_rollout", default=8, type=int)
+    parser.add_argument("--phase2_rollout", default=24, type=int)
+    parser.add_argument("--lambda_action_gap", default=1.0, type=float)
+    parser.add_argument("--lambda_history", default=0.5, type=float)
+    parser.add_argument("--lambda_history_legacy", default=0.0, type=float)
+    parser.add_argument("--lambda_ce", default=0.1, type=float)
+    parser.add_argument("--probe_mode", type=str2bool, default=False)
+    parser.add_argument("--probe_variant", default="", type=str)
+    parser.add_argument("--save_interval", default=100, type=int)
+    parser.add_argument("--eval_enabled", type=str2bool, default=True)
+    parser.add_argument("--val_deterministic", type=str2bool, default=False)
+    parser.add_argument("--val_seed", default=42, type=int)
+    parser.add_argument("--val_disable_lighting", type=str2bool, default=False)
+    parser.add_argument("--lighting_aug_enabled", type=str2bool, default=False)
+    parser.add_argument("--lighting_aug_train_only", type=str2bool, default=False)
+    parser.add_argument("--phase1_disable_lighting", type=str2bool, default=False)
+    parser.add_argument("--phase1_disable_projection_randomization", type=str2bool, default=False)
+    parser.add_argument("--lighting_backend", default="ic_light", type=str)
+    parser.add_argument("--lighting_model_id", default="stabilityai/sdxl-turbo", type=str)
+    parser.add_argument("--lighting_pool_size", default=8, type=int)
+    parser.add_argument("--lighting_refresh_interval", default=200, type=int)
+    parser.add_argument("--lighting_num_inference_steps", default=8, type=int)
+    parser.add_argument("--lighting_guidance_scale", default=7.0, type=float)
+    parser.add_argument("--lighting_blend_min", default=0.15, type=float)
+    parser.add_argument("--lighting_blend_max", default=0.5, type=float)
+    parser.add_argument("--lighting_apply_prob", default=1.0, type=float)
+    parser.add_argument("--lighting_seed", default=42, type=int)
+    parser.add_argument("--ic_light_repo", default="/home/yxx/IC-Light", type=str)
+    parser.add_argument(
+        "--ic_light_model_path",
+        default="/home/yxx/IC-Light/models/iclight_sd15_fbc.safetensors",
+        type=str,
+    )
+    parser.add_argument("--ic_light_scope", default="full", type=str)
+    parser.add_argument("--ic_light_bg_control", default="legacy_prompt", type=str)
+    parser.add_argument("--viz_enabled", type=str2bool, default=True)
+    parser.add_argument("--viz_policy", default="milestone", type=str)
+    parser.add_argument("--viz_samples", default=4, type=int)
+    parser.add_argument("--viz_save_best", type=str2bool, default=True)
+    parser.add_argument("--viz_save_last", type=str2bool, default=True)
+    parser.add_argument("--record_online_videos", type=str2bool, default=False)
+    parser.add_argument("--record_online_videos_last_only", type=str2bool, default=True)
+    parser.add_argument("--record_online_train_video", type=str2bool, default=False)
+    parser.add_argument("--record_online_val_video", type=str2bool, default=False)
+    parser.add_argument("--record_online_video_frame_source", default="projected_input", type=str)
+    parser.add_argument("--record_online_video_fps", default=10, type=int)
+
+    parser.add_argument("--task_suite_name", default="auto", type=str)
+    parser.add_argument("--online_train_tasks_per_iter", default=1, type=int)
+    parser.add_argument("--online_train_episodes_per_task", default=1, type=int)
+    parser.add_argument("--online_val_episodes", default=8, type=int)
+    parser.add_argument("--num_steps_wait", default=10, type=int)
+    parser.add_argument("--max_env_steps", default="auto_by_suite", type=str)
+    parser.add_argument("--env_resolution", default=256, type=int)
+    parser.add_argument("--online_ce_mode", default="pseudo_clean", type=str)
+    parser.add_argument("--env_action_source", default="adv", type=str)
+    parser.add_argument("--env_seed", default=42, type=int)
+    parser.add_argument("--auto_gpu_tune", type=str2bool, default=False)
+    parser.add_argument("--gpu_tune_mode", default="stable", type=str)
+    parser.add_argument("--gpu_mem_low", default=0.82, type=float)
+    parser.add_argument("--gpu_mem_high", default=0.92, type=float)
+    parser.add_argument("--gpu_mem_hard_cap", default=0.95, type=float)
+    parser.add_argument("--gpu_util_low", default=70, type=int)
+    parser.add_argument("--gpu_tune_cooldown_iters", default=2, type=int)
+    parser.add_argument("--gpu_tune_min_rollout", default=8, type=int)
+    parser.add_argument("--gpu_tune_max_rollout", default=192, type=int)
+    parser.add_argument("--gpu_tune_min_tasks_per_iter", default=1, type=int)
+    parser.add_argument("--gpu_tune_max_tasks_per_iter", default=2, type=int)
+    return parser.parse_args()
+
+
+def list_of_ints(arg):
+    return list(map(int, arg.split(",")))
+
+
+def list_of_ints_or_none(arg):
+    if arg is None:
+        return None
+    value = str(arg).strip().lower()
+    if value in ("none", "null", ""):
+        return None
+    return list(map(int, str(arg).split(",")))
+
+
+def list_of_floats(arg):
+    if isinstance(arg, (list, tuple)):
+        return [float(x) for x in arg]
+    return [float(x) for x in str(arg).split(",")]
+
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    if value.lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    if value.lower() in ("no", "false", "f", "n", "0"):
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected.")
+
+
+if __name__ == "__main__":
+    args = arg_parser()
+    print(
+        "Paramters:\n"
+        f" dataset:{args.dataset}\n task_suite_name:{args.task_suite_name}\n"
+        f" online_train_tasks_per_iter:{args.online_train_tasks_per_iter}\n"
+        f" online_train_episodes_per_task:{args.online_train_episodes_per_task}\n"
+        f" online_val_episodes:{args.online_val_episodes}\n"
+        f" num_steps_wait:{args.num_steps_wait}\n max_env_steps:{args.max_env_steps}\n"
+        f" env_resolution:{args.env_resolution}\n online_ce_mode:{args.online_ce_mode}\n"
+        f" env_action_source:{args.env_action_source}\n env_seed:{args.env_seed}\n"
+        f" auto_gpu_tune:{args.auto_gpu_tune}\n gpu_tune_mode:{args.gpu_tune_mode}\n"
+        f" gpu_mem_low:{args.gpu_mem_low}\n gpu_mem_high:{args.gpu_mem_high}\n"
+        f" gpu_mem_hard_cap:{args.gpu_mem_hard_cap}\n gpu_util_low:{args.gpu_util_low}\n"
+        f" gpu_tune_cooldown_iters:{args.gpu_tune_cooldown_iters}\n"
+        f" gpu_tune_min_rollout:{args.gpu_tune_min_rollout}\n gpu_tune_max_rollout:{args.gpu_tune_max_rollout}\n"
+        f" gpu_tune_min_tasks_per_iter:{args.gpu_tune_min_tasks_per_iter}\n"
+        f" gpu_tune_max_tasks_per_iter:{args.gpu_tune_max_tasks_per_iter}\n"
+        f" maskidx:{args.maskidx}\n use_all_joints:{args.use_all_joints}\n gripper_weight:{args.gripper_weight}\n"
+        f" lr:{args.lr}\n device:{args.device}\n tags:{args.tags}\n"
+        f" attack_mode:{args.attack_mode}\n projection_size:{args.projection_size}\n"
+        f" phase1_ratio:{args.phase1_ratio}\n phase1_rollout:{args.phase1_rollout}\n"
+        f" phase2_rollout:{args.phase2_rollout}\n lambda_action_gap:{args.lambda_action_gap}\n"
+        f" lambda_history:{args.lambda_history}\n lambda_history_legacy:{args.lambda_history_legacy}\n"
+        f" lambda_ce:{args.lambda_ce}\n probe_mode:{args.probe_mode}\n probe_variant:{args.probe_variant}\n"
+        f" save_interval:{args.save_interval}\n eval_enabled:{args.eval_enabled}\n"
+        f" val_deterministic:{args.val_deterministic}\n val_seed:{args.val_seed}\n"
+        f" val_disable_lighting:{args.val_disable_lighting}\n"
+        f" phase1_disable_lighting:{args.phase1_disable_lighting}\n"
+        f" phase1_disable_projection_randomization:{args.phase1_disable_projection_randomization}\n"
+        f" lighting_backend:{args.lighting_backend}\n lighting_model_id:{args.lighting_model_id}\n"
+        f" lighting_pool_size:{args.lighting_pool_size}\n lighting_refresh_interval:{args.lighting_refresh_interval}\n"
+        f" lighting_num_inference_steps:{args.lighting_num_inference_steps}\n lighting_guidance_scale:{args.lighting_guidance_scale}\n"
+        f" lighting_blend_min:{args.lighting_blend_min}\n lighting_blend_max:{args.lighting_blend_max}\n"
+        f" lighting_apply_prob:{args.lighting_apply_prob}\n lighting_seed:{args.lighting_seed}\n"
+        f" ic_light_repo:{args.ic_light_repo}\n ic_light_model_path:{args.ic_light_model_path}\n"
+        f" ic_light_scope:{args.ic_light_scope}\n ic_light_bg_control:{args.ic_light_bg_control}\n"
+        f" record_online_videos:{args.record_online_videos}\n"
+        f" record_online_videos_last_only:{args.record_online_videos_last_only}\n"
+        f" record_online_train_video:{args.record_online_train_video}\n"
+        f" record_online_val_video:{args.record_online_val_video}\n"
+        f" record_online_video_frame_source:{args.record_online_video_frame_source}\n"
+        f" record_online_video_fps:{args.record_online_video_fps}\n"
+    )
+    main(args)

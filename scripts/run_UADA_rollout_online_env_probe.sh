@@ -14,8 +14,13 @@ LOG_DIR="${PROBE_ROOT}/logs"
 SUMMARY_CSV="${PROBE_ROOT}/probe_summary.csv"
 mkdir -p "${LOG_DIR}"
 
+# Historical probe baseline used for fair comparisons against newer GT runs.
+DATASET_NAME="${DATASET:-libero_spatial}"
+ACTION_GAP_MODE_NAME="${ACTION_GAP_MODE:-clean_adv}"
+PHASE_STATE_MODE_NAME="${PHASE_STATE_MODE:-initial_only}"
+
 cat > "${SUMMARY_CSV}" <<'EOF'
-variant,exp_id,run_dir,iter,lambda_action_gap,lambda_history,lambda_history_legacy,lambda_ce,online_ce_mode,final_val_done_rate,final_val_episode_len,final_val_action_gap,final_val_history1,final_val_history2,final_val_ce,final_val_ce_objective,final_val_rollout_score,final_val_objective_score
+variant,exp_id,run_dir,iter,lambda_action_gap,lambda_history,lambda_history_legacy,lambda_ce,online_ce_mode,action_gap_mode_active,final_val_done_rate,final_val_episode_len,final_val_action_gap,final_val_gt_action_gap,final_val_active_action_gap,final_val_history1,final_val_history2,final_val_ce,final_val_ce_objective,final_val_rollout_score,final_val_gt_rollout_score,final_val_active_rollout_score,final_val_objective_score,final_val_gt_objective_score,final_val_active_objective_score
 EOF
 
 echo "Probe root: ${PROBE_ROOT}"
@@ -70,7 +75,7 @@ run_variant() {
         --projector_distance_falloff 0.10 \
         --projector_psf false \
         --wandb_project "false" \
-        --dataset "libero_spatial" \
+        --dataset "${DATASET_NAME}" \
         --resize_patch false \
         --phase1_ratio 0.4 \
         --phase1_rollout 8 \
@@ -121,6 +126,12 @@ run_variant() {
         --max_env_steps "auto_by_suite" \
         --env_resolution 256 \
         --online_ce_mode "${online_ce_mode}" \
+        --action_gap_mode "${ACTION_GAP_MODE_NAME}" \
+        --gt_dataset_root "${GT_DATASET_ROOT:-/home/yxx/roboticAttack/openvla-main/dataset}" \
+        --gt_action_bank_path "${GT_ACTION_BANK_PATH:-}" \
+        --gt_softmin_tau "${GT_SOFTMIN_TAU:-0.05}" \
+        --phase_state_mode "${PHASE_STATE_MODE_NAME}" \
+        --phase_state_cache_path "${PHASE_STATE_CACHE_PATH:-}" \
         --env_action_source "adv" \
         --env_seed 42 \
         --probe_mode true \
@@ -160,15 +171,22 @@ fieldnames = [
     "lambda_history_legacy",
     "lambda_ce",
     "online_ce_mode",
+    "action_gap_mode_active",
     "final_val_done_rate",
     "final_val_episode_len",
     "final_val_action_gap",
+    "final_val_gt_action_gap",
+    "final_val_active_action_gap",
     "final_val_history1",
     "final_val_history2",
     "final_val_ce",
     "final_val_ce_objective",
     "final_val_rollout_score",
+    "final_val_gt_rollout_score",
+    "final_val_active_rollout_score",
     "final_val_objective_score",
+    "final_val_gt_objective_score",
+    "final_val_active_objective_score",
 ]
 row = {
     "variant": data["variant"],
@@ -180,15 +198,22 @@ row = {
     "lambda_history_legacy": data["lambda_history_legacy"],
     "lambda_ce": data["lambda_ce"],
     "online_ce_mode": data["online_ce_mode"],
+    "action_gap_mode_active": data["action_gap_mode_active"],
     "final_val_done_rate": data["final_val_done_rate"],
     "final_val_episode_len": data["final_val_episode_len"],
     "final_val_action_gap": data["final_val_action_gap"],
+    "final_val_gt_action_gap": data["final_val_gt_action_gap"],
+    "final_val_active_action_gap": data["final_val_active_action_gap"],
     "final_val_history1": data["final_val_history1"],
     "final_val_history2": data["final_val_history2"],
     "final_val_ce": data["final_val_ce"],
     "final_val_ce_objective": data["final_val_ce_objective"],
     "final_val_rollout_score": data["final_val_rollout_score"],
+    "final_val_gt_rollout_score": data["final_val_gt_rollout_score"],
+    "final_val_active_rollout_score": data["final_val_active_rollout_score"],
     "final_val_objective_score": data["final_val_objective_score"],
+    "final_val_gt_objective_score": data["final_val_gt_objective_score"],
+    "final_val_active_objective_score": data["final_val_active_objective_score"],
 }
 with open(summary_csv, "a", newline="") as file:
     writer = csv.DictWriter(file, fieldnames=fieldnames)

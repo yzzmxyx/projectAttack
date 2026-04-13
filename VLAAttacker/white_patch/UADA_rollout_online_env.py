@@ -1,9 +1,11 @@
 import csv
 import json
+import math
 import os
 import pickle
 import random
 import subprocess
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import cv2
@@ -23,22 +25,59 @@ except Exception:
     from UADA_rollout import IGNORE_INDEX, OpenVLAAttacker
 
 try:
+    from white_patch.gt_phase_schedule import clamp_phase_boundary_ratios, infer_gt_phase_for_step
+except Exception:
+    from gt_phase_schedule import clamp_phase_boundary_ratios, infer_gt_phase_for_step
+
+try:
     import wandb
 except Exception:
     wandb = None
+
+
+DEFAULT_SIGLIP_MODEL_NAME = "google/siglip-so400m-patch14-384"
 
 
 class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
     def _reset_metric_buffers(self):
         super()._reset_metric_buffers()
         self.train_rollout_history_div_legacy = []
+        self.train_rollout_siglip_distance = []
         self.train_rollout_objective_score = []
+        self.train_gt_rollout_action_gap = []
+        self.train_gt_rollout_action_gap_joints = []
+        self.train_gt_rollout_score = []
+        self.train_gt_rollout_objective_score = []
+        self.train_active_rollout_action_gap = []
+        self.train_active_rollout_score = []
+        self.train_active_rollout_objective_score = []
         self.val_rollout_objective_score = []
+        self.val_rollout_siglip_distance = []
+        self.val_gt_rollout_action_gap = []
+        self.val_gt_rollout_action_gap_joints = []
+        self.val_gt_rollout_score = []
+        self.val_gt_rollout_objective_score = []
+        self.val_active_rollout_action_gap = []
+        self.val_active_rollout_score = []
+        self.val_active_rollout_objective_score = []
         self.train_online_done_rate = []
         self.train_online_episode_len = []
         self.val_online_done_rate = []
         self.val_online_episode_len = []
         self._recent_train_oom = False
+        self._gt_expert_cache = {"train": {}, "val": {}}
+        self._gt_expert_cache_stats = {"train": {}, "val": {}}
+        self._action_gap_mode = "clean_adv"
+        self._gt_dataset_root = ""
+        self._gt_phase_action_bank = {}
+        self._gt_phase_action_bank_stats = {}
+        self._gt_phase_boundary_ratios = {}
+        self._gt_action_bank_path = ""
+        self._gt_softmin_tau = 0.05
+        self._phase_state_cache = {}
+        self._phase_state_cache_records = {}
+        self._phase_state_cache_stats = {}
+        self._phase_state_cache_path = ""
 
     def _probe_metrics_path(self):
         return os.path.join(self.save_dir, "probe_metrics.csv")
@@ -54,17 +93,28 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             "rollout_steps_used",
             "horizon_type",
             "action_gap",
+            "gt_action_gap",
             "history1",
             "history2",
             "ce",
             "ce_objective",
+            "siglip_distance",
             "rollout_score",
+            "gt_rollout_score",
             "objective_score",
+            "gt_objective_score",
+            "action_gap_mode_active",
+            "active_action_gap",
+            "active_rollout_score",
+            "active_objective_score",
             "episode_len",
             "done_rate",
             "action_gap_joint_0",
             "action_gap_joint_1",
             "action_gap_joint_2",
+            "gt_action_gap_joint_0",
+            "gt_action_gap_joint_1",
+            "gt_action_gap_joint_2",
             "projection_alpha_mean",
             "projection_coverage_ratio",
             "projection_bottom_ratio",
@@ -168,6 +218,574 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         print(f"[OnlineVideo] saved {split_name} video to {video_path}")
         return True
 
+    def _normalize_instruction_key(self, instruction):
+        text = str(instruction).lower().replace("\n", " ").strip()
+        text = " ".join(text.split())
+        while text.endswith(".") or text.endswith("?"):
+            text = text[:-1].rstrip()
+        return text
+
+    def _resolve_gt_dataset_name(self, dataset_name):
+        dataset_key = str(dataset_name).lower().strip()
+        mapping = {
+            "bridge_orig": "bridge_orig",
+            "libero_spatial": "libero_spatial_no_noops",
+            "libero_object": "libero_object_no_noops",
+            "libero_goal": "libero_goal_no_noops",
+            "libero_10": "libero_10_no_noops",
+        }
+        if dataset_key not in mapping:
+            raise ValueError(f"Unsupported GT dataset for online action-gap mode: `{dataset_name}`.")
+        return mapping[dataset_key]
+
+    def _resolve_default_sidecar_path(self, dataset_name, filename):
+        sidecar_dataset = self._resolve_gt_dataset_name(dataset_name)
+        project_root = Path(__file__).resolve().parents[2]
+        return project_root / "data" / "libero_sidecars" / sidecar_dataset / str(filename)
+
+    def _resolve_optional_path(self, value, dataset_name, filename):
+        path_value = "" if value is None else str(value).strip()
+        if path_value.lower() in ("", "none", "null", "auto"):
+            return self._resolve_default_sidecar_path(dataset_name, filename)
+        return Path(os.path.abspath(os.path.expanduser(path_value)))
+
+    def _normalize_phase_start_name(self, phase_name):
+        name = str(phase_name).lower().strip()
+        aliases = {
+            "": "initial",
+            "pre_contact": "initial",
+            "default": "initial",
+            "init": "initial",
+            "initial": "initial",
+            "contact": "contact_manipulate",
+            "contact_manipulate": "contact_manipulate",
+            "post": "post_contact",
+            "post_contact": "post_contact",
+        }
+        if name not in aliases:
+            raise ValueError(f"Unsupported phase start name: `{phase_name}`.")
+        return aliases[name]
+
+    def _phase_start_to_gt_phase(self, phase_start_name):
+        name = self._normalize_phase_start_name(phase_start_name)
+        if name == "initial":
+            return "pre_contact"
+        return name
+
+    def _phase_start_for_counter(self, phase_state_mode, counter):
+        mode = str(phase_state_mode).lower().strip()
+        if mode == "initial_only":
+            return "initial"
+        if mode != "phase_cycle":
+            raise ValueError("--phase_state_mode must be one of {initial_only, phase_cycle}")
+        phases = ("initial", "contact_manipulate", "post_contact")
+        return phases[int(counter) % len(phases)]
+
+    def _load_gt_phase_boundary_ratios(self, phase_parquet_path, required_instruction_keys):
+        ratios = {}
+        phase_path = Path(phase_parquet_path)
+        if not phase_path.exists():
+            return ratios
+        try:
+            import pandas as pd
+        except Exception:
+            return ratios
+
+        df = pd.read_parquet(
+            phase_path,
+            columns=["episode_key", "instruction", "T", "phase", "phase_start_t"],
+        )
+        required = set(required_instruction_keys)
+        for instruction, inst_df in df.groupby("instruction", sort=False):
+            instruction_key = self._normalize_instruction_key(instruction)
+            if instruction_key not in required:
+                continue
+            contact_ratios = []
+            post_ratios = []
+            for _episode_key, episode_df in inst_df.groupby("episode_key", sort=False):
+                T = int(episode_df["T"].iloc[0])
+                if T <= 1:
+                    continue
+                contact_rows = episode_df[episode_df["phase"] == "contact_manipulate"]
+                post_rows = episode_df[episode_df["phase"] == "post_contact"]
+                if len(contact_rows) > 0:
+                    contact_ratios.append(float(contact_rows["phase_start_t"].iloc[0]) / float(T))
+                if len(post_rows) > 0:
+                    post_ratios.append(float(post_rows["phase_start_t"].iloc[0]) / float(T))
+            if contact_ratios and post_ratios:
+                ratios[instruction_key] = {
+                    "contact_ratio": float(np.median(np.asarray(contact_ratios, dtype=np.float32))),
+                    "post_ratio": float(np.median(np.asarray(post_ratios, dtype=np.float32))),
+                }
+        return ratios
+
+    def _build_gt_phase_action_bank(self, gt_action_bank_path, dataset_name, required_instruction_keys, action_dim):
+        bank_path = self._resolve_optional_path(gt_action_bank_path, dataset_name, "action_bank.pt")
+        if not bank_path.exists():
+            raise FileNotFoundError(
+                f"GT action bank not found: `{bank_path}`. Build it with build_libero_action_bank.py first."
+            )
+
+        raw_bank = torch.load(bank_path, map_location="cpu")
+        required = set(required_instruction_keys)
+        merged = {}
+        source_group_counts = {}
+        for key, value in raw_bank.items():
+            if not isinstance(key, tuple) or len(key) < 3:
+                continue
+            instruction_key = self._normalize_instruction_key(key[0])
+            phase_name = self._phase_start_to_gt_phase(key[1])
+            if instruction_key not in required:
+                continue
+            actions = value["actions"] if isinstance(value, dict) else value
+            actions = torch.as_tensor(actions, dtype=torch.float32).reshape(-1, int(action_dim))
+            merged.setdefault((instruction_key, phase_name), []).append(actions.cpu())
+            source_group_counts[(instruction_key, phase_name)] = source_group_counts.get((instruction_key, phase_name), 0) + 1
+
+        missing = [
+            (instruction, phase)
+            for instruction in sorted(required)
+            for phase in ("pre_contact", "contact_manipulate", "post_contact")
+            if (instruction, phase) not in merged
+        ]
+        if missing:
+            preview = ", ".join(f"{instruction}/{phase}" for instruction, phase in missing[:5])
+            if len(missing) > 5:
+                preview += ", ..."
+            raise RuntimeError(f"Missing GT action-bank phase groups: {preview}")
+
+        phase_bank = {}
+        group_sizes = []
+        for key, parts in merged.items():
+            actions = torch.cat(parts, dim=0).contiguous().cpu()
+            phase_bank[key] = actions
+            group_sizes.append(int(actions.shape[0]))
+
+        phase_parquet_path = bank_path.with_name("phases.parquet")
+        self._gt_phase_action_bank = phase_bank
+        self._gt_phase_boundary_ratios = self._load_gt_phase_boundary_ratios(
+            phase_parquet_path=phase_parquet_path,
+            required_instruction_keys=required,
+        )
+        self._gt_action_bank_path = str(bank_path)
+        self._gt_phase_action_bank_stats = {
+            "path": str(bank_path),
+            "num_phase_groups": int(len(phase_bank)),
+            "num_instructions": int(len(required)),
+            "min_group_size": int(min(group_sizes)) if group_sizes else 0,
+            "max_group_size": int(max(group_sizes)) if group_sizes else 0,
+            "mean_group_size": float(sum(group_sizes) / float(max(1, len(group_sizes)))),
+            "source_progress_bin_groups": int(sum(source_group_counts.values())),
+            "phase_boundary_ratio_instructions": int(len(self._gt_phase_boundary_ratios)),
+        }
+        self._gt_expert_cache_stats = {
+            "train": {
+                "num_instructions": int(len(required)),
+                "candidate_trajectories_mean": float(sum(group_sizes) / float(max(1, len(group_sizes)))),
+                "candidate_trajectories_min": int(min(group_sizes)) if group_sizes else 0,
+                "candidate_trajectories_max": int(max(group_sizes)) if group_sizes else 0,
+            },
+            "val": {
+                "num_instructions": int(len(required)),
+                "candidate_trajectories_mean": float(sum(group_sizes) / float(max(1, len(group_sizes)))),
+                "candidate_trajectories_min": int(min(group_sizes)) if group_sizes else 0,
+                "candidate_trajectories_max": int(max(group_sizes)) if group_sizes else 0,
+            },
+        }
+        self._gt_dataset_root = str(bank_path.parent)
+
+    def _load_phase_state_cache(self, phase_state_cache_path, dataset_name):
+        cache_path = self._resolve_optional_path(phase_state_cache_path, dataset_name, "phase_state_cache.pt")
+        if not cache_path.exists():
+            raise FileNotFoundError(
+                f"Phase-state cache not found: `{cache_path}`. Build it with build_libero_phase_state_cache.py first."
+            )
+        payload = torch.load(cache_path, map_location="cpu")
+        raw_states = payload.get("states", payload) if isinstance(payload, dict) else payload
+        states = {}
+        for key, value in raw_states.items():
+            if not isinstance(key, tuple) or len(key) != 3:
+                continue
+            task_id, init_state_idx, phase_name = key
+            normalized_phase = self._normalize_phase_start_name(phase_name)
+            states[(int(task_id), int(init_state_idx), normalized_phase)] = torch.as_tensor(value, dtype=torch.float32).cpu()
+        if not states:
+            raise RuntimeError(f"Phase-state cache `{cache_path}` did not contain any usable states.")
+        self._phase_state_cache = states
+        self._phase_state_cache_records = payload.get("records", {}) if isinstance(payload, dict) else {}
+        self._phase_state_cache_path = str(cache_path)
+        self._phase_state_cache_stats = {
+            "path": str(cache_path),
+            "num_states": int(len(states)),
+            "num_records": int(len(self._phase_state_cache_records)),
+            "schema_version": int(payload.get("schema_version", 0)) if isinstance(payload, dict) else 0,
+        }
+
+    def _resolve_phase_start_state(self, task_id, init_state_idx, phase_start_name, default_init_state):
+        phase_name = self._normalize_phase_start_name(phase_start_name)
+        if phase_name == "initial":
+            return default_init_state
+        key = (int(task_id), int(init_state_idx), phase_name)
+        if key not in self._phase_state_cache:
+            raise RuntimeError(
+                f"Missing cached phase state for task_id={task_id}, init_state_idx={init_state_idx}, phase={phase_name}."
+            )
+        return self._phase_state_cache[key].detach().cpu().numpy()
+
+    def _get_gt_phase_boundary_ratio_pair(self, task_description):
+        instruction_key = self._normalize_instruction_key(task_description)
+        ratios = self._gt_phase_boundary_ratios.get(instruction_key, {})
+        return clamp_phase_boundary_ratios(
+            ratios.get("contact_ratio", 0.3),
+            ratios.get("post_ratio", 0.7),
+        )
+
+    def _infer_gt_phase_for_step(self, split, task_description, step_idx, horizon, phase_start_name):
+        phase_start = self._normalize_phase_start_name(phase_start_name)
+        contact_ratio, post_ratio = self._get_gt_phase_boundary_ratio_pair(task_description)
+        return infer_gt_phase_for_step(
+            step_idx=step_idx,
+            horizon=horizon,
+            phase_start_name=phase_start,
+            contact_ratio=contact_ratio,
+            post_ratio=post_ratio,
+        )
+
+    def _gt_cache_batch_transform(self, rlds_batch):
+        instruction = rlds_batch["task"]["language_instruction"]
+        if isinstance(instruction, bytes):
+            instruction_text = instruction.decode()
+        else:
+            instruction_text = str(instruction)
+        action = np.asarray(rlds_batch["action"], dtype=np.float32)
+        if action.ndim > 1:
+            action = action[0]
+        return {
+            "instruction_key": self._normalize_instruction_key(instruction_text),
+            "normalized_action": np.asarray(action, dtype=np.float32),
+        }
+
+    def _fit_continuous_action_dim_tensor(self, action, action_dim):
+        vector = torch.as_tensor(action, dtype=torch.float32).reshape(-1)
+        if vector.shape[0] == int(action_dim):
+            return vector
+        out = torch.zeros((int(action_dim),), dtype=torch.float32)
+        copy_dim = min(int(action_dim), int(vector.shape[0]))
+        if copy_dim > 0:
+            out[:copy_dim] = vector[:copy_dim]
+        return out
+
+    def _collect_required_gt_instruction_keys(self, task_suite):
+        required_keys = set()
+        for task_id in range(int(task_suite.n_tasks)):
+            task = task_suite.get_task(task_id)
+            instruction_key = self._normalize_instruction_key(getattr(task, "language", ""))
+            if instruction_key == "":
+                raise ValueError(f"Task {task_id} is missing a valid language instruction for GT cache alignment.")
+            required_keys.add(instruction_key)
+        if len(required_keys) == 0:
+            raise ValueError("No task instructions found while preparing GT action-gap cache.")
+        return required_keys
+
+    def _build_gt_expert_cache(self, gt_dataset_root, dataset_name, required_instruction_keys, action_dim):
+        try:
+            from prismatic.vla.datasets import EpisodicRLDSDataset
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to import EpisodicRLDSDataset for GT action-gap mode. "
+                "Please ensure RLDS dataset dependencies are installed."
+            ) from exc
+
+        data_root_dir = Path(os.path.abspath(os.path.expanduser(str(gt_dataset_root))))
+        if not data_root_dir.exists():
+            raise FileNotFoundError(f"GT dataset root does not exist: `{data_root_dir}`.")
+
+        gt_dataset_name = self._resolve_gt_dataset_name(dataset_name)
+        required_keys_sorted = sorted(required_instruction_keys)
+        expert_cache = {}
+        expert_cache_stats = {}
+
+        for split_name, train_flag in (("train", True), ("val", False)):
+            split_cache = {key: [] for key in required_keys_sorted}
+            dataset = EpisodicRLDSDataset(
+                data_root_dir=data_root_dir,
+                data_mix=gt_dataset_name,
+                batch_transform=self._gt_cache_batch_transform,
+                resize_resolution=(224, 224),
+                shuffle_buffer_size=1,
+                train=train_flag,
+                image_aug=False,
+            )
+            for episode in dataset:
+                if not episode:
+                    continue
+                instruction_key = str(episode[0].get("instruction_key", ""))
+                if instruction_key not in required_instruction_keys:
+                    continue
+                trajectory_actions = [
+                    self._fit_continuous_action_dim_tensor(step["normalized_action"], action_dim=action_dim) for step in episode
+                ]
+                if len(trajectory_actions) == 0:
+                    continue
+                split_cache[instruction_key].append(torch.stack(trajectory_actions, dim=0).cpu())
+
+            missing_keys = [key for key in required_keys_sorted if len(split_cache.get(key, [])) == 0]
+            if missing_keys:
+                preview = ", ".join(missing_keys[:5])
+                if len(missing_keys) > 5:
+                    preview += ", ..."
+                raise RuntimeError(
+                    f"Missing GT expert trajectories for split `{split_name}` in `{data_root_dir}` "
+                    f"dataset `{gt_dataset_name}`. Missing instructions: {preview}"
+                )
+
+            candidate_counts = [len(split_cache[key]) for key in required_keys_sorted]
+            mean_count = float(sum(candidate_counts) / float(max(1, len(candidate_counts))))
+            expert_cache[split_name] = split_cache
+            expert_cache_stats[split_name] = {
+                "num_instructions": int(len(required_keys_sorted)),
+                "candidate_trajectories_mean": float(mean_count),
+                "candidate_trajectories_min": int(min(candidate_counts)),
+                "candidate_trajectories_max": int(max(candidate_counts)),
+            }
+
+        self._gt_expert_cache = expert_cache
+        self._gt_expert_cache_stats = expert_cache_stats
+        self._gt_dataset_root = str(data_root_dir)
+
+    def _gt_cache_log_fields(self):
+        train_stats = self._gt_expert_cache_stats.get("train", {})
+        val_stats = self._gt_expert_cache_stats.get("val", {})
+        fields = {
+            "gt_dataset_root": str(self._gt_dataset_root),
+            "gt_cache_train_num_instructions": int(train_stats.get("num_instructions", 0)),
+            "gt_cache_val_num_instructions": int(val_stats.get("num_instructions", 0)),
+            "gt_cache_train_candidate_trajectories_mean": float(train_stats.get("candidate_trajectories_mean", 0.0)),
+            "gt_cache_train_candidate_trajectories_min": int(train_stats.get("candidate_trajectories_min", 0)),
+            "gt_cache_train_candidate_trajectories_max": int(train_stats.get("candidate_trajectories_max", 0)),
+            "gt_cache_val_candidate_trajectories_mean": float(val_stats.get("candidate_trajectories_mean", 0.0)),
+            "gt_cache_val_candidate_trajectories_min": int(val_stats.get("candidate_trajectories_min", 0)),
+            "gt_cache_val_candidate_trajectories_max": int(val_stats.get("candidate_trajectories_max", 0)),
+        }
+        phase_stats = self._gt_phase_action_bank_stats
+        fields.update(
+            {
+                "gt_action_bank_path": str(self._gt_action_bank_path),
+                "gt_action_bank_num_phase_groups": int(phase_stats.get("num_phase_groups", 0)),
+                "gt_action_bank_min_group_size": int(phase_stats.get("min_group_size", 0)),
+                "gt_action_bank_max_group_size": int(phase_stats.get("max_group_size", 0)),
+                "gt_action_bank_mean_group_size": float(phase_stats.get("mean_group_size", 0.0)),
+                "gt_action_bank_phase_boundary_ratio_instructions": int(
+                    phase_stats.get("phase_boundary_ratio_instructions", 0)
+                ),
+                "gt_softmin_tau": float(self._gt_softmin_tau),
+                "phase_state_cache_path": str(self._phase_state_cache_path),
+                "phase_state_cache_num_states": int(self._phase_state_cache_stats.get("num_states", 0)),
+            }
+        )
+        return fields
+
+    def _get_gt_candidate_actions(self, split, task_description, step_idx, horizon, action_dim, phase_name=None):
+        split_name = "val" if str(split).lower().strip() == "val" else "train"
+        instruction_key = self._normalize_instruction_key(task_description)
+        if self._gt_phase_action_bank:
+            gt_phase = self._phase_start_to_gt_phase(phase_name or "initial")
+            candidate_actions = self._gt_phase_action_bank.get((instruction_key, gt_phase))
+            if candidate_actions is None or candidate_actions.numel() == 0:
+                raise RuntimeError(
+                    f"Missing GT action-bank candidates for instruction `{instruction_key}` phase `{gt_phase}` "
+                    f"under `{self._gt_action_bank_path}`."
+                )
+            candidate_actions = candidate_actions.to(self.vla.device, dtype=torch.float32)
+            if candidate_actions.shape[-1] != int(action_dim):
+                candidate_actions = torch.stack(
+                    [self._fit_continuous_action_dim_tensor(action, action_dim=int(action_dim)) for action in candidate_actions],
+                    dim=0,
+                ).to(self.vla.device, dtype=torch.float32)
+            return candidate_actions, int(candidate_actions.shape[0]), instruction_key, gt_phase
+
+        split_cache = self._gt_expert_cache.get(split_name, {})
+        trajectories = split_cache.get(instruction_key, [])
+        if len(trajectories) == 0:
+            raise RuntimeError(
+                f"Missing GT candidates for split `{split_name}` instruction `{instruction_key}` "
+                f"under `{self._gt_dataset_root}`."
+            )
+
+        effective_horizon = max(1, int(horizon))
+        progress = 0.0 if effective_horizon <= 1 else float(step_idx) / float(max(1, effective_horizon - 1))
+        selected_actions = []
+        for trajectory in trajectories:
+            traj_len = int(trajectory.shape[0])
+            candidate_idx = 0 if traj_len <= 1 else int(round(progress * float(traj_len - 1)))
+            candidate_idx = max(0, min(traj_len - 1, candidate_idx))
+            selected_actions.append(trajectory[candidate_idx])
+
+        candidate_actions = torch.stack(selected_actions, dim=0).to(self.vla.device, dtype=torch.float32)
+        if candidate_actions.shape[-1] != int(action_dim):
+            candidate_actions = torch.stack(
+            [self._fit_continuous_action_dim_tensor(action, action_dim=int(action_dim)) for action in candidate_actions],
+                dim=0,
+            ).to(self.vla.device, dtype=torch.float32)
+        return candidate_actions, int(candidate_actions.shape[0]), instruction_key, self._phase_start_to_gt_phase(phase_name or "initial")
+
+    def _compute_gt_action_gap_losses(
+        self,
+        adv_logits,
+        labels_full,
+        action_mask_full,
+        gt_candidate_actions,
+        maskidx,
+        use_all_joints,
+        gripper_weight,
+        gt_softmin_tau=0.05,
+    ):
+        batch_size = labels_full.shape[0]
+        adv_action_logits = self._extract_action_logits(adv_logits, labels_full)
+        seq_len = min(action_mask_full.shape[1], adv_action_logits.shape[1])
+        action_mask = action_mask_full[:, :seq_len]
+        adv_action_logits = adv_action_logits[:, :seq_len, :]
+        adv_pred_tokens = adv_action_logits.argmax(dim=-1) + 31744
+
+        masked_adv_logits = adv_action_logits[action_mask]
+        if masked_adv_logits.numel() == 0 or gt_candidate_actions is None or gt_candidate_actions.numel() == 0:
+            zero = torch.zeros((), device=self.vla.device, dtype=torch.float32)
+            per_joint_zero = torch.zeros((self.default_action_dim,), device=self.vla.device, dtype=torch.float32)
+            return zero, zero.detach(), per_joint_zero, adv_pred_tokens.detach()
+
+        num_actions = int(masked_adv_logits.shape[0] // max(1, batch_size))
+        if num_actions <= 0:
+            zero = torch.zeros((), device=self.vla.device, dtype=torch.float32)
+            per_joint_zero = torch.zeros((self.default_action_dim,), device=self.vla.device, dtype=torch.float32)
+            return zero, zero.detach(), per_joint_zero, adv_pred_tokens.detach()
+
+        adv_probs = F.softmax(masked_adv_logits, dim=-1)
+        adv_soft_actions = (adv_probs * self.action_bin_centers).sum(dim=-1).view(batch_size, num_actions)
+        adv_hard_tokens = masked_adv_logits.argmax(dim=-1) + 31744
+        adv_hard_actions = self._decode_action_tokens(adv_hard_tokens, batch_size, num_actions)
+
+        gt_candidate_actions = gt_candidate_actions.to(self.vla.device, dtype=torch.float32)
+        if gt_candidate_actions.ndim != 2:
+            raise ValueError("GT candidate actions must have shape [num_candidates, action_dim].")
+        if gt_candidate_actions.shape[1] != num_actions:
+            gt_candidate_actions = torch.stack(
+                [self._fit_continuous_action_dim_tensor(action, action_dim=num_actions) for action in gt_candidate_actions],
+                dim=0,
+            ).to(self.vla.device, dtype=torch.float32)
+
+        idx_tensor, joint_weights = self._select_joint_indices_and_weights(
+            num_actions=num_actions,
+            maskidx=maskidx,
+            use_all_joints=use_all_joints,
+            gripper_weight=gripper_weight,
+        )
+        if idx_tensor.numel() == 0:
+            zero = torch.zeros((), device=self.vla.device, dtype=torch.float32)
+            per_joint_zero = torch.zeros((self.default_action_dim,), device=self.vla.device, dtype=torch.float32)
+            return zero, zero.detach(), per_joint_zero, adv_pred_tokens.detach()
+
+        loss_action_gap, metric_action_gap, per_joint_l1 = self._compute_weighted_action_set_objective(
+            adv_soft_actions=adv_soft_actions,
+            adv_hard_actions=adv_hard_actions,
+            gt_candidate_actions=gt_candidate_actions,
+            idx_tensor=idx_tensor,
+            joint_weights=joint_weights,
+            tau=gt_softmin_tau,
+        )
+        return loss_action_gap, metric_action_gap.detach(), per_joint_l1.detach(), adv_pred_tokens.detach()
+
+    @staticmethod
+    def _compute_weighted_action_set_objective(
+        adv_soft_actions,
+        adv_hard_actions,
+        gt_candidate_actions,
+        idx_tensor,
+        joint_weights,
+        tau,
+    ):
+        selected_adv_soft = adv_soft_actions.index_select(1, idx_tensor)
+        selected_adv_hard = adv_hard_actions.index_select(1, idx_tensor)
+        selected_gt_candidates = gt_candidate_actions.index_select(1, idx_tensor)
+        weight_denom = joint_weights.sum().clamp(min=1e-6)
+
+        soft_squared = torch.square(selected_adv_soft[:, None, :] - selected_gt_candidates[None, :, :])
+        weighted_soft_squared = (soft_squared * joint_weights.view(1, 1, -1)).sum(dim=-1) / weight_denom
+        tau = max(float(tau), 1e-6)
+        num_candidates = max(1, int(selected_gt_candidates.shape[0]))
+        soft_min_distance = -tau * (
+            torch.logsumexp(-weighted_soft_squared / tau, dim=1) - math.log(float(num_candidates))
+        )
+        loss_action_gap = soft_min_distance.mean()
+
+        hard_squared = torch.square(selected_adv_hard[:, None, :] - selected_gt_candidates[None, :, :])
+        weighted_hard_squared = (hard_squared * joint_weights.view(1, 1, -1)).sum(dim=-1) / weight_denom
+        nearest_idx = weighted_hard_squared.argmin(dim=1)
+        nearest_actions = gt_candidate_actions.index_select(0, nearest_idx)
+        per_joint_l1 = torch.abs(adv_hard_actions - nearest_actions).mean(dim=0)
+        metric_action_gap = weighted_hard_squared.min(dim=1).values.mean()
+        return loss_action_gap, metric_action_gap, per_joint_l1
+
+    def _load_siglip_image_model(self, model_name):
+        from transformers import SiglipModel
+
+        model = SiglipModel.from_pretrained(str(model_name)).to(self.vla.device)
+        model.eval()
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        return model
+
+    def _as_siglip_image_batch(self, images):
+        if isinstance(images, (list, tuple)):
+            if len(images) == 0:
+                return torch.empty((0, 3, 1, 1), device=self.vla.device, dtype=torch.float32)
+            batch = torch.stack([image.to(self.vla.device, dtype=torch.float32) for image in images], dim=0)
+        else:
+            batch = images.to(self.vla.device, dtype=torch.float32)
+            if batch.ndim == 3:
+                batch = batch.unsqueeze(0)
+        if batch.ndim != 4:
+            raise ValueError(f"Expected SigLIP image batch with 3 or 4 dims, got shape {tuple(batch.shape)}.")
+        return torch.clamp(batch[:, :3, :, :], 0.0, 1.0)
+
+    def _siglip_resize_center_crop(self, images, input_size):
+        input_size = max(1, int(input_size))
+        if images.numel() == 0:
+            return images
+        height = int(images.shape[-2])
+        width = int(images.shape[-1])
+        if height <= 0 or width <= 0:
+            raise ValueError(f"Invalid SigLIP image shape: {tuple(images.shape)}.")
+        scale = float(input_size) / float(min(height, width))
+        resized_h = max(input_size, int(round(float(height) * scale)))
+        resized_w = max(input_size, int(round(float(width) * scale)))
+        resized = F.interpolate(images, size=(resized_h, resized_w), mode="bilinear", align_corners=False)
+        top = max(0, (resized_h - input_size) // 2)
+        left = max(0, (resized_w - input_size) // 2)
+        return resized[:, :, top : top + input_size, left : left + input_size]
+
+    def _compute_siglip_embedding_distance(self, siglip_model, reference_images, projected_images, input_size=384):
+        if siglip_model is None:
+            return torch.zeros((), device=self.vla.device, dtype=torch.float32)
+
+        reference_batch = self._siglip_resize_center_crop(
+            self._as_siglip_image_batch(reference_images).detach(),
+            input_size=input_size,
+        )
+        projected_batch = self._siglip_resize_center_crop(
+            self._as_siglip_image_batch(projected_images),
+            input_size=input_size,
+        )
+        if projected_batch.numel() == 0:
+            return torch.zeros((), device=self.vla.device, dtype=torch.float32)
+
+        with torch.no_grad():
+            reference_features = siglip_model.get_image_features(pixel_values=reference_batch)
+            reference_features = F.normalize(reference_features.float(), dim=-1)
+        projected_features = siglip_model.get_image_features(pixel_values=projected_batch)
+        projected_features = F.normalize(projected_features.float(), dim=-1)
+        cosine_similarity = F.cosine_similarity(reference_features, projected_features, dim=-1)
+        return 1.0 - cosine_similarity.mean()
+
     def online_attack_unconstrained(
         self,
         num_iter=5000,
@@ -187,6 +805,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         lambda_history=0.5,
         lambda_history_legacy=0.0,
         lambda_ce=0.0,
+        lambda_siglip=0.0,
+        siglip_model_name=DEFAULT_SIGLIP_MODEL_NAME,
+        siglip_input_size=384,
         save_interval=100,
         eval_enabled=True,
         lighting_aug_enabled=False,
@@ -246,6 +867,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         online_ce_mode="pseudo_clean",
         env_action_source="adv",
         env_seed=42,
+        dataset_name="libero_spatial",
+        action_gap_mode="clean_adv",
+        gt_dataset_root="/home/yxx/roboticAttack/openvla-main/dataset",
         val_deterministic=False,
         val_seed=42,
         val_disable_lighting=False,
@@ -268,6 +892,10 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         gpu_tune_max_rollout=192,
         gpu_tune_min_tasks_per_iter=1,
         gpu_tune_max_tasks_per_iter=2,
+        phase_state_mode="initial_only",
+        phase_state_cache_path="",
+        gt_softmin_tau=0.05,
+        gt_action_bank_path="",
     ):
         del env_action_source  # current implementation uses adv action for stepping by default
         self._reset_metric_buffers()
@@ -302,7 +930,13 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         phase2_rollout = max(1, int(phase2_rollout))
         use_all_joints = bool(use_all_joints)
         gripper_weight = float(gripper_weight)
+        lambda_action_gap = float(lambda_action_gap)
+        lambda_history = float(lambda_history)
         lambda_history_legacy = float(lambda_history_legacy)
+        lambda_ce = float(lambda_ce)
+        lambda_siglip = float(lambda_siglip)
+        siglip_model_name = str(siglip_model_name)
+        siglip_input_size = max(1, int(siglip_input_size))
         eval_enabled = bool(eval_enabled)
         self.lighting_aug_train_only = bool(lighting_aug_train_only)
         phase1_disable_lighting = bool(phase1_disable_lighting)
@@ -315,6 +949,16 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         online_val_episodes = max(1, int(online_val_episodes))
         num_steps_wait = max(0, int(num_steps_wait))
         env_resolution = max(64, int(env_resolution))
+        dataset_name = str(dataset_name).strip()
+        action_gap_mode = str(action_gap_mode).lower().strip()
+        if action_gap_mode not in ("clean_adv", "gt_farthest"):
+            raise ValueError("--action_gap_mode must be one of {clean_adv, gt_farthest}")
+        gt_dataset_root = os.path.abspath(os.path.expanduser(str(gt_dataset_root)))
+        gt_softmin_tau = max(float(gt_softmin_tau), 1e-6)
+        self._gt_softmin_tau = gt_softmin_tau
+        phase_state_mode = str(phase_state_mode).lower().strip()
+        if phase_state_mode not in ("initial_only", "phase_cycle"):
+            raise ValueError("--phase_state_mode must be one of {initial_only, phase_cycle}")
         val_deterministic = bool(val_deterministic)
         val_seed = int(val_seed)
         val_disable_lighting = bool(val_disable_lighting)
@@ -349,6 +993,14 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         if online_ce_mode == "off":
             lambda_ce = 0.0
 
+        siglip_model = None
+        if lambda_siglip > 0.0:
+            siglip_model = self._load_siglip_image_model(model_name=siglip_model_name)
+            print(
+                "[OnlineEnv] SigLIP objective enabled "
+                f"(model={siglip_model_name}, input_size={siglip_input_size}, lambda_siglip={lambda_siglip})"
+            )
+
         if viz_enabled and not eval_enabled:
             print("[OnlineViz] `viz_enabled=true` but `eval_enabled=false`; visualization will be skipped.")
 
@@ -377,9 +1029,39 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         unnorm_key = self._resolve_unnorm_key(resolved_suite_name)
         action_stats = self.vla.get_action_stats(unnorm_key)
         action_dim = len(action_stats["q01"])
+        self._action_gap_mode = action_gap_mode
+        self._gt_dataset_root = gt_dataset_root
+        if action_gap_mode == "gt_farthest":
+            required_instruction_keys = self._collect_required_gt_instruction_keys(task_suite)
+            self._build_gt_phase_action_bank(
+                gt_action_bank_path=gt_action_bank_path,
+                dataset_name=dataset_name,
+                required_instruction_keys=required_instruction_keys,
+                action_dim=action_dim,
+            )
+        else:
+            self._gt_expert_cache = {"train": {}, "val": {}}
+            self._gt_expert_cache_stats = {"train": {}, "val": {}}
+            self._gt_phase_action_bank = {}
+            self._gt_phase_action_bank_stats = {}
+            self._gt_phase_boundary_ratios = {}
+            self._gt_action_bank_path = ""
+        if phase_state_mode == "phase_cycle":
+            self._load_phase_state_cache(
+                phase_state_cache_path=phase_state_cache_path,
+                dataset_name=dataset_name,
+            )
+        else:
+            self._phase_state_cache = {}
+            self._phase_state_cache_records = {}
+            self._phase_state_cache_stats = {}
+            self._phase_state_cache_path = ""
         print(
             "[OnlineEnv] initialized "
-            f"(suite={resolved_suite_name}, action_dim={action_dim}, max_env_steps={max_env_steps}, ce_mode={online_ce_mode})"
+            f"(suite={resolved_suite_name}, action_dim={action_dim}, max_env_steps={max_env_steps}, ce_mode={online_ce_mode}, "
+            f"action_gap_mode={action_gap_mode}, lambda_siglip={lambda_siglip}, gt_dataset_root={gt_dataset_root}, "
+            f"gt_action_bank_path={self._gt_action_bank_path}, phase_state_mode={phase_state_mode}, "
+            f"phase_state_cache_path={self._phase_state_cache_path}, gt_softmin_tau={gt_softmin_tau})"
         )
         gpu_tuner_state = self._init_gpu_tuner_state(
             enabled=auto_gpu_tune,
@@ -404,6 +1086,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             )
 
         optimizer.zero_grad()
+        train_phase_start_counter = 0
         for i in tqdm(range(num_iter)):
             phase_id = 1 if i < phase1_end_iter else 2
             base_rollout_steps = base_phase1_rollout if phase_id == 1 else base_phase2_rollout
@@ -438,10 +1121,12 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             train_video_episode = None
 
             train_action_gap = 0.0
+            train_gt_action_gap = 0.0
             train_history_div = 0.0
             train_history_div_legacy = 0.0
             train_ce = 0.0
             train_ce_objective = 0.0
+            train_siglip_distance = 0.0
             train_proj_alpha = 0.0
             train_proj_coverage = 0.0
             train_proj_bottom = 0.0
@@ -451,7 +1136,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             train_episodes_done = 0.0
             train_episode_len = 0.0
             train_per_joint_gap = None
+            train_gt_per_joint_gap = None
             train_episode_count = 0
+            train_phase_start_counts = {"initial": 0, "contact_manipulate": 0, "post_contact": 0}
 
             for task_id in train_task_ids:
                 task = task_suite.get_task(task_id)
@@ -459,12 +1146,24 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 env, task_description = get_libero_env(task, "openvla", resolution=env_resolution)
                 try:
                     for episode_idx in range(online_train_episodes_per_task):
-                        init_state = self._sample_init_state(init_states, i, episode_idx)
+                        init_state_idx = self._sample_init_state_index(init_states, i, episode_idx)
+                        if init_state_idx is None:
+                            continue
+                        init_state = init_states[init_state_idx]
+                        phase_start_name = self._phase_start_for_counter(phase_state_mode, train_phase_start_counter)
+                        train_phase_start_counter += 1
+                        train_phase_start_counts[phase_start_name] = train_phase_start_counts.get(phase_start_name, 0) + 1
+                        phase_init_state = self._resolve_phase_start_state(
+                            task_id=task_id,
+                            init_state_idx=init_state_idx,
+                            phase_start_name=phase_start_name,
+                            default_init_state=init_state,
+                        )
                         episode = self._run_online_episode(
                             env=env,
                             get_libero_image=get_libero_image,
                             get_libero_dummy_action=get_libero_dummy_action,
-                            init_state=init_state,
+                            init_state=phase_init_state,
                             task_description=task_description,
                             projection_texture=projection_texture,
                             rollout_steps=rollout_steps,
@@ -481,6 +1180,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                             lambda_history=lambda_history,
                             lambda_history_legacy=lambda_history_legacy,
                             lambda_ce=lambda_ce,
+                            lambda_siglip=lambda_siglip,
+                            siglip_model=siglip_model,
+                            siglip_input_size=siglip_input_size,
                             online_ce_mode=online_ce_mode,
                             attack_mode=attack_mode,
                             projection_alpha=projection_alpha,
@@ -513,16 +1215,21 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                             task_id=task_id,
                             record_video_frames=bool(should_record_train_video and (train_video_episode is None)),
                             video_frame_source=record_online_video_frame_source,
+                            action_gap_mode=action_gap_mode,
+                            start_phase_name=phase_start_name,
+                            gt_softmin_tau=gt_softmin_tau,
                         )
                         if episode is None:
                             continue
 
                         train_episode_count += 1
                         train_action_gap += episode["action_gap"]
+                        train_gt_action_gap += episode["gt_action_gap"]
                         train_history_div += episode["history_div"]
                         train_history_div_legacy += episode["history_div_legacy"]
                         train_ce += episode["ce_value"]
                         train_ce_objective += episode["ce_objective_value"]
+                        train_siglip_distance += episode["siglip_distance"]
                         train_proj_alpha += episode["projection_alpha"]
                         train_proj_coverage += episode["projection_coverage"]
                         train_proj_bottom += episode["projection_bottom"]
@@ -532,6 +1239,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                         train_episodes_done += float(episode["done"])
                         train_episode_len += float(episode["episode_len"])
                         train_per_joint_gap = self._accumulate_joint_values(train_per_joint_gap, episode["per_joint_gap"])
+                        train_gt_per_joint_gap = self._accumulate_joint_values(train_gt_per_joint_gap, episode["gt_per_joint_gap"])
                         if should_record_train_video and (train_video_episode is None) and self._should_dump_online_episode_video(episode):
                             train_video_episode = episode
                 finally:
@@ -558,10 +1266,12 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 scheduler.step()
 
             avg_action_gap = train_action_gap / float(max(1, train_episode_count))
+            avg_gt_action_gap = train_gt_action_gap / float(max(1, train_episode_count))
             avg_history_div = train_history_div / float(max(1, train_episode_count))
             avg_history_div_legacy = train_history_div_legacy / float(max(1, train_episode_count))
             avg_ce = train_ce / float(max(1, train_episode_count))
             avg_ce_objective = train_ce_objective / float(max(1, train_episode_count))
+            avg_siglip_distance = train_siglip_distance / float(max(1, train_episode_count))
             avg_proj_alpha = train_proj_alpha / float(max(1, train_episode_count))
             avg_proj_coverage = train_proj_coverage / float(max(1, train_episode_count))
             avg_proj_bottom = train_proj_bottom / float(max(1, train_episode_count))
@@ -569,12 +1279,24 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             avg_done_rate = train_episodes_done / float(max(1, train_episode_count))
             avg_ep_len = train_episode_len / float(max(1, train_episode_count))
             avg_per_joint_gap = self._normalize_joint_values(train_per_joint_gap, float(max(1, train_episode_count)))
+            avg_gt_per_joint_gap = self._normalize_joint_values(train_gt_per_joint_gap, float(max(1, train_episode_count)))
             rollout_score = (
                 (lambda_action_gap * avg_action_gap)
                 + (lambda_history * avg_history_div)
                 + (lambda_history_legacy * avg_history_div_legacy)
+                + (lambda_siglip * avg_siglip_distance)
+            )
+            gt_rollout_score = (
+                (lambda_action_gap * avg_gt_action_gap)
+                + (lambda_history * avg_history_div)
+                + (lambda_history_legacy * avg_history_div_legacy)
+                + (lambda_siglip * avg_siglip_distance)
             )
             objective_score = rollout_score - (lambda_ce * avg_ce_objective)
+            gt_objective_score = gt_rollout_score - (lambda_ce * avg_ce_objective)
+            active_action_gap = avg_gt_action_gap if action_gap_mode == "gt_farthest" else avg_action_gap
+            active_rollout_score = gt_rollout_score if action_gap_mode == "gt_farthest" else rollout_score
+            active_objective_score = gt_objective_score if action_gap_mode == "gt_farthest" else objective_score
             gpu_stats = self._collect_gpu_runtime_stats(device_index=gpu_tuner_state["device_index"])
             autotune_action = "hold(disabled)"
             if auto_gpu_tune:
@@ -590,19 +1312,35 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             self.train_rollout_action_gap_joints.append(avg_per_joint_gap.detach().cpu().tolist())
             self.train_rollout_history_div.append(avg_history_div)
             self.train_rollout_history_div_legacy.append(avg_history_div_legacy)
+            self.train_rollout_siglip_distance.append(avg_siglip_distance)
             self.train_rollout_score.append(rollout_score)
             self.train_rollout_objective_score.append(objective_score)
+            self.train_gt_rollout_action_gap.append(avg_gt_action_gap)
+            self.train_gt_rollout_action_gap_joints.append(avg_gt_per_joint_gap.detach().cpu().tolist())
+            self.train_gt_rollout_score.append(gt_rollout_score)
+            self.train_gt_rollout_objective_score.append(gt_objective_score)
+            self.train_active_rollout_action_gap.append(active_action_gap)
+            self.train_active_rollout_score.append(active_rollout_score)
+            self.train_active_rollout_objective_score.append(active_objective_score)
             self.train_phase_id.append(phase_id)
             self.train_online_done_rate.append(avg_done_rate)
             self.train_online_episode_len.append(avg_ep_len)
-            self.loss_buffer.append(objective_score if probe_mode else rollout_score)
+            self.loss_buffer.append(active_rollout_score)
 
             train_logdata = {
                 "TRAIN_online_rollout_action_gap": avg_action_gap,
+                "TRAIN_online_gt_action_gap": avg_gt_action_gap,
                 "TRAIN_online_rollout_history_div": avg_history_div,
                 "TRAIN_online_rollout_history_div_legacy": avg_history_div_legacy,
+                "TRAIN_online_siglip_distance": avg_siglip_distance,
                 "TRAIN_online_rollout_score": rollout_score,
+                "TRAIN_online_gt_rollout_score": gt_rollout_score,
                 "TRAIN_online_objective_score": objective_score,
+                "TRAIN_online_gt_objective_score": gt_objective_score,
+                "TRAIN_action_gap_mode_active": str(action_gap_mode),
+                "TRAIN_online_active_action_gap": active_action_gap,
+                "TRAIN_online_active_rollout_score": active_rollout_score,
+                "TRAIN_online_active_objective_score": active_objective_score,
                 "TRAIN_online_done_rate": avg_done_rate,
                 "TRAIN_online_episode_len": avg_ep_len,
                 "TRAIN_online_ce": avg_ce,
@@ -628,9 +1366,18 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 "TRAIN_eff_phase2_rollout": int(eff_phase2_rollout),
                 "TRAIN_eff_online_train_tasks_per_iter": int(eff_train_tasks_per_iter),
                 "TRAIN_autotune_action": str(autotune_action),
+                "TRAIN_phase_state_mode": str(phase_state_mode),
+                "TRAIN_phase_start_initial_count": int(train_phase_start_counts.get("initial", 0)),
+                "TRAIN_phase_start_contact_manipulate_count": int(
+                    train_phase_start_counts.get("contact_manipulate", 0)
+                ),
+                "TRAIN_phase_start_post_contact_count": int(train_phase_start_counts.get("post_contact", 0)),
             }
             for joint_idx, joint_gap_value in enumerate(avg_per_joint_gap.detach().cpu().tolist()):
                 train_logdata[f"TRAIN_online_rollout_action_gap_joint_{joint_idx}"] = float(joint_gap_value)
+            for joint_idx, joint_gap_value in enumerate(avg_gt_per_joint_gap.detach().cpu().tolist()):
+                train_logdata[f"TRAIN_online_gt_action_gap_joint_{joint_idx}"] = float(joint_gap_value)
+            train_logdata.update(self._gt_cache_log_fields())
             if self.lighting_augmentor is not None:
                 train_logdata["TRAIN_lighting_pool_size"] = self.lighting_augmentor.current_pool_size
                 train_logdata["TRAIN_lighting_backend"] = self.lighting_augmentor.backend
@@ -646,16 +1393,28 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                         "rollout_steps_used": int(rollout_steps),
                         "horizon_type": "phase_rollout",
                         "action_gap": float(avg_action_gap),
+                        "gt_action_gap": float(avg_gt_action_gap),
                         "history1": float(avg_history_div),
                         "history2": float(avg_history_div_legacy),
                         "ce": float(avg_ce),
                         "ce_objective": float(avg_ce_objective),
+                        "siglip_distance": float(avg_siglip_distance),
                         "rollout_score": float(rollout_score),
+                        "gt_rollout_score": float(gt_rollout_score),
                         "objective_score": float(objective_score),
+                        "gt_objective_score": float(gt_objective_score),
+                        "action_gap_mode_active": str(action_gap_mode),
+                        "active_action_gap": float(active_action_gap),
+                        "active_rollout_score": float(active_rollout_score),
+                        "active_objective_score": float(active_objective_score),
                         "episode_len": float(avg_ep_len),
+                        "done_rate": float(avg_done_rate),
                         "action_gap_joint_0": float(avg_per_joint_gap[0].item()) if avg_per_joint_gap.numel() > 0 else "",
                         "action_gap_joint_1": float(avg_per_joint_gap[1].item()) if avg_per_joint_gap.numel() > 1 else "",
                         "action_gap_joint_2": float(avg_per_joint_gap[2].item()) if avg_per_joint_gap.numel() > 2 else "",
+                        "gt_action_gap_joint_0": float(avg_gt_per_joint_gap[0].item()) if avg_gt_per_joint_gap.numel() > 0 else "",
+                        "gt_action_gap_joint_1": float(avg_gt_per_joint_gap[1].item()) if avg_gt_per_joint_gap.numel() > 1 else "",
+                        "gt_action_gap_joint_2": float(avg_gt_per_joint_gap[2].item()) if avg_gt_per_joint_gap.numel() > 2 else "",
                         "projection_alpha_mean": float(avg_proj_alpha),
                         "projection_coverage_ratio": float(avg_proj_coverage),
                         "projection_bottom_ratio": float(avg_proj_bottom),
@@ -708,6 +1467,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     lambda_history=lambda_history,
                     lambda_history_legacy=lambda_history_legacy,
                     lambda_ce=lambda_ce,
+                    lambda_siglip=lambda_siglip,
+                    siglip_model=siglip_model,
+                    siglip_input_size=siglip_input_size,
                     online_ce_mode=online_ce_mode,
                     attack_mode=attack_mode,
                     projection_alpha=projection_alpha,
@@ -740,6 +1502,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     probe_mode=probe_mode,
                     record_video_frames=should_record_val_video,
                     video_frame_source=record_online_video_frame_source,
+                    action_gap_mode=action_gap_mode,
+                    gt_softmin_tau=gt_softmin_tau,
                 )
                 val_stats["VAL_effective_lighting_enabled"] = int(
                     self._is_lighting_enabled_for_split("val") and (not bool(val_disable_lighting))
@@ -754,10 +1518,20 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 self.val_rollout_action_gap_joints.append(
                     self._extract_joint_metric_list(val_stats, prefix="VAL_online_rollout_action_gap_joint_")
                 )
+                self.val_gt_rollout_action_gap.append(val_stats["VAL_online_gt_action_gap"])
+                self.val_gt_rollout_action_gap_joints.append(
+                    self._extract_joint_metric_list(val_stats, prefix="VAL_online_gt_action_gap_joint_")
+                )
                 self.val_rollout_history_div.append(val_stats["VAL_online_rollout_history_div"])
                 self.val_rollout_history_div_legacy.append(val_stats["VAL_online_rollout_history_div_legacy"])
+                self.val_rollout_siglip_distance.append(val_stats["VAL_online_siglip_distance"])
                 self.val_rollout_score.append(val_stats["VAL_online_rollout_score"])
                 self.val_rollout_objective_score.append(val_stats["VAL_online_objective_score"])
+                self.val_gt_rollout_score.append(val_stats["VAL_online_gt_rollout_score"])
+                self.val_gt_rollout_objective_score.append(val_stats["VAL_online_gt_objective_score"])
+                self.val_active_rollout_action_gap.append(val_stats["VAL_online_active_action_gap"])
+                self.val_active_rollout_score.append(val_stats["VAL_online_active_rollout_score"])
+                self.val_active_rollout_objective_score.append(val_stats["VAL_online_active_objective_score"])
                 self.val_rollout_score_legacy.append(val_stats["VAL_online_rollout_score_legacy"])
                 self.val_online_done_rate.append(val_stats["VAL_online_done_rate"])
                 self.val_online_episode_len.append(val_stats["VAL_online_episode_len"])
@@ -784,17 +1558,28 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                             "rollout_steps_used": int(eval_rollout_steps),
                             "horizon_type": "full_horizon",
                             "action_gap": float(val_stats["VAL_online_rollout_action_gap"]),
+                            "gt_action_gap": float(val_stats["VAL_online_gt_action_gap"]),
                             "history1": float(val_stats["VAL_online_rollout_history_div"]),
                             "history2": float(val_stats["VAL_online_rollout_history_div_legacy"]),
                             "ce": float(val_stats["VAL_online_ce"]),
                             "ce_objective": float(val_stats["VAL_online_ce_objective"]),
+                            "siglip_distance": float(val_stats["VAL_online_siglip_distance"]),
                             "rollout_score": float(val_stats["VAL_online_rollout_score"]),
+                            "gt_rollout_score": float(val_stats["VAL_online_gt_rollout_score"]),
                             "objective_score": float(val_stats["VAL_online_objective_score"]),
+                            "gt_objective_score": float(val_stats["VAL_online_gt_objective_score"]),
+                            "action_gap_mode_active": str(action_gap_mode),
+                            "active_action_gap": float(val_stats["VAL_online_active_action_gap"]),
+                            "active_rollout_score": float(val_stats["VAL_online_active_rollout_score"]),
+                            "active_objective_score": float(val_stats["VAL_online_active_objective_score"]),
                             "episode_len": float(val_stats["VAL_online_episode_len"]),
                             "done_rate": float(val_stats["VAL_online_done_rate"]),
                             "action_gap_joint_0": float(val_stats.get("VAL_online_rollout_action_gap_joint_0", "")) if "VAL_online_rollout_action_gap_joint_0" in val_stats else "",
                             "action_gap_joint_1": float(val_stats.get("VAL_online_rollout_action_gap_joint_1", "")) if "VAL_online_rollout_action_gap_joint_1" in val_stats else "",
                             "action_gap_joint_2": float(val_stats.get("VAL_online_rollout_action_gap_joint_2", "")) if "VAL_online_rollout_action_gap_joint_2" in val_stats else "",
+                            "gt_action_gap_joint_0": float(val_stats.get("VAL_online_gt_action_gap_joint_0", "")) if "VAL_online_gt_action_gap_joint_0" in val_stats else "",
+                            "gt_action_gap_joint_1": float(val_stats.get("VAL_online_gt_action_gap_joint_1", "")) if "VAL_online_gt_action_gap_joint_1" in val_stats else "",
+                            "gt_action_gap_joint_2": float(val_stats.get("VAL_online_gt_action_gap_joint_2", "")) if "VAL_online_gt_action_gap_joint_2" in val_stats else "",
                             "projection_alpha_mean": float(val_stats["VAL_projection_alpha_mean"]),
                             "projection_coverage_ratio": float(val_stats["VAL_projection_coverage_ratio"]),
                             "projection_bottom_ratio": float(val_stats["VAL_projection_bottom_ratio"]),
@@ -813,22 +1598,31 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                                 "lambda_history": float(lambda_history),
                                 "lambda_history_legacy": float(lambda_history_legacy),
                                 "lambda_ce": float(lambda_ce),
+                                "lambda_siglip": float(lambda_siglip),
                                 "online_ce_mode": str(online_ce_mode),
+                                "action_gap_mode_active": str(action_gap_mode),
                                 "final_val_done_rate": float(val_stats["VAL_online_done_rate"]),
                                 "final_val_episode_len": float(val_stats["VAL_online_episode_len"]),
                                 "final_val_action_gap": float(val_stats["VAL_online_rollout_action_gap"]),
+                                "final_val_gt_action_gap": float(val_stats["VAL_online_gt_action_gap"]),
                                 "final_val_history1": float(val_stats["VAL_online_rollout_history_div"]),
                                 "final_val_history2": float(val_stats["VAL_online_rollout_history_div_legacy"]),
                                 "final_val_ce": float(val_stats["VAL_online_ce"]),
                                 "final_val_ce_objective": float(val_stats["VAL_online_ce_objective"]),
+                                "final_val_siglip_distance": float(val_stats["VAL_online_siglip_distance"]),
                                 "final_val_rollout_score": float(val_stats["VAL_online_rollout_score"]),
+                                "final_val_gt_rollout_score": float(val_stats["VAL_online_gt_rollout_score"]),
                                 "final_val_objective_score": float(val_stats["VAL_online_objective_score"]),
+                                "final_val_gt_objective_score": float(val_stats["VAL_online_gt_objective_score"]),
+                                "final_val_active_action_gap": float(val_stats["VAL_online_active_action_gap"]),
+                                "final_val_active_rollout_score": float(val_stats["VAL_online_active_rollout_score"]),
+                                "final_val_active_objective_score": float(val_stats["VAL_online_active_objective_score"]),
                             }
                         )
 
-                improved = val_stats["VAL_online_rollout_score"] > self.best_rollout_score
+                improved = val_stats["VAL_online_active_rollout_score"] > self.best_rollout_score
                 if improved:
-                    self.best_rollout_score = val_stats["VAL_online_rollout_score"]
+                    self.best_rollout_score = val_stats["VAL_online_active_rollout_score"]
                     temp_save_dir = os.path.join(self.save_dir, f"{str(i)}")
                     os.makedirs(temp_save_dir, exist_ok=True)
                     torch.save(projection_texture.detach().cpu(), os.path.join(temp_save_dir, "projection_texture.pt"))
@@ -892,6 +1686,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         lambda_history,
         lambda_history_legacy,
         lambda_ce,
+        lambda_siglip,
+        siglip_model,
+        siglip_input_size,
         online_ce_mode,
         attack_mode,
         projection_alpha,
@@ -924,12 +1721,16 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         probe_mode,
         record_video_frames,
         video_frame_source,
+        action_gap_mode,
+        gt_softmin_tau=0.05,
     ):
         total_action_gap = 0.0
+        total_gt_action_gap = 0.0
         total_history_div = 0.0
         total_history_div_legacy = 0.0
         total_ce = 0.0
         total_ce_objective = 0.0
+        total_siglip_distance = 0.0
         total_done = 0.0
         total_ep_len = 0.0
         total_proj_alpha = 0.0
@@ -939,6 +1740,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         total_action_terms = 0
         total_history_terms = 0
         total_per_joint = None
+        total_gt_per_joint = None
         visual_frames = []
         video_episode = None
 
@@ -978,6 +1780,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                         lambda_history=lambda_history,
                         lambda_history_legacy=lambda_history_legacy,
                         lambda_ce=lambda_ce,
+                        lambda_siglip=lambda_siglip,
+                        siglip_model=siglip_model,
+                        siglip_input_size=siglip_input_size,
                         online_ce_mode=online_ce_mode,
                         attack_mode=attack_mode,
                         projection_alpha=projection_alpha,
@@ -1010,15 +1815,20 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                         task_id=task_id,
                         record_video_frames=bool(record_video_frames and (video_episode is None)),
                         video_frame_source=video_frame_source,
+                        action_gap_mode=action_gap_mode,
+                        start_phase_name="initial",
+                        gt_softmin_tau=gt_softmin_tau,
                     )
                     if episode is None:
                         continue
 
                     total_action_gap += episode["action_gap"]
+                    total_gt_action_gap += episode["gt_action_gap"]
                     total_history_div += episode["history_div"]
                     total_history_div_legacy += episode["history_div_legacy"]
                     total_ce += episode["ce_value"]
                     total_ce_objective += episode["ce_objective_value"]
+                    total_siglip_distance += episode["siglip_distance"]
                     total_done += float(episode["done"])
                     total_ep_len += float(episode["episode_len"])
                     total_proj_alpha += episode["projection_alpha"]
@@ -1028,6 +1838,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     total_action_terms += max(1, episode["action_terms"])
                     total_history_terms += max(0, episode["history_terms"])
                     total_per_joint = self._accumulate_joint_values(total_per_joint, episode["per_joint_gap"])
+                    total_gt_per_joint = self._accumulate_joint_values(total_gt_per_joint, episode["gt_per_joint_gap"])
                     if len(visual_frames) == 0 and len(episode["visual_frames"]) > 0:
                         visual_frames = episode["visual_frames"][: max(1, int(viz_samples))]
                     if bool(record_video_frames) and (video_episode is None) and self._should_dump_online_episode_video(episode):
@@ -1038,10 +1849,12 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
 
         divisor = float(max(1, int(online_val_episodes)))
         avg_action_gap = total_action_gap / divisor
+        avg_gt_action_gap = total_gt_action_gap / divisor
         avg_history_div = total_history_div / divisor
         avg_history_div_legacy = total_history_div_legacy / divisor
         avg_ce = total_ce / divisor
         avg_ce_objective = total_ce_objective / divisor
+        avg_siglip_distance = total_siglip_distance / divisor
         avg_done = total_done / divisor
         avg_ep_len = total_ep_len / divisor
         avg_proj_alpha = total_proj_alpha / divisor
@@ -1049,28 +1862,57 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         avg_proj_bottom = total_proj_bottom / divisor
         avg_proj_keystone = total_proj_keystone / divisor
         avg_per_joint = self._normalize_joint_values(total_per_joint, divisor)
+        avg_gt_per_joint = self._normalize_joint_values(total_gt_per_joint, divisor)
         if probe_mode:
             avg_rollout_score = (
                 (lambda_action_gap * avg_action_gap)
                 + (lambda_history * avg_history_div)
                 + (lambda_history_legacy * avg_history_div_legacy)
+                + (lambda_siglip * avg_siglip_distance)
+            )
+            avg_gt_rollout_score = (
+                (lambda_action_gap * avg_gt_action_gap)
+                + (lambda_history * avg_history_div)
+                + (lambda_history_legacy * avg_history_div_legacy)
+                + (lambda_siglip * avg_siglip_distance)
             )
             avg_rollout_score_legacy = (
                 (lambda_action_gap * avg_action_gap)
                 + (lambda_history_legacy * avg_history_div_legacy)
             )
         else:
-            avg_rollout_score = (lambda_action_gap * avg_action_gap) + (lambda_history * avg_history_div)
+            avg_rollout_score = (
+                (lambda_action_gap * avg_action_gap)
+                + (lambda_history * avg_history_div)
+                + (lambda_siglip * avg_siglip_distance)
+            )
+            avg_gt_rollout_score = (
+                (lambda_action_gap * avg_gt_action_gap)
+                + (lambda_history * avg_history_div)
+                + (lambda_siglip * avg_siglip_distance)
+            )
             avg_rollout_score_legacy = (lambda_action_gap * avg_action_gap) + (lambda_history * avg_history_div_legacy)
         avg_objective_score = avg_rollout_score - (lambda_ce * avg_ce_objective)
+        avg_gt_objective_score = avg_gt_rollout_score - (lambda_ce * avg_ce_objective)
+        avg_active_action_gap = avg_gt_action_gap if action_gap_mode == "gt_farthest" else avg_action_gap
+        avg_active_rollout_score = avg_gt_rollout_score if action_gap_mode == "gt_farthest" else avg_rollout_score
+        avg_active_objective_score = avg_gt_objective_score if action_gap_mode == "gt_farthest" else avg_objective_score
 
         stats = {
             "VAL_online_rollout_action_gap": avg_action_gap,
+            "VAL_online_gt_action_gap": avg_gt_action_gap,
             "VAL_online_rollout_history_div": avg_history_div,
             "VAL_online_rollout_history_div_legacy": avg_history_div_legacy,
+            "VAL_online_siglip_distance": avg_siglip_distance,
             "VAL_online_rollout_score": avg_rollout_score,
+            "VAL_online_gt_rollout_score": avg_gt_rollout_score,
             "VAL_online_rollout_score_legacy": avg_rollout_score_legacy,
             "VAL_online_objective_score": avg_objective_score,
+            "VAL_online_gt_objective_score": avg_gt_objective_score,
+            "VAL_action_gap_mode_active": str(action_gap_mode),
+            "VAL_online_active_action_gap": avg_active_action_gap,
+            "VAL_online_active_rollout_score": avg_active_rollout_score,
+            "VAL_online_active_objective_score": avg_active_objective_score,
             "VAL_online_done_rate": avg_done,
             "VAL_online_episode_len": avg_ep_len,
             "VAL_online_ce": avg_ce,
@@ -1086,8 +1928,11 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             if self.lighting_augmentor is not None
             else "n/a",
         }
+        stats.update(self._gt_cache_log_fields())
         for joint_idx, joint_gap_value in enumerate(avg_per_joint.detach().cpu().tolist()):
             stats[f"VAL_online_rollout_action_gap_joint_{joint_idx}"] = float(joint_gap_value)
+        for joint_idx, joint_gap_value in enumerate(avg_gt_per_joint.detach().cpu().tolist()):
+            stats[f"VAL_online_gt_action_gap_joint_{joint_idx}"] = float(joint_gap_value)
         return stats, visual_frames, video_episode
 
     def _run_online_episode(
@@ -1112,6 +1957,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         lambda_history,
         lambda_history_legacy,
         lambda_ce,
+        lambda_siglip,
+        siglip_model,
+        siglip_input_size,
         online_ce_mode,
         attack_mode,
         projection_alpha,
@@ -1144,14 +1992,19 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         task_id=None,
         record_video_frames=False,
         video_frame_source="projected_input",
+        action_gap_mode="clean_adv",
+        start_phase_name="initial",
+        gt_softmin_tau=0.05,
     ):
         action_dim = len(action_stats["q01"])
+        start_phase_name = self._normalize_phase_start_name(start_phase_name)
         video_frame_source = str(video_frame_source).lower().strip()
         if video_frame_source not in ("next_obs", "orig", "projected_input", "adv"):
             video_frame_source = "projected_input"
         env.reset()
         obs = env.set_init_state(init_state)
-        for _ in range(max(0, int(num_steps_wait))):
+        effective_num_steps_wait = 0 if start_phase_name != "initial" else max(0, int(num_steps_wait))
+        for _ in range(effective_num_steps_wait):
             obs, _, done_wait, _ = env.step(get_libero_dummy_action("openvla"))
             if done_wait:
                 break
@@ -1173,18 +2026,24 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         if need_backward and (projection_texture.grad is not None):
             grad_before_episode = projection_texture.grad.detach().clone()
         total_action_gap = 0.0
+        total_gt_action_gap = 0.0
         total_history_div = 0.0
         total_history_div_legacy = 0.0
         total_ce = 0.0
         total_ce_objective = 0.0
+        total_siglip_distance = 0.0
         total_action_terms = 0
         total_history_terms = 0
         total_history_terms_legacy = 0
         total_per_joint = None
+        total_gt_per_joint = None
         total_proj_alpha = 0.0
         total_proj_cov = 0.0
         total_proj_bottom = 0.0
         total_proj_keystone = 0.0
+        gt_candidate_count = 0
+        gt_reference_instruction = self._normalize_instruction_key(task_description)
+        gt_reference_phase = self._phase_start_to_gt_phase(start_phase_name)
         last_done = False
         visual_frames = []
         video_frames = []
@@ -1322,9 +2181,40 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 use_all_joints=use_all_joints,
                 gripper_weight=gripper_weight,
             )
+            step_gt_action_gap_loss = torch.zeros((), device=self.vla.device, dtype=torch.float32)
+            step_gt_action_gap_metric = torch.zeros((), device=self.vla.device, dtype=torch.float32)
+            step_gt_per_joint_gap = torch.zeros((self.default_action_dim,), device=self.vla.device, dtype=torch.float32)
+            if action_gap_mode == "gt_farthest":
+                gt_phase_name = self._infer_gt_phase_for_step(
+                    split=split,
+                    task_description=task_description,
+                    step_idx=step_idx,
+                    horizon=max_steps,
+                    phase_start_name=start_phase_name,
+                )
+                gt_candidate_actions, gt_candidate_count, gt_reference_instruction, gt_reference_phase = self._get_gt_candidate_actions(
+                    split=split,
+                    task_description=task_description,
+                    step_idx=step_idx,
+                    horizon=max_steps,
+                    action_dim=action_dim,
+                    phase_name=gt_phase_name,
+                )
+                step_gt_action_gap_loss, step_gt_action_gap_metric, step_gt_per_joint_gap, _ = self._compute_gt_action_gap_losses(
+                    adv_logits=output_adv.logits,
+                    labels_full=labels_full,
+                    action_mask_full=action_mask_full,
+                    gt_candidate_actions=gt_candidate_actions,
+                    maskidx=maskidx,
+                    use_all_joints=use_all_joints,
+                    gripper_weight=gripper_weight,
+                    gt_softmin_tau=gt_softmin_tau,
+                )
             total_action_gap += step_action_gap_metric.item()
+            total_gt_action_gap += step_gt_action_gap_metric.item()
             total_action_terms += 1
             total_per_joint = self._accumulate_joint_values(total_per_joint, step_per_joint_gap)
+            total_gt_per_joint = self._accumulate_joint_values(total_gt_per_joint, step_gt_per_joint_gap)
 
             clean_pred_tokens = self._extract_pred_action_tokens_from_logits(output_clean.logits, labels_full)
             step_history_div = torch.zeros((), device=self.vla.device, dtype=torch.float32)
@@ -1347,10 +2237,21 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             step_weight = float(self._get_rollout_step_weight(step_idx))
             episode_weight_sum += step_weight
 
-            step_loss = -(lambda_action_gap * step_action_gap_loss)
+            step_siglip_distance = torch.zeros((), device=self.vla.device, dtype=torch.float32)
+            if (siglip_model is not None) and (lambda_siglip > 0.0):
+                step_siglip_distance = self._compute_siglip_embedding_distance(
+                    siglip_model=siglip_model,
+                    reference_images=attack_aux["pre_projection_tensors"],
+                    projected_images=attack_aux["projected_input_tensors"],
+                    input_size=siglip_input_size,
+                )
+
+            active_step_action_gap_loss = step_gt_action_gap_loss if action_gap_mode == "gt_farthest" else step_action_gap_loss
+            step_loss = -(lambda_action_gap * active_step_action_gap_loss)
             if need_history:
                 step_loss = step_loss - (lambda_history * step_history_div)
                 step_loss = step_loss - (lambda_history_legacy * step_history_div_legacy)
+            step_loss = step_loss - (lambda_siglip * step_siglip_distance)
             step_ce = torch.zeros((), device=self.vla.device, dtype=torch.float32)
             step_ce_objective = torch.zeros((), device=self.vla.device, dtype=torch.float32)
             if online_ce_mode in ("pseudo_clean", "uada_inverse_pseudo_clean"):
@@ -1368,6 +2269,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             weighted_step_loss = step_loss * step_weight
             total_ce += step_ce.detach().item()
             total_ce_objective += step_ce_objective.detach().item()
+            total_siglip_distance += step_siglip_distance.detach().item()
             if need_backward:
                 if weighted_step_loss.requires_grad:
                     weighted_step_loss.backward()
@@ -1461,16 +2363,19 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         return {
             "loss": total_loss if need_backward else total_loss.detach(),
             "action_gap": total_action_gap / float(ep_steps),
+            "gt_action_gap": total_gt_action_gap / float(ep_steps),
             "history_div": total_history_div / float(max(1, total_history_terms)),
             "history_div_legacy": total_history_div_legacy / float(max(1, total_history_terms_legacy)),
             "ce_value": total_ce / float(ep_steps),
             "ce_objective_value": total_ce_objective / float(ep_steps),
+            "siglip_distance": total_siglip_distance / float(ep_steps),
             "action_terms": total_action_terms,
             "history_terms": total_history_terms,
             "history_terms_legacy": total_history_terms_legacy,
             "done": last_done,
             "episode_len": total_action_terms,
             "per_joint_gap": self._normalize_joint_values(total_per_joint, float(ep_steps)),
+            "gt_per_joint_gap": self._normalize_joint_values(total_gt_per_joint, float(ep_steps)),
             "projection_alpha": total_proj_alpha / float(ep_steps),
             "projection_coverage": total_proj_cov / float(ep_steps),
             "projection_bottom": total_proj_bottom / float(ep_steps),
@@ -1481,6 +2386,11 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             "effective_lighting_enabled": int(episode_effective_lighting_enabled),
             "task_id": -1 if task_id is None else int(task_id),
             "task_description": str(task_description),
+            "phase_start_name": str(start_phase_name),
+            "effective_num_steps_wait": int(effective_num_steps_wait),
+            "gt_candidate_count": int(gt_candidate_count),
+            "gt_reference_instruction": str(gt_reference_instruction),
+            "gt_reference_phase": str(gt_reference_phase),
         }
 
     def _is_cuda_alloc_failure(self, err):
@@ -1845,13 +2755,24 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             return candidate_ids
         return random.sample(candidate_ids, k=int(num_tasks))
 
-    def _sample_init_state(self, init_states, iter_idx, local_idx, deterministic_seed=None):
+    def _sample_init_state_index(self, init_states, iter_idx, local_idx, deterministic_seed=None):
         if len(init_states) == 0:
             return None
         if deterministic_seed is not None:
             ridx = int(deterministic_seed) % len(init_states)
         else:
             ridx = (int(iter_idx) + int(local_idx) + random.randint(0, max(0, len(init_states) - 1))) % len(init_states)
+        return int(ridx)
+
+    def _sample_init_state(self, init_states, iter_idx, local_idx, deterministic_seed=None):
+        ridx = self._sample_init_state_index(
+            init_states=init_states,
+            iter_idx=iter_idx,
+            local_idx=local_idx,
+            deterministic_seed=deterministic_seed,
+        )
+        if ridx is None:
+            return None
         return init_states[ridx]
 
     def _set_online_env_seed(self, seed):
@@ -1963,14 +2884,30 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             pickle.dump(self.train_rollout_action_gap, file)
         with open(os.path.join(path, "train_online_rollout_action_gap_joints.pkl"), "wb") as file:
             pickle.dump(self.train_rollout_action_gap_joints, file)
+        with open(os.path.join(path, "train_online_gt_rollout_action_gap.pkl"), "wb") as file:
+            pickle.dump(self.train_gt_rollout_action_gap, file)
+        with open(os.path.join(path, "train_online_gt_rollout_action_gap_joints.pkl"), "wb") as file:
+            pickle.dump(self.train_gt_rollout_action_gap_joints, file)
         with open(os.path.join(path, "train_online_rollout_history_div.pkl"), "wb") as file:
             pickle.dump(self.train_rollout_history_div, file)
         with open(os.path.join(path, "train_online_rollout_history_div_legacy.pkl"), "wb") as file:
             pickle.dump(self.train_rollout_history_div_legacy, file)
+        with open(os.path.join(path, "train_online_siglip_distance.pkl"), "wb") as file:
+            pickle.dump(self.train_rollout_siglip_distance, file)
         with open(os.path.join(path, "train_online_rollout_score.pkl"), "wb") as file:
             pickle.dump(self.train_rollout_score, file)
         with open(os.path.join(path, "train_online_objective_score.pkl"), "wb") as file:
             pickle.dump(self.train_rollout_objective_score, file)
+        with open(os.path.join(path, "train_online_gt_rollout_score.pkl"), "wb") as file:
+            pickle.dump(self.train_gt_rollout_score, file)
+        with open(os.path.join(path, "train_online_gt_objective_score.pkl"), "wb") as file:
+            pickle.dump(self.train_gt_rollout_objective_score, file)
+        with open(os.path.join(path, "train_online_active_rollout_action_gap.pkl"), "wb") as file:
+            pickle.dump(self.train_active_rollout_action_gap, file)
+        with open(os.path.join(path, "train_online_active_rollout_score.pkl"), "wb") as file:
+            pickle.dump(self.train_active_rollout_score, file)
+        with open(os.path.join(path, "train_online_active_objective_score.pkl"), "wb") as file:
+            pickle.dump(self.train_active_rollout_objective_score, file)
         with open(os.path.join(path, "train_online_phase_id.pkl"), "wb") as file:
             pickle.dump(self.train_phase_id, file)
         with open(os.path.join(path, "train_online_done_rate.pkl"), "wb") as file:
@@ -1981,14 +2918,30 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             pickle.dump(self.val_rollout_action_gap, file)
         with open(os.path.join(path, "val_online_rollout_action_gap_joints.pkl"), "wb") as file:
             pickle.dump(self.val_rollout_action_gap_joints, file)
+        with open(os.path.join(path, "val_online_gt_rollout_action_gap.pkl"), "wb") as file:
+            pickle.dump(self.val_gt_rollout_action_gap, file)
+        with open(os.path.join(path, "val_online_gt_rollout_action_gap_joints.pkl"), "wb") as file:
+            pickle.dump(self.val_gt_rollout_action_gap_joints, file)
         with open(os.path.join(path, "val_online_rollout_history_div.pkl"), "wb") as file:
             pickle.dump(self.val_rollout_history_div, file)
         with open(os.path.join(path, "val_online_rollout_history_div_legacy.pkl"), "wb") as file:
             pickle.dump(self.val_rollout_history_div_legacy, file)
+        with open(os.path.join(path, "val_online_siglip_distance.pkl"), "wb") as file:
+            pickle.dump(self.val_rollout_siglip_distance, file)
         with open(os.path.join(path, "val_online_rollout_score.pkl"), "wb") as file:
             pickle.dump(self.val_rollout_score, file)
         with open(os.path.join(path, "val_online_objective_score.pkl"), "wb") as file:
             pickle.dump(self.val_rollout_objective_score, file)
+        with open(os.path.join(path, "val_online_gt_rollout_score.pkl"), "wb") as file:
+            pickle.dump(self.val_gt_rollout_score, file)
+        with open(os.path.join(path, "val_online_gt_objective_score.pkl"), "wb") as file:
+            pickle.dump(self.val_gt_rollout_objective_score, file)
+        with open(os.path.join(path, "val_online_active_rollout_action_gap.pkl"), "wb") as file:
+            pickle.dump(self.val_active_rollout_action_gap, file)
+        with open(os.path.join(path, "val_online_active_rollout_score.pkl"), "wb") as file:
+            pickle.dump(self.val_active_rollout_score, file)
+        with open(os.path.join(path, "val_online_active_objective_score.pkl"), "wb") as file:
+            pickle.dump(self.val_active_rollout_objective_score, file)
         with open(os.path.join(path, "val_online_rollout_score_legacy.pkl"), "wb") as file:
             pickle.dump(self.val_rollout_score_legacy, file)
         with open(os.path.join(path, "val_online_done_rate.pkl"), "wb") as file:

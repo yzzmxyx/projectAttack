@@ -283,6 +283,8 @@ class ProjectorAttackTransform:
     ):
         modified_images = []
         projected_inputs: List[torch.Tensor] = []
+        pre_projection_tensors: List[torch.Tensor] = []
+        projected_input_tensors: List[torch.Tensor] = []
         alpha_means: List[float] = []
         coverage_ratios: List[float] = []
         bottom_ratios: List[float] = []
@@ -409,6 +411,8 @@ class ProjectorAttackTransform:
             else:
                 bottom_ratios.append(0.0)
             projected_inputs.append(adv_tensor.detach().cpu())
+            pre_projection_tensors.append(projected_input.detach())
+            projected_input_tensors.append(adv_tensor)
 
             im0 = self.normalize(adv_tensor, mean[0].to(self.device), std[0].to(self.device))
             im1 = self.normalize(adv_tensor, mean[1].to(self.device), std[1].to(self.device))
@@ -426,6 +430,8 @@ class ProjectorAttackTransform:
 
         aux = {
             "projected_inputs": projected_inputs,
+            "pre_projection_tensors": pre_projection_tensors,
+            "projected_input_tensors": projected_input_tensors,
             "projection_alpha_mean": self.last_alpha_mean,
             "projection_coverage_ratio": self.last_coverage_ratio,
             "projection_bottom_ratio": self.last_bottom_ratio,
@@ -477,8 +483,11 @@ class ProjectorAttackTransform:
             self.last_backend = "clean"
             if not return_aux:
                 return output
+            image_tensors = [self._to_tensor_image(image) for image in images]
             return output, {
-                "projected_inputs": [self._to_tensor_image(image).detach().cpu() for image in images],
+                "projected_inputs": [image_tensor.detach().cpu() for image_tensor in image_tensors],
+                "pre_projection_tensors": [image_tensor.detach() for image_tensor in image_tensors],
+                "projected_input_tensors": [image_tensor.detach() for image_tensor in image_tensors],
                 "projection_alpha_mean": self.last_alpha_mean,
                 "projection_coverage_ratio": self.last_coverage_ratio,
                 "projection_bottom_ratio": self.last_bottom_ratio,
@@ -500,8 +509,11 @@ class ProjectorAttackTransform:
             self.last_backend = "patch"
             if not return_aux:
                 return output
+            image_tensors = [self._to_tensor_image(image) for image in images]
             return output, {
-                "projected_inputs": [self._to_tensor_image(image).detach().cpu() for image in images],
+                "projected_inputs": [image_tensor.detach().cpu() for image_tensor in image_tensors],
+                "pre_projection_tensors": [image_tensor.detach() for image_tensor in image_tensors],
+                "projected_input_tensors": [image_tensor.detach() for image_tensor in image_tensors],
                 "projection_alpha_mean": self.last_alpha_mean,
                 "projection_coverage_ratio": self.last_coverage_ratio,
                 "projection_bottom_ratio": self.last_bottom_ratio,

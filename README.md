@@ -72,6 +72,7 @@ Run probe experiments:
 ```bash
 bash scripts/run_UADA_rollout_online_env_probe.sh
 bash scripts/run_UADA_rollout_online_env_probe_round2.sh
+bash scripts/run_UADA_rollout_online_env_probe_siglip.sh
 ```
 
 Run offline SigLIP comparison:

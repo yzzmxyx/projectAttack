@@ -75,6 +75,9 @@ def main(args):
         f"{args.dataset}_UADA_rollout_onlineEnv_atk{args.attack_mode}_lr{format(args.lr, '.0e')}_iter{args.iter}_"
         f"phase1R{args.phase1_rollout}_phase2R{args.phase2_rollout}_"
         f"lamA{args.lambda_action_gap}_lamH{args.lambda_history}_lamHL{args.lambda_history_legacy}_"
+        f"lamS{args.lambda_siglip}_"
+        f"agMode{args.action_gap_mode}_"
+        f"phaseState{args.phase_state_mode}_tau{args.gt_softmin_tau}_"
         f"ceMode{args.online_ce_mode}_probe{int(args.probe_mode)}_{args.probe_variant}_"
         f"autoTune{int(args.auto_gpu_tune)}_{args.gpu_tune_mode}_"
         f"valDet{int(args.val_deterministic)}_valSeed{args.val_seed}_valNoLight{int(args.val_disable_lighting)}_"
@@ -106,9 +109,17 @@ def main(args):
             "phase1_rollout": args.phase1_rollout,
             "phase2_rollout": args.phase2_rollout,
             "lambda_action_gap": args.lambda_action_gap,
+            "action_gap_mode": args.action_gap_mode,
+            "gt_action_bank_path": args.gt_action_bank_path,
+            "gt_softmin_tau": args.gt_softmin_tau,
+            "phase_state_mode": args.phase_state_mode,
+            "phase_state_cache_path": args.phase_state_cache_path,
             "lambda_history": args.lambda_history,
             "lambda_history_legacy": args.lambda_history_legacy,
             "lambda_ce": args.lambda_ce,
+            "lambda_siglip": args.lambda_siglip,
+            "siglip_model_name": args.siglip_model_name,
+            "siglip_input_size": args.siglip_input_size,
             "probe_mode": args.probe_mode,
             "probe_variant": args.probe_variant,
             "save_interval": args.save_interval,
@@ -179,6 +190,7 @@ def main(args):
             "online_ce_mode": args.online_ce_mode,
             "env_action_source": args.env_action_source,
             "env_seed": args.env_seed,
+            "gt_dataset_root": args.gt_dataset_root,
             "auto_gpu_tune": args.auto_gpu_tune,
             "gpu_tune_mode": args.gpu_tune_mode,
             "gpu_mem_low": args.gpu_mem_low,
@@ -231,6 +243,9 @@ def main(args):
         lambda_history=args.lambda_history,
         lambda_history_legacy=args.lambda_history_legacy,
         lambda_ce=args.lambda_ce,
+        lambda_siglip=args.lambda_siglip,
+        siglip_model_name=args.siglip_model_name,
+        siglip_input_size=args.siglip_input_size,
         save_interval=args.save_interval,
         eval_enabled=args.eval_enabled,
         lighting_aug_enabled=args.lighting_aug_enabled,
@@ -295,6 +310,13 @@ def main(args):
         online_ce_mode=args.online_ce_mode,
         env_action_source=args.env_action_source,
         env_seed=args.env_seed,
+        dataset_name=args.dataset,
+        action_gap_mode=args.action_gap_mode,
+        gt_dataset_root=args.gt_dataset_root,
+        gt_action_bank_path=args.gt_action_bank_path,
+        gt_softmin_tau=args.gt_softmin_tau,
+        phase_state_mode=args.phase_state_mode,
+        phase_state_cache_path=args.phase_state_cache_path,
         val_deterministic=args.val_deterministic,
         val_seed=args.val_seed,
         val_disable_lighting=args.val_disable_lighting,
@@ -355,7 +377,7 @@ def arg_parser():
     parser.add_argument("--projector_psf", type=str2bool, default=False)
     parser.add_argument("--wandb_project", default="false", type=str)
     parser.add_argument("--wandb_entity", default="xxx", type=str)
-    parser.add_argument("--dataset", default="libero_spatial", type=str)
+    parser.add_argument("--dataset", default="libero_10", type=str)
     parser.add_argument("--resize_patch", type=str2bool, default=False)
     parser.add_argument("--server", default="/home/yxx/projectAttack", type=str)
 
@@ -363,9 +385,17 @@ def arg_parser():
     parser.add_argument("--phase1_rollout", default=8, type=int)
     parser.add_argument("--phase2_rollout", default=24, type=int)
     parser.add_argument("--lambda_action_gap", default=1.0, type=float)
+    parser.add_argument("--action_gap_mode", default="gt_farthest", type=str)
+    parser.add_argument("--gt_action_bank_path", default="", type=str)
+    parser.add_argument("--gt_softmin_tau", default=0.05, type=float)
+    parser.add_argument("--phase_state_mode", default="phase_cycle", type=str)
+    parser.add_argument("--phase_state_cache_path", default="", type=str)
     parser.add_argument("--lambda_history", default=0.5, type=float)
     parser.add_argument("--lambda_history_legacy", default=0.0, type=float)
     parser.add_argument("--lambda_ce", default=0.1, type=float)
+    parser.add_argument("--lambda_siglip", default=0.0, type=float)
+    parser.add_argument("--siglip_model_name", default="google/siglip-so400m-patch14-384", type=str)
+    parser.add_argument("--siglip_input_size", default=384, type=int)
     parser.add_argument("--probe_mode", type=str2bool, default=False)
     parser.add_argument("--probe_variant", default="", type=str)
     parser.add_argument("--save_interval", default=100, type=int)
@@ -417,6 +447,7 @@ def arg_parser():
     parser.add_argument("--online_ce_mode", default="pseudo_clean", type=str)
     parser.add_argument("--env_action_source", default="adv", type=str)
     parser.add_argument("--env_seed", default=42, type=int)
+    parser.add_argument("--gt_dataset_root", default="/home/yxx/roboticAttack/openvla-main/dataset", type=str)
     parser.add_argument("--auto_gpu_tune", type=str2bool, default=False)
     parser.add_argument("--gpu_tune_mode", default="stable", type=str)
     parser.add_argument("--gpu_mem_low", default=0.82, type=float)
@@ -483,8 +514,13 @@ if __name__ == "__main__":
         f" attack_mode:{args.attack_mode}\n projection_size:{args.projection_size}\n"
         f" phase1_ratio:{args.phase1_ratio}\n phase1_rollout:{args.phase1_rollout}\n"
         f" phase2_rollout:{args.phase2_rollout}\n lambda_action_gap:{args.lambda_action_gap}\n"
+        f" action_gap_mode:{args.action_gap_mode}\n gt_dataset_root:{args.gt_dataset_root}\n"
+        f" gt_action_bank_path:{args.gt_action_bank_path}\n gt_softmin_tau:{args.gt_softmin_tau}\n"
+        f" phase_state_mode:{args.phase_state_mode}\n phase_state_cache_path:{args.phase_state_cache_path}\n"
         f" lambda_history:{args.lambda_history}\n lambda_history_legacy:{args.lambda_history_legacy}\n"
-        f" lambda_ce:{args.lambda_ce}\n probe_mode:{args.probe_mode}\n probe_variant:{args.probe_variant}\n"
+        f" lambda_ce:{args.lambda_ce}\n lambda_siglip:{args.lambda_siglip}\n"
+        f" siglip_model_name:{args.siglip_model_name}\n siglip_input_size:{args.siglip_input_size}\n"
+        f" probe_mode:{args.probe_mode}\n probe_variant:{args.probe_variant}\n"
         f" save_interval:{args.save_interval}\n eval_enabled:{args.eval_enabled}\n"
         f" val_deterministic:{args.val_deterministic}\n val_seed:{args.val_seed}\n"
         f" val_disable_lighting:{args.val_disable_lighting}\n"

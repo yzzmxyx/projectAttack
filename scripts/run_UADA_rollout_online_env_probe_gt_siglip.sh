@@ -9,26 +9,30 @@ import uuid
 print(uuid.uuid4())
 PY
 )"
-PROBE_ROOT="${current_dir}/run/UADA_rollout_online_env_probe_round2/${PROBE_ID}"
+PROBE_ROOT="${current_dir}/run/UADA_rollout_online_env_probe_gt_siglip/${PROBE_ID}"
 LOG_DIR="${PROBE_ROOT}/logs"
 SUMMARY_CSV="${PROBE_ROOT}/probe_summary.csv"
 mkdir -p "${LOG_DIR}"
 
+# Keep the GT probe on the same historical task-suite baseline as the legacy probes.
+DATASET_NAME="${DATASET:-libero_spatial}"
+ACTION_GAP_MODE_NAME="${ACTION_GAP_MODE:-gt_farthest}"
+PHASE_STATE_MODE_NAME="${PHASE_STATE_MODE:-phase_cycle}"
+
 cat > "${SUMMARY_CSV}" <<'EOF'
-variant,attack_mode,lr,exp_id,run_dir,iter,lambda_action_gap,lambda_history,lambda_history_legacy,lambda_ce,online_ce_mode,action_gap_mode_active,final_val_done_rate,final_val_episode_len,final_val_action_gap,final_val_gt_action_gap,final_val_active_action_gap,final_val_history1,final_val_history2,final_val_ce,final_val_ce_objective,final_val_rollout_score,final_val_gt_rollout_score,final_val_active_rollout_score,final_val_objective_score,final_val_gt_objective_score,final_val_active_objective_score
+variant,exp_id,run_dir,iter,lambda_action_gap,lambda_history,lambda_history_legacy,lambda_ce,lambda_siglip,online_ce_mode,action_gap_mode_active,final_val_done_rate,final_val_episode_len,final_val_action_gap,final_val_gt_action_gap,final_val_active_action_gap,final_val_history1,final_val_history2,final_val_ce,final_val_ce_objective,final_val_siglip_distance,final_val_rollout_score,final_val_gt_rollout_score,final_val_active_rollout_score,final_val_objective_score,final_val_gt_objective_score,final_val_active_objective_score
 EOF
 
-echo "Round2 probe root: ${PROBE_ROOT}"
+echo "GT SiGLIP probe root: ${PROBE_ROOT}"
 
 run_variant() {
     local variant="$1"
-    local attack_mode="$2"
-    local lr="$3"
-    local lambda_action_gap="$4"
-    local lambda_history="$5"
-    local lambda_history_legacy="$6"
-    local lambda_ce="$7"
-    local online_ce_mode="$8"
+    local lambda_action_gap="$2"
+    local lambda_history="$3"
+    local lambda_history_legacy="$4"
+    local lambda_ce="$5"
+    local online_ce_mode="$6"
+    local lambda_siglip="$7"
     local safe_variant
     safe_variant="$(echo "${variant}" | tr '+' '_' )"
     local log_path="${LOG_DIR}/${safe_variant}.log"
@@ -37,16 +41,16 @@ run_variant() {
         --maskidx 0,1,2 \
         --use_all_joints false \
         --gripper_weight 0.5 \
-        --lr "${lr}" \
+        --lr 2e-3 \
         --server "${current_dir}" \
-        --device "${DEVICE:-6}" \
+        --device "${DEVICE:-4}" \
         --iter 20 \
         --accumulate 1 \
         --bs 1 \
         --warmup 2 \
-        --tags "UADA_rollout_online_env_probe_round2" "${variant}" \
+        --tags "UADA_rollout_online_env_probe_gt_siglip" "${variant}" \
         --geometry true \
-        --attack_mode "${attack_mode}" \
+        --attack_mode "projection" \
         --patch_size "3,22,22" \
         --projection_size "3,22,22" \
         --projection_alpha 0.55 \
@@ -72,7 +76,7 @@ run_variant() {
         --projector_distance_falloff 0.10 \
         --projector_psf false \
         --wandb_project "false" \
-        --dataset "${DATASET:-libero_10}" \
+        --dataset "${DATASET_NAME}" \
         --resize_patch false \
         --phase1_ratio 0.4 \
         --phase1_rollout 8 \
@@ -81,6 +85,9 @@ run_variant() {
         --lambda_history "${lambda_history}" \
         --lambda_history_legacy "${lambda_history_legacy}" \
         --lambda_ce "${lambda_ce}" \
+        --lambda_siglip "${lambda_siglip}" \
+        --siglip_model_name "${SIGLIP_MODEL_NAME:-google/siglip-so400m-patch14-384}" \
+        --siglip_input_size "${SIGLIP_INPUT_SIZE:-384}" \
         --save_interval 5 \
         --eval_enabled true \
         --val_deterministic true \
@@ -123,11 +130,11 @@ run_variant() {
         --max_env_steps "auto_by_suite" \
         --env_resolution 256 \
         --online_ce_mode "${online_ce_mode}" \
-        --action_gap_mode "${ACTION_GAP_MODE:-gt_farthest}" \
+        --action_gap_mode "${ACTION_GAP_MODE_NAME}" \
         --gt_dataset_root "${GT_DATASET_ROOT:-/home/yxx/roboticAttack/openvla-main/dataset}" \
         --gt_action_bank_path "${GT_ACTION_BANK_PATH:-}" \
         --gt_softmin_tau "${GT_SOFTMIN_TAU:-0.05}" \
-        --phase_state_mode "${PHASE_STATE_MODE:-phase_cycle}" \
+        --phase_state_mode "${PHASE_STATE_MODE_NAME}" \
         --phase_state_cache_path "${PHASE_STATE_CACHE_PATH:-}" \
         --env_action_source "adv" \
         --env_seed 42 \
@@ -149,19 +156,17 @@ run_variant() {
         exit 1
     fi
 
-    python3.10 - "${SUMMARY_CSV}" "${final_json}" "${exp_id}" "${attack_mode}" "${lr}" <<'PY'
+    python3.10 - "${SUMMARY_CSV}" "${final_json}" "${exp_id}" <<'PY'
 import csv
 import json
 import sys
 
-summary_csv, final_json, exp_id, attack_mode, lr = sys.argv[1:6]
+summary_csv, final_json, exp_id = sys.argv[1:4]
 with open(final_json, "r") as file:
     data = json.load(file)
 
 fieldnames = [
     "variant",
-    "attack_mode",
-    "lr",
     "exp_id",
     "run_dir",
     "iter",
@@ -169,6 +174,7 @@ fieldnames = [
     "lambda_history",
     "lambda_history_legacy",
     "lambda_ce",
+    "lambda_siglip",
     "online_ce_mode",
     "action_gap_mode_active",
     "final_val_done_rate",
@@ -180,6 +186,7 @@ fieldnames = [
     "final_val_history2",
     "final_val_ce",
     "final_val_ce_objective",
+    "final_val_siglip_distance",
     "final_val_rollout_score",
     "final_val_gt_rollout_score",
     "final_val_active_rollout_score",
@@ -189,8 +196,6 @@ fieldnames = [
 ]
 row = {
     "variant": data["variant"],
-    "attack_mode": attack_mode,
-    "lr": lr,
     "exp_id": exp_id,
     "run_dir": data["run_dir"],
     "iter": data["iter"],
@@ -198,6 +203,7 @@ row = {
     "lambda_history": data["lambda_history"],
     "lambda_history_legacy": data["lambda_history_legacy"],
     "lambda_ce": data["lambda_ce"],
+    "lambda_siglip": data["lambda_siglip"],
     "online_ce_mode": data["online_ce_mode"],
     "action_gap_mode_active": data["action_gap_mode_active"],
     "final_val_done_rate": data["final_val_done_rate"],
@@ -209,6 +215,7 @@ row = {
     "final_val_history2": data["final_val_history2"],
     "final_val_ce": data["final_val_ce"],
     "final_val_ce_objective": data["final_val_ce_objective"],
+    "final_val_siglip_distance": data["final_val_siglip_distance"],
     "final_val_rollout_score": data["final_val_rollout_score"],
     "final_val_gt_rollout_score": data["final_val_gt_rollout_score"],
     "final_val_active_rollout_score": data["final_val_active_rollout_score"],
@@ -222,14 +229,11 @@ with open(summary_csv, "a", newline="") as file:
 PY
 }
 
-run_variant "clean_no_patch" "clean" "0.0" "0.0" "0.0" "0.0" "0.0" "off"
-run_variant "clean_random_patch_frozen" "projection" "0.0" "0.0" "0.0" "0.0" "0.0" "off"
-run_variant "ce-only" "projection" "2e-3" "0.0" "0.0" "0.0" "0.1" "pseudo_clean"
-run_variant "history1+ce" "projection" "2e-3" "0.0" "0.5" "0.0" "0.1" "pseudo_clean"
-run_variant "history2+ce" "projection" "2e-3" "0.0" "0.0" "0.5" "0.1" "pseudo_clean"
-run_variant "action+history1+ce" "projection" "2e-3" "1.0" "0.5" "0.0" "0.1" "pseudo_clean"
-run_variant "action+history2+ce" "projection" "2e-3" "1.0" "0.0" "0.5" "0.1" "pseudo_clean"
-run_variant "history1+history2" "projection" "2e-3" "0.0" "0.5" "0.5" "0.0" "off"
-run_variant "history1+history2+ce" "projection" "2e-3" "0.0" "0.5" "0.5" "0.1" "pseudo_clean"
+run_variant "gt-only" "1.0" "0.0" "0.0" "0.0" "off" "0.0"
+run_variant "gt+ce" "1.0" "0.0" "0.0" "0.1" "pseudo_clean" "0.0"
+run_variant "gt+siglip" "1.0" "0.0" "0.0" "0.0" "off" "1.0"
+run_variant "gt+history1+siglip" "1.0" "0.5" "0.0" "0.0" "off" "1.0"
+run_variant "gt+siglip+ce" "1.0" "0.0" "0.0" "0.1" "pseudo_clean" "1.0"
+run_variant "gt+history1+siglip+ce" "1.0" "0.5" "0.0" "0.1" "pseudo_clean" "1.0"
 
-echo "Round2 probe summary written to: ${SUMMARY_CSV}"
+echo "GT SiGLIP probe summary written to: ${SUMMARY_CSV}"

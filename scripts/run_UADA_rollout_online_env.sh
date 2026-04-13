@@ -1,7 +1,36 @@
 #!/bin/bash
-current_dir=$(pwd)
-echo "$current_dir"
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+current_dir="$(cd "${SCRIPT_DIR}/.." && pwd)"
+echo "${current_dir}"
 export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128,garbage_collection_threshold:0.8"
+
+# Match the historical probe budget/task-suite defaults so GT runs stay directly comparable.
+DATASET_NAME="${DATASET:-libero_spatial}"
+DEVICE_ID="${DEVICE:-6}"
+ACCUMULATE_STEPS="${ACCUMULATE:-1}"
+WARMUP_STEPS="${WARMUP:-2}"
+PHASE2_ROLLOUT_STEPS="${PHASE2_ROLLOUT:-24}"
+SAVE_INTERVAL_STEPS="${SAVE_INTERVAL:-5}"
+WANDB_PROJECT_NAME="${WANDB_PROJECT:-false}"
+WANDB_ENTITY_NAME="${WANDB_ENTITY:-1473195970-beihang-university}"
+LAMBDA_ACTION_GAP="${LAMBDA_ACTION_GAP:-1.0}"
+LAMBDA_HISTORY="${LAMBDA_HISTORY:-0.5}"
+LAMBDA_HISTORY_LEGACY="${LAMBDA_HISTORY_LEGACY:-0.5}"
+LAMBDA_CE="${LAMBDA_CE:-0.1}"
+LAMBDA_SIGLIP="${LAMBDA_SIGLIP:-0.0}"
+ONLINE_CE_MODE_NAME="${ONLINE_CE_MODE:-pseudo_clean}"
+SIGLIP_MODEL_NAME_VALUE="${SIGLIP_MODEL_NAME:-google/siglip-so400m-patch14-384}"
+SIGLIP_INPUT_SIZE_VALUE="${SIGLIP_INPUT_SIZE:-384}"
+TRAIN_TASKS_PER_ITER="${ONLINE_TRAIN_TASKS_PER_ITER:-1}"
+TRAIN_EPISODES_PER_TASK="${ONLINE_TRAIN_EPISODES_PER_TASK:-1}"
+VAL_EPISODES="${ONLINE_VAL_EPISODES:-8}"
+TASK_SUITE_NAME="${TASK_SUITE_NAME:-auto}"
+VIZ_ENABLED_VALUE="${VIZ_ENABLED:-false}"
+VIZ_SAVE_BEST_VALUE="${VIZ_SAVE_BEST:-false}"
+VIZ_SAVE_LAST_VALUE="${VIZ_SAVE_LAST:-false}"
+PHASE1_DISABLE_PROJ_RAND="${PHASE1_DISABLE_PROJECTION_RANDOMIZATION:-false}"
 
 python3.10 - <<'PY'
 import importlib.util
@@ -24,12 +53,12 @@ python3.10 VLAAttacker/UADA_rollout_online_env_wrapper.py \
     --gripper_weight 0.5 \
     --lr 2e-3 \
     --server "$current_dir" \
-    --device 3 \
-    --iter 2000 \
-    --accumulate 2 \
+    --device "${DEVICE_ID}" \
+    --iter 20 \
+    --accumulate "${ACCUMULATE_STEPS}" \
     --bs 1 \
-    --warmup 20 \
-    --tags "UADA_rollout_online_env" \
+    --warmup "${WARMUP_STEPS}" \
+    --tags "UADA_rollout_online_env" "fair_compare" \
     --geometry true \
     --attack_mode "projection" \
     --patch_size "3,22,22" \
@@ -56,17 +85,21 @@ python3.10 VLAAttacker/UADA_rollout_online_env_wrapper.py \
     --projector_vignetting 0.08 \
     --projector_distance_falloff 0.10 \
     --projector_psf false \
-    --wandb_project "projectAttack" \
-    --wandb_entity "1473195970-beihang-university" \
-    --dataset "libero_spatial" \
+    --wandb_project "${WANDB_PROJECT_NAME}" \
+    --wandb_entity "${WANDB_ENTITY_NAME}" \
+    --dataset "${DATASET_NAME}" \
     --resize_patch false \
     --phase1_ratio 0.4 \
-    --phase1_rollout 32 \
-    --phase2_rollout 128 \
-    --lambda_action_gap 1.0 \
-    --lambda_history 0.5 \
-    --lambda_ce 0.1 \
-    --save_interval 50 \
+    --phase1_rollout 8 \
+    --phase2_rollout "${PHASE2_ROLLOUT_STEPS}" \
+    --lambda_action_gap "${LAMBDA_ACTION_GAP}" \
+    --lambda_history "${LAMBDA_HISTORY}" \
+    --lambda_history_legacy "${LAMBDA_HISTORY_LEGACY}" \
+    --lambda_ce "${LAMBDA_CE}" \
+    --lambda_siglip "${LAMBDA_SIGLIP}" \
+    --siglip_model_name "${SIGLIP_MODEL_NAME_VALUE}" \
+    --siglip_input_size "${SIGLIP_INPUT_SIZE_VALUE}" \
+    --save_interval "${SAVE_INTERVAL_STEPS}" \
     --eval_enabled true \
     --val_deterministic true \
     --val_seed 42 \
@@ -74,7 +107,7 @@ python3.10 VLAAttacker/UADA_rollout_online_env_wrapper.py \
     --lighting_aug_enabled false \
     --lighting_aug_train_only false \
     --phase1_disable_lighting true \
-    --phase1_disable_projection_randomization true \
+    --phase1_disable_projection_randomization "${PHASE1_DISABLE_PROJ_RAND}" \
     --lighting_backend "ic_light" \
     --lighting_model_id "stabilityai/sdxl-turbo" \
     --lighting_pool_size 2 \
@@ -95,19 +128,25 @@ python3.10 VLAAttacker/UADA_rollout_online_env_wrapper.py \
     --record_online_val_video true \
     --record_online_video_frame_source "projected_input" \
     --record_online_video_fps 10 \
-    --viz_enabled true \
+    --viz_enabled "${VIZ_ENABLED_VALUE}" \
     --viz_policy "milestone" \
     --viz_samples 2 \
-    --viz_save_best true \
-    --viz_save_last true \
-    --task_suite_name "auto" \
-    --online_train_tasks_per_iter 2 \
-    --online_train_episodes_per_task 4 \
-    --online_val_episodes 8 \
+    --viz_save_best "${VIZ_SAVE_BEST_VALUE}" \
+    --viz_save_last "${VIZ_SAVE_LAST_VALUE}" \
+    --task_suite_name "${TASK_SUITE_NAME}" \
+    --online_train_tasks_per_iter "${TRAIN_TASKS_PER_ITER}" \
+    --online_train_episodes_per_task "${TRAIN_EPISODES_PER_TASK}" \
+    --online_val_episodes "${VAL_EPISODES}" \
     --num_steps_wait 10 \
     --max_env_steps "auto_by_suite" \
     --env_resolution 256 \
-    --online_ce_mode "pseudo_clean" \
+    --online_ce_mode "${ONLINE_CE_MODE_NAME}" \
     --env_action_source "adv" \
     --env_seed 42 \
+    --action_gap_mode "${ACTION_GAP_MODE:-gt_farthest}" \
+    --gt_dataset_root "${GT_DATASET_ROOT:-/home/yxx/roboticAttack/openvla-main/dataset}" \
+    --gt_action_bank_path "${GT_ACTION_BANK_PATH:-}" \
+    --gt_softmin_tau "${GT_SOFTMIN_TAU:-0.05}" \
+    --phase_state_mode "${PHASE_STATE_MODE:-phase_cycle}" \
+    --phase_state_cache_path "${PHASE_STATE_CACHE_PATH:-}" \
     --auto_gpu_tune false

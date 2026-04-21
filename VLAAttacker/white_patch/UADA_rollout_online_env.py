@@ -30,6 +30,38 @@ except Exception:
     from gt_phase_schedule import clamp_phase_boundary_ratios, infer_gt_phase_for_step
 
 try:
+    from white_patch.window_rollout_probe_utils import (
+        compute_window_rollout_weight,
+        infer_phase_name_from_boundaries,
+        normalize_window_rollout_metric_mode,
+        normalize_window_rollout_phase_scope,
+        resolve_phase_window,
+        select_window_rollout_metric_value,
+    )
+except Exception:
+    from window_rollout_probe_utils import (
+        compute_window_rollout_weight,
+        infer_phase_name_from_boundaries,
+        normalize_window_rollout_metric_mode,
+        normalize_window_rollout_phase_scope,
+        resolve_phase_window,
+        select_window_rollout_metric_value,
+    )
+
+try:
+    from white_patch.projector_photometric_params import (
+        LearnableProjectorPhotometricParams,
+        parse_projector_channel_gain,
+        save_projector_params,
+    )
+except Exception:
+    from projector_photometric_params import (
+        LearnableProjectorPhotometricParams,
+        parse_projector_channel_gain,
+        save_projector_params,
+    )
+
+try:
     import wandb
 except Exception:
     wandb = None
@@ -48,6 +80,16 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         self.train_gt_rollout_action_gap_joints = []
         self.train_gt_rollout_score = []
         self.train_gt_rollout_objective_score = []
+        self.train_continuous_clean_gt_action_gap = []
+        self.train_continuous_adv_gt_action_gap = []
+        self.train_continuous_rollout_delta = []
+        self.train_impulse_rollout_area = []
+        self.train_window_rollout_clean_gt_action_gap = []
+        self.train_window_rollout_adv_gt_action_gap = []
+        self.train_window_rollout_delta_weighted = []
+        self.train_window_rollout_delta_weighted_loss = []
+        self.train_total_rollout_score = []
+        self.train_total_objective_score = []
         self.train_active_rollout_action_gap = []
         self.train_active_rollout_score = []
         self.train_active_rollout_objective_score = []
@@ -57,6 +99,16 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         self.val_gt_rollout_action_gap_joints = []
         self.val_gt_rollout_score = []
         self.val_gt_rollout_objective_score = []
+        self.val_continuous_clean_gt_action_gap = []
+        self.val_continuous_adv_gt_action_gap = []
+        self.val_continuous_rollout_delta = []
+        self.val_impulse_rollout_area = []
+        self.val_window_rollout_clean_gt_action_gap = []
+        self.val_window_rollout_adv_gt_action_gap = []
+        self.val_window_rollout_delta_weighted = []
+        self.val_window_rollout_delta_weighted_loss = []
+        self.val_total_rollout_score = []
+        self.val_total_objective_score = []
         self.val_active_rollout_action_gap = []
         self.val_active_rollout_score = []
         self.val_active_rollout_objective_score = []
@@ -78,6 +130,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         self._phase_state_cache_records = {}
         self._phase_state_cache_stats = {}
         self._phase_state_cache_path = ""
+        self._init_projection_texture_path = ""
+        self._initial_projection_texture_snapshot_path = ""
+        self._initial_patch_snapshot_path = ""
 
     def _probe_metrics_path(self):
         return os.path.join(self.save_dir, "probe_metrics.csv")
@@ -99,6 +154,21 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             "ce",
             "ce_objective",
             "siglip_distance",
+            "continuous_clean_gt_action_gap",
+            "continuous_adv_gt_action_gap",
+            "continuous_rollout_delta",
+            "impulse_rollout_area",
+            "window_rollout_clean_gt_action_gap",
+            "window_rollout_adv_gt_action_gap",
+            "window_rollout_delta_weighted",
+            "window_rollout_delta_weighted_loss",
+            "window_rollout_future_steps",
+            "window_phase_name",
+            "window_start_step",
+            "window_end_step",
+            "lambda_window_rollout_loss",
+            "window_rollout_metric_mode",
+            "window_rollout_metric_value",
             "rollout_score",
             "gt_rollout_score",
             "objective_score",
@@ -107,6 +177,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             "active_action_gap",
             "active_rollout_score",
             "active_objective_score",
+            "total_rollout_score",
+            "total_objective_score",
             "episode_len",
             "done_rate",
             "action_gap_joint_0",
@@ -440,6 +512,111 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             ratios.get("post_ratio", 0.7),
         )
 
+    def _get_phase_boundary_info(self, task_id, init_state_idx):
+        phases = ("initial", "contact_manipulate", "post_contact")
+        records = {}
+        source_T = 0
+        for phase_name in phases:
+            key = (int(task_id), int(init_state_idx), phase_name)
+            record = self._phase_state_cache_records.get(key)
+            if not isinstance(record, dict):
+                continue
+            records[phase_name] = record
+            source_T = max(source_T, int(record.get("source_T", 0) or 0))
+        if source_T <= 0:
+            return None
+        contact_record = records.get("contact_manipulate", {})
+        post_record = records.get("post_contact", {})
+        contact_step = contact_record.get("source_boundary_t")
+        post_step = post_record.get("source_boundary_t")
+        return {
+            "source_T": int(source_T),
+            "contact_step": None if contact_step is None else int(contact_step),
+            "post_step": None if post_step is None else int(post_step),
+        }
+
+    def _resolve_window_rollout_probe_case(
+        self,
+        task_id,
+        init_state_idx,
+        phase_scope,
+        future_horizon,
+        exp_base,
+        max_env_steps,
+    ):
+        boundary_info = self._get_phase_boundary_info(task_id=task_id, init_state_idx=init_state_idx)
+        if boundary_info is None:
+            return None
+
+        phase_name = normalize_window_rollout_phase_scope(phase_scope)
+        window = resolve_phase_window(
+            source_T=boundary_info["source_T"],
+            contact_step=boundary_info["contact_step"],
+            post_step=boundary_info["post_step"],
+            phase_name=phase_name,
+        )
+        if window is None:
+            return None
+
+        available_steps_from_start = max(0, int(window["source_T"]) - int(window["window_start_step"]))
+        max_total_steps = min(int(max_env_steps), available_steps_from_start)
+        window_step_count = min(int(window["window_step_count"]), max_total_steps)
+        if window_step_count <= 0:
+            return None
+        future_budget = max(0, max_total_steps - window_step_count)
+        future_steps = min(max(0, int(future_horizon)), future_budget)
+        total_rollout_steps = window_step_count + future_steps
+        if total_rollout_steps <= 0:
+            return None
+
+        return {
+            "phase_name": str(window["phase_name"]),
+            "window_start_step": int(window["window_start_step"]),
+            "window_end_step": int(window["window_end_step"]),
+            "window_step_count": int(window_step_count),
+            "future_steps": int(future_steps),
+            "future_horizon": int(max(0, future_horizon)),
+            "exp_base": float(exp_base),
+            "source_T": int(window["source_T"]),
+            "contact_step": window["contact_step"],
+            "post_step": window["post_step"],
+            "total_rollout_steps": int(total_rollout_steps),
+        }
+
+    def _resolve_window_rollout_phase_scopes(self, phase_scope):
+        normalized = normalize_window_rollout_phase_scope(phase_scope)
+        if normalized == "all":
+            return ["initial", "contact_manipulate", "post_contact"]
+        return [normalized]
+
+    @staticmethod
+    def _build_fixed_train_window_spec(
+        phase_name,
+        window_step_count,
+        future_horizon,
+        exp_base,
+        max_env_steps,
+    ):
+        fixed_window_steps = max(1, int(window_step_count))
+        max_total_steps = max(1, int(max_env_steps))
+        fixed_window_steps = min(fixed_window_steps, max_total_steps)
+        future_budget = max(0, max_total_steps - fixed_window_steps)
+        future_steps = min(max(0, int(future_horizon)), future_budget)
+        total_rollout_steps = fixed_window_steps + future_steps
+        return {
+            "phase_name": str(phase_name),
+            "window_start_step": 0,
+            "window_end_step": int(max(0, fixed_window_steps - 1)),
+            "window_step_count": int(fixed_window_steps),
+            "future_steps": int(future_steps),
+            "future_horizon": int(max(0, int(future_horizon))),
+            "exp_base": float(exp_base),
+            "source_T": int(total_rollout_steps),
+            "contact_step": None,
+            "post_step": None,
+            "total_rollout_steps": int(total_rollout_steps),
+        }
+
     def _infer_gt_phase_for_step(self, split, task_description, step_idx, horizon, phase_start_name):
         phase_start = self._normalize_phase_start_name(phase_start_name)
         contact_ratio, post_ratio = self._get_gt_phase_boundary_ratio_pair(task_description)
@@ -449,6 +626,31 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             phase_start_name=phase_start,
             contact_ratio=contact_ratio,
             post_ratio=post_ratio,
+        )
+
+    def _infer_gt_phase_for_episode_step(
+        self,
+        split,
+        task_description,
+        step_idx,
+        horizon,
+        phase_start_name,
+        phase_boundary_info=None,
+        absolute_step_idx=None,
+    ):
+        if phase_boundary_info is not None and absolute_step_idx is not None:
+            return infer_phase_name_from_boundaries(
+                absolute_step_idx=int(absolute_step_idx),
+                source_T=int(phase_boundary_info.get("source_T", 0) or 0),
+                contact_step=phase_boundary_info.get("contact_step"),
+                post_step=phase_boundary_info.get("post_step"),
+            )
+        return self._infer_gt_phase_for_step(
+            split=split,
+            task_description=task_description,
+            step_idx=step_idx,
+            horizon=horizon,
+            phase_start_name=phase_start_name,
         )
 
     def _gt_cache_batch_transform(self, rlds_batch):
@@ -581,9 +783,31 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 "gt_softmin_tau": float(self._gt_softmin_tau),
                 "phase_state_cache_path": str(self._phase_state_cache_path),
                 "phase_state_cache_num_states": int(self._phase_state_cache_stats.get("num_states", 0)),
+                "init_projection_texture_path": str(self._init_projection_texture_path),
+                "initial_projection_texture_snapshot_path": str(self._initial_projection_texture_snapshot_path),
+                "initial_patch_snapshot_path": str(self._initial_patch_snapshot_path),
             }
         )
         return fields
+
+    def _save_initial_projection_snapshot(self, projection_texture):
+        initial_dir = os.path.join(self.save_dir, "initial")
+        os.makedirs(initial_dir, exist_ok=True)
+        projection_snapshot_path = os.path.join(initial_dir, "projection_texture.pt")
+        patch_snapshot_path = os.path.join(initial_dir, "patch.pt")
+        snapshot_tensor = projection_texture.detach().cpu()
+        torch.save(snapshot_tensor, projection_snapshot_path)
+        torch.save(snapshot_tensor, patch_snapshot_path)
+        self._initial_projection_texture_snapshot_path = str(projection_snapshot_path)
+        self._initial_patch_snapshot_path = str(patch_snapshot_path)
+
+    def _write_run_metadata(self):
+        metadata = {
+            "run_dir": str(self.save_dir),
+        }
+        metadata.update(self._gt_cache_log_fields())
+        with open(os.path.join(self.save_dir, "run_metadata.json"), "w") as file:
+            json.dump(metadata, file, indent=2, sort_keys=True)
 
     def _get_gt_candidate_actions(self, split, task_description, step_idx, horizon, action_dim, phase_name=None):
         split_name = "val" if str(split).lower().strip() == "val" else "train"
@@ -790,6 +1014,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         self,
         num_iter=5000,
         patch_size=[3, 50, 50],
+        init_projection_texture_path="",
         lr=1 / 255,
         accumulate_steps=1,
         maskidx=[],
@@ -802,10 +1027,19 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         phase1_rollout=8,
         phase2_rollout=24,
         lambda_action_gap=1.0,
-        lambda_history=0.5,
+        lambda_history=0.0,
         lambda_history_legacy=0.0,
-        lambda_ce=0.0,
-        lambda_siglip=0.0,
+        lambda_ce=0.02,
+        lambda_ce_phase2=0.0,
+        lambda_continuous_rollout=0.0,
+        lambda_window_rollout_loss=0.0,
+        impulse_rollout_metric_enabled=False,
+        window_rollout_probe_enabled=False,
+        window_rollout_metric_mode="delta_weighted",
+        window_rollout_exp_base=0.9,
+        window_rollout_future_horizon=8,
+        window_rollout_phase_scope="all",
+        lambda_siglip=0.15,
         siglip_model_name=DEFAULT_SIGLIP_MODEL_NAME,
         siglip_input_size=384,
         save_interval=100,
@@ -827,6 +1061,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         ic_light_bg_control="legacy_prompt",
         lighting_aug_train_only=False,
         phase1_disable_lighting=False,
+        projection_randomization_enabled=True,
         phase1_disable_projection_randomization=False,
         attack_mode="projection",
         projection_size=None,
@@ -848,6 +1083,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         projector_gamma=1.8,
         projector_gain=1.35,
         projector_channel_gain=(1.08, 1.04, 1.00),
+        learn_projector_gain=False,
+        learn_projector_channel_gain=False,
+        photometric_lr_ratio=0.1,
         projector_ambient=0.08,
         projector_vignetting=0.08,
         projector_distance_falloff=0.10,
@@ -859,10 +1097,11 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         viz_save_last=True,
         task_suite_name="auto",
         online_train_tasks_per_iter=1,
-        online_train_episodes_per_task=1,
+        online_train_episodes_per_task=10,
         online_val_episodes=8,
         num_steps_wait=10,
         max_env_steps="auto_by_suite",
+        val_max_env_steps=120,
         env_resolution=256,
         online_ce_mode="pseudo_clean",
         env_action_source="adv",
@@ -909,18 +1148,25 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         projection_texture = torch.rand(projection_size, device=self.vla.device)
         projection_texture.requires_grad_(True)
         projection_texture.retain_grad()
-
-        if self.optimizer != "adamW":
-            raise ValueError("UADA_rollout_online_env currently supports optimizer='adamW' only.")
-
-        optimizer = transformers.AdamW([projection_texture], lr=lr)
-        scheduler = transformers.get_cosine_schedule_with_warmup(
-            optimizer=optimizer,
-            num_warmup_steps=warmup,
-            num_training_steps=max(1, int(num_iter / max(1, accumulate_steps))),
-            num_cycles=0.5,
-            last_epoch=-1,
-        )
+        init_projection_path_value = "" if init_projection_texture_path is None else str(init_projection_texture_path).strip()
+        if init_projection_path_value.lower() not in ("", "none", "null"):
+            init_projection_path = Path(os.path.abspath(os.path.expanduser(init_projection_path_value)))
+            if not init_projection_path.exists():
+                raise FileNotFoundError(f"init_projection_texture_path not found: `{init_projection_path}`.")
+            loaded_projection = torch.load(init_projection_path, map_location=self.vla.device)
+            loaded_projection = torch.as_tensor(loaded_projection, device=self.vla.device, dtype=projection_texture.dtype)
+            if tuple(loaded_projection.shape) != tuple(projection_texture.shape):
+                raise ValueError(
+                    "Loaded projection texture shape mismatch: "
+                    f"expected {tuple(projection_texture.shape)}, got {tuple(loaded_projection.shape)} "
+                    f"from `{init_projection_path}`."
+                )
+            with torch.no_grad():
+                projection_texture.copy_(loaded_projection)
+            self._init_projection_texture_path = str(init_projection_path)
+        else:
+            self._init_projection_texture_path = ""
+        self._save_initial_projection_snapshot(projection_texture)
 
         phase1_ratio = float(min(max(phase1_ratio, 0.0), 1.0))
         phase1_end_iter = int(num_iter * phase1_ratio)
@@ -934,12 +1180,25 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         lambda_history = float(lambda_history)
         lambda_history_legacy = float(lambda_history_legacy)
         lambda_ce = float(lambda_ce)
+        lambda_ce_phase2 = float(lambda_ce_phase2)
+        lambda_continuous_rollout = float(lambda_continuous_rollout)
+        lambda_window_rollout_loss = float(lambda_window_rollout_loss)
+        impulse_rollout_metric_enabled = bool(impulse_rollout_metric_enabled)
+        window_rollout_probe_enabled = bool(window_rollout_probe_enabled)
+        window_rollout_metric_mode = normalize_window_rollout_metric_mode(window_rollout_metric_mode)
+        window_rollout_exp_base = float(window_rollout_exp_base)
+        window_rollout_future_horizon = max(0, int(window_rollout_future_horizon))
+        window_rollout_phase_scope = normalize_window_rollout_phase_scope(window_rollout_phase_scope)
         lambda_siglip = float(lambda_siglip)
         siglip_model_name = str(siglip_model_name)
         siglip_input_size = max(1, int(siglip_input_size))
         eval_enabled = bool(eval_enabled)
+        learn_projector_gain = bool(learn_projector_gain)
+        learn_projector_channel_gain = bool(learn_projector_channel_gain)
+        photometric_lr_ratio = max(0.0, float(photometric_lr_ratio))
         self.lighting_aug_train_only = bool(lighting_aug_train_only)
         phase1_disable_lighting = bool(phase1_disable_lighting)
+        projection_randomization_enabled = bool(projection_randomization_enabled)
         phase1_disable_projection_randomization = bool(phase1_disable_projection_randomization)
         viz_enabled = bool(viz_enabled)
         viz_policy = str(viz_policy).lower()
@@ -949,6 +1208,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         online_val_episodes = max(1, int(online_val_episodes))
         num_steps_wait = max(0, int(num_steps_wait))
         env_resolution = max(64, int(env_resolution))
+        val_max_env_steps = max(1, int(val_max_env_steps))
         dataset_name = str(dataset_name).strip()
         action_gap_mode = str(action_gap_mode).lower().strip()
         if action_gap_mode not in ("clean_adv", "gt_farthest"):
@@ -992,6 +1252,34 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             raise ValueError("--online_ce_mode must be one of {off, pseudo_clean, uada_inverse_pseudo_clean}")
         if online_ce_mode == "off":
             lambda_ce = 0.0
+            lambda_ce_phase2 = 0.0
+
+        if self.optimizer != "adamW":
+            raise ValueError("UADA_rollout_online_env currently supports optimizer='adamW' only.")
+
+        photometric_params = LearnableProjectorPhotometricParams(
+            projector_gain=projector_gain,
+            projector_channel_gain=projector_channel_gain,
+            learn_projector_gain=learn_projector_gain,
+            learn_projector_channel_gain=learn_projector_channel_gain,
+            device=self.vla.device,
+        )
+        optimizer_param_groups = [{"params": [projection_texture], "lr": lr}]
+        if photometric_params.has_trainable_params():
+            optimizer_param_groups.append(
+                {
+                    "params": list(photometric_params.parameters()),
+                    "lr": float(lr) * float(photometric_lr_ratio),
+                }
+            )
+        optimizer = transformers.AdamW(optimizer_param_groups, lr=lr)
+        scheduler = transformers.get_cosine_schedule_with_warmup(
+            optimizer=optimizer,
+            num_warmup_steps=warmup,
+            num_training_steps=max(1, int(num_iter / max(1, accumulate_steps))),
+            num_cycles=0.5,
+            last_epoch=-1,
+        )
 
         siglip_model = None
         if lambda_siglip > 0.0:
@@ -1031,7 +1319,14 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         action_dim = len(action_stats["q01"])
         self._action_gap_mode = action_gap_mode
         self._gt_dataset_root = gt_dataset_root
-        if action_gap_mode == "gt_farthest":
+        needs_gt_action_bank = (
+            (action_gap_mode == "gt_farthest")
+            or (lambda_continuous_rollout > 0.0)
+            or (lambda_window_rollout_loss > 0.0)
+            or bool(impulse_rollout_metric_enabled)
+            or bool(window_rollout_probe_enabled)
+        )
+        if needs_gt_action_bank:
             required_instruction_keys = self._collect_required_gt_instruction_keys(task_suite)
             self._build_gt_phase_action_bank(
                 gt_action_bank_path=gt_action_bank_path,
@@ -1046,7 +1341,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             self._gt_phase_action_bank_stats = {}
             self._gt_phase_boundary_ratios = {}
             self._gt_action_bank_path = ""
-        if phase_state_mode == "phase_cycle":
+        if phase_state_mode == "phase_cycle" or window_rollout_probe_enabled or (lambda_window_rollout_loss > 0.0):
             self._load_phase_state_cache(
                 phase_state_cache_path=phase_state_cache_path,
                 dataset_name=dataset_name,
@@ -1059,10 +1354,24 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         print(
             "[OnlineEnv] initialized "
             f"(suite={resolved_suite_name}, action_dim={action_dim}, max_env_steps={max_env_steps}, ce_mode={online_ce_mode}, "
-            f"action_gap_mode={action_gap_mode}, lambda_siglip={lambda_siglip}, gt_dataset_root={gt_dataset_root}, "
+            f"val_max_env_steps={val_max_env_steps}, "
+            f"action_gap_mode={action_gap_mode}, lambda_ce={lambda_ce}, lambda_ce_phase2={lambda_ce_phase2}, "
+            f"lambda_continuous_rollout={lambda_continuous_rollout}, "
+            f"lambda_window_rollout_loss={lambda_window_rollout_loss}, "
+            f"impulse_rollout_metric_enabled={int(impulse_rollout_metric_enabled)}, "
+            f"init_projection_texture_path={init_projection_path_value}, "
+            f"window_rollout_probe_enabled={int(window_rollout_probe_enabled)}, "
+            f"window_rollout_metric_mode={window_rollout_metric_mode}, "
+            f"window_rollout_exp_base={window_rollout_exp_base}, "
+            f"window_rollout_future_horizon={window_rollout_future_horizon}, "
+            f"window_rollout_phase_scope={window_rollout_phase_scope}, "
+            f"lambda_siglip={lambda_siglip}, gt_dataset_root={gt_dataset_root}, "
             f"gt_action_bank_path={self._gt_action_bank_path}, phase_state_mode={phase_state_mode}, "
-            f"phase_state_cache_path={self._phase_state_cache_path}, gt_softmin_tau={gt_softmin_tau})"
+            f"phase_state_cache_path={self._phase_state_cache_path}, gt_softmin_tau={gt_softmin_tau}, "
+            f"projection_randomization_enabled={int(projection_randomization_enabled)}, "
+            f"initial_patch_snapshot_path={self._initial_patch_snapshot_path})"
         )
+        self._write_run_metadata()
         gpu_tuner_state = self._init_gpu_tuner_state(
             enabled=auto_gpu_tune,
             mode=gpu_tune_mode,
@@ -1089,6 +1398,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         train_phase_start_counter = 0
         for i in tqdm(range(num_iter)):
             phase_id = 1 if i < phase1_end_iter else 2
+            effective_lambda_ce = lambda_ce if phase_id == 1 else lambda_ce_phase2
             base_rollout_steps = base_phase1_rollout if phase_id == 1 else base_phase2_rollout
             tune_level_for_iter = int(gpu_tuner_state["level"]) if auto_gpu_tune else 2
             if auto_gpu_tune:
@@ -1103,8 +1413,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
 
             rollout_steps = eff_phase1_rollout if phase_id == 1 else eff_phase2_rollout
             train_disable_lighting = bool((phase_id == 1) and phase1_disable_lighting)
-            train_projection_randomization_enabled = not bool(
-                (phase_id == 1) and phase1_disable_projection_randomization
+            train_projection_randomization_enabled = bool(
+                projection_randomization_enabled
+                and (not bool((phase_id == 1) and phase1_disable_projection_randomization))
             )
             train_effective_lighting_enabled = int(
                 self._is_lighting_enabled_for_split("train") and (not train_disable_lighting)
@@ -1127,6 +1438,14 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             train_ce = 0.0
             train_ce_objective = 0.0
             train_siglip_distance = 0.0
+            train_continuous_clean_gt_action_gap = 0.0
+            train_continuous_adv_gt_action_gap = 0.0
+            train_continuous_rollout_delta = 0.0
+            train_impulse_rollout_area = 0.0
+            train_window_rollout_clean_gt_action_gap = 0.0
+            train_window_rollout_adv_gt_action_gap = 0.0
+            train_window_rollout_delta_weighted = 0.0
+            train_window_rollout_delta_weighted_loss = 0.0
             train_proj_alpha = 0.0
             train_proj_coverage = 0.0
             train_proj_bottom = 0.0
@@ -1159,14 +1478,33 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                             phase_start_name=phase_start_name,
                             default_init_state=init_state,
                         )
+                        train_window_rollout_spec = None
+                        if window_rollout_probe_enabled or (lambda_window_rollout_loss > 0.0):
+                            # Train-time window length follows current phase rollout budget:
+                            # phase1 -> phase1_rollout, phase2 -> phase2_rollout, then append future k steps.
+                            train_window_rollout_spec = self._build_fixed_train_window_spec(
+                                phase_name=phase_start_name,
+                                window_step_count=rollout_steps,
+                                future_horizon=window_rollout_future_horizon,
+                                exp_base=window_rollout_exp_base,
+                                max_env_steps=max_env_steps,
+                            )
+                        episode_rollout_steps = int(rollout_steps)
+                        if isinstance(train_window_rollout_spec, dict):
+                            episode_rollout_steps = int(
+                                train_window_rollout_spec.get("total_rollout_steps", episode_rollout_steps)
+                            )
                         episode = self._run_online_episode(
                             env=env,
+                            task=task,
+                            get_libero_env=get_libero_env,
                             get_libero_image=get_libero_image,
                             get_libero_dummy_action=get_libero_dummy_action,
                             init_state=phase_init_state,
+                            init_state_idx=init_state_idx,
                             task_description=task_description,
                             projection_texture=projection_texture,
-                            rollout_steps=rollout_steps,
+                            rollout_steps=episode_rollout_steps,
                             max_env_steps=max_env_steps,
                             num_steps_wait=num_steps_wait,
                             split="train",
@@ -1179,7 +1517,13 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                             lambda_action_gap=lambda_action_gap,
                             lambda_history=lambda_history,
                             lambda_history_legacy=lambda_history_legacy,
-                            lambda_ce=lambda_ce,
+                            lambda_ce=effective_lambda_ce,
+                            lambda_continuous_rollout=lambda_continuous_rollout,
+                            lambda_window_rollout_loss=lambda_window_rollout_loss,
+                            impulse_rollout_metric_enabled=impulse_rollout_metric_enabled,
+                            window_rollout_probe_enabled=bool(train_window_rollout_spec is not None),
+                            window_rollout_metric_mode=window_rollout_metric_mode,
+                            window_rollout_spec=train_window_rollout_spec,
                             lambda_siglip=lambda_siglip,
                             siglip_model=siglip_model,
                             siglip_input_size=siglip_input_size,
@@ -1203,10 +1547,12 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                             projector_gamma=projector_gamma,
                             projector_gain=projector_gain,
                             projector_channel_gain=projector_channel_gain,
+                            learnable_projector_params=photometric_params,
                             projector_ambient=projector_ambient,
                             projector_vignetting=projector_vignetting,
                             projector_distance_falloff=projector_distance_falloff,
                             projector_psf=projector_psf,
+                            env_resolution=env_resolution,
                             projection_randomization_enabled=train_projection_randomization_enabled,
                             need_backward=True,
                             capture_visual=False,
@@ -1230,6 +1576,14 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                         train_ce += episode["ce_value"]
                         train_ce_objective += episode["ce_objective_value"]
                         train_siglip_distance += episode["siglip_distance"]
+                        train_continuous_clean_gt_action_gap += episode["continuous_clean_gt_action_gap"]
+                        train_continuous_adv_gt_action_gap += episode["continuous_adv_gt_action_gap"]
+                        train_continuous_rollout_delta += episode["continuous_rollout_delta"]
+                        train_impulse_rollout_area += episode["impulse_rollout_area"]
+                        train_window_rollout_clean_gt_action_gap += episode["window_rollout_clean_gt_action_gap"]
+                        train_window_rollout_adv_gt_action_gap += episode["window_rollout_adv_gt_action_gap"]
+                        train_window_rollout_delta_weighted += episode["window_rollout_delta_weighted"]
+                        train_window_rollout_delta_weighted_loss += episode["window_rollout_delta_weighted_loss"]
                         train_proj_alpha += episode["projection_alpha"]
                         train_proj_coverage += episode["projection_coverage"]
                         train_proj_bottom += episode["projection_bottom"]
@@ -1250,9 +1604,13 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 print(f"[OnlineEnv] iter {i}: no valid episodes processed, skipping optimizer step.")
                 continue
 
+            grad_scale = float(max(1, train_episode_count * accumulate_steps))
             if projection_texture.grad is not None:
-                grad_scale = float(max(1, train_episode_count * accumulate_steps))
                 projection_texture.grad.div_(grad_scale)
+            if photometric_params.has_trainable_params():
+                for param in photometric_params.parameters():
+                    if param.grad is not None:
+                        param.grad.div_(grad_scale)
 
             log_patch_grad = 0.0
             if projection_texture.grad is not None:
@@ -1265,6 +1623,12 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 optimizer.zero_grad()
                 scheduler.step()
 
+            current_projector_gain, current_projector_channel_gain = photometric_params.resolved_values()
+            current_projector_gain_value = float(current_projector_gain.detach().cpu().item())
+            current_projector_channel_gain_values = [
+                float(v) for v in current_projector_channel_gain.detach().cpu().tolist()
+            ]
+
             avg_action_gap = train_action_gap / float(max(1, train_episode_count))
             avg_gt_action_gap = train_gt_action_gap / float(max(1, train_episode_count))
             avg_history_div = train_history_div / float(max(1, train_episode_count))
@@ -1272,6 +1636,25 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             avg_ce = train_ce / float(max(1, train_episode_count))
             avg_ce_objective = train_ce_objective / float(max(1, train_episode_count))
             avg_siglip_distance = train_siglip_distance / float(max(1, train_episode_count))
+            avg_continuous_clean_gt_action_gap = train_continuous_clean_gt_action_gap / float(max(1, train_episode_count))
+            avg_continuous_adv_gt_action_gap = train_continuous_adv_gt_action_gap / float(max(1, train_episode_count))
+            avg_continuous_rollout_delta = train_continuous_rollout_delta / float(max(1, train_episode_count))
+            avg_impulse_rollout_area = train_impulse_rollout_area / float(max(1, train_episode_count))
+            avg_window_rollout_clean_gt_action_gap = train_window_rollout_clean_gt_action_gap / float(
+                max(1, train_episode_count)
+            )
+            avg_window_rollout_adv_gt_action_gap = train_window_rollout_adv_gt_action_gap / float(
+                max(1, train_episode_count)
+            )
+            avg_window_rollout_delta_weighted = train_window_rollout_delta_weighted / float(max(1, train_episode_count))
+            avg_window_rollout_delta_weighted_loss = train_window_rollout_delta_weighted_loss / float(
+                max(1, train_episode_count)
+            )
+            avg_window_rollout_metric_value = select_window_rollout_metric_value(
+                metric_mode=window_rollout_metric_mode,
+                delta_weighted=avg_window_rollout_delta_weighted,
+                adv_gt_action_gap=avg_window_rollout_adv_gt_action_gap,
+            )
             avg_proj_alpha = train_proj_alpha / float(max(1, train_episode_count))
             avg_proj_coverage = train_proj_coverage / float(max(1, train_episode_count))
             avg_proj_bottom = train_proj_bottom / float(max(1, train_episode_count))
@@ -1292,11 +1675,17 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 + (lambda_history_legacy * avg_history_div_legacy)
                 + (lambda_siglip * avg_siglip_distance)
             )
-            objective_score = rollout_score - (lambda_ce * avg_ce_objective)
-            gt_objective_score = gt_rollout_score - (lambda_ce * avg_ce_objective)
+            objective_score = rollout_score - (effective_lambda_ce * avg_ce_objective)
+            gt_objective_score = gt_rollout_score - (effective_lambda_ce * avg_ce_objective)
             active_action_gap = avg_gt_action_gap if action_gap_mode == "gt_farthest" else avg_action_gap
             active_rollout_score = gt_rollout_score if action_gap_mode == "gt_farthest" else rollout_score
             active_objective_score = gt_objective_score if action_gap_mode == "gt_farthest" else objective_score
+            total_rollout_score = (
+                active_rollout_score
+                + (lambda_continuous_rollout * avg_continuous_rollout_delta)
+                + (lambda_window_rollout_loss * avg_window_rollout_metric_value)
+            )
+            total_objective_score = total_rollout_score - (effective_lambda_ce * avg_ce_objective)
             gpu_stats = self._collect_gpu_runtime_stats(device_index=gpu_tuner_state["device_index"])
             autotune_action = "hold(disabled)"
             if auto_gpu_tune:
@@ -1319,13 +1708,23 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             self.train_gt_rollout_action_gap_joints.append(avg_gt_per_joint_gap.detach().cpu().tolist())
             self.train_gt_rollout_score.append(gt_rollout_score)
             self.train_gt_rollout_objective_score.append(gt_objective_score)
+            self.train_continuous_clean_gt_action_gap.append(avg_continuous_clean_gt_action_gap)
+            self.train_continuous_adv_gt_action_gap.append(avg_continuous_adv_gt_action_gap)
+            self.train_continuous_rollout_delta.append(avg_continuous_rollout_delta)
+            self.train_impulse_rollout_area.append(avg_impulse_rollout_area)
+            self.train_window_rollout_clean_gt_action_gap.append(avg_window_rollout_clean_gt_action_gap)
+            self.train_window_rollout_adv_gt_action_gap.append(avg_window_rollout_adv_gt_action_gap)
+            self.train_window_rollout_delta_weighted.append(avg_window_rollout_delta_weighted)
+            self.train_window_rollout_delta_weighted_loss.append(avg_window_rollout_delta_weighted_loss)
+            self.train_total_rollout_score.append(total_rollout_score)
+            self.train_total_objective_score.append(total_objective_score)
             self.train_active_rollout_action_gap.append(active_action_gap)
             self.train_active_rollout_score.append(active_rollout_score)
             self.train_active_rollout_objective_score.append(active_objective_score)
             self.train_phase_id.append(phase_id)
             self.train_online_done_rate.append(avg_done_rate)
             self.train_online_episode_len.append(avg_ep_len)
-            self.loss_buffer.append(active_rollout_score)
+            self.loss_buffer.append(total_rollout_score)
 
             train_logdata = {
                 "TRAIN_online_rollout_action_gap": avg_action_gap,
@@ -1345,12 +1744,32 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 "TRAIN_online_episode_len": avg_ep_len,
                 "TRAIN_online_ce": avg_ce,
                 "TRAIN_online_ce_objective": avg_ce_objective,
+                "TRAIN_lambda_ce_effective": float(effective_lambda_ce),
+                "TRAIN_lambda_continuous_rollout": float(lambda_continuous_rollout),
+                "TRAIN_lambda_window_rollout_loss": float(lambda_window_rollout_loss),
+                "TRAIN_impulse_rollout_metric_enabled": int(impulse_rollout_metric_enabled),
+                "TRAIN_online_continuous_clean_gt_action_gap": avg_continuous_clean_gt_action_gap,
+                "TRAIN_online_continuous_adv_gt_action_gap": avg_continuous_adv_gt_action_gap,
+                "TRAIN_online_continuous_rollout_delta": avg_continuous_rollout_delta,
+                "TRAIN_online_impulse_rollout_area": avg_impulse_rollout_area,
+                "TRAIN_online_window_rollout_clean_gt_action_gap": avg_window_rollout_clean_gt_action_gap,
+                "TRAIN_online_window_rollout_adv_gt_action_gap": avg_window_rollout_adv_gt_action_gap,
+                "TRAIN_online_window_rollout_delta_weighted": avg_window_rollout_delta_weighted,
+                "TRAIN_online_window_rollout_delta_weighted_loss": avg_window_rollout_delta_weighted_loss,
+                "TRAIN_online_window_rollout_metric_mode": str(window_rollout_metric_mode),
+                "TRAIN_online_window_rollout_metric_value": avg_window_rollout_metric_value,
+                "TRAIN_online_total_rollout_score": total_rollout_score,
+                "TRAIN_online_total_objective_score": total_objective_score,
                 "TRAIN_patch_gradient": log_patch_grad,
                 "TRAIN_LR": optimizer.param_groups[0]["lr"],
                 "TRAIN_projection_alpha_mean": avg_proj_alpha,
                 "TRAIN_projection_coverage_ratio": avg_proj_coverage,
                 "TRAIN_projection_bottom_ratio": avg_proj_bottom,
                 "TRAIN_projection_keystone": avg_proj_keystone,
+                "TRAIN_projector_gain": current_projector_gain_value,
+                "TRAIN_projector_channel_gain_r": current_projector_channel_gain_values[0],
+                "TRAIN_projector_channel_gain_g": current_projector_channel_gain_values[1],
+                "TRAIN_projector_channel_gain_b": current_projector_channel_gain_values[2],
                 "phase_id": phase_id,
                 "attack_mode": attack_mode,
                 "online_task_suite": resolved_suite_name,
@@ -1399,6 +1818,21 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                         "ce": float(avg_ce),
                         "ce_objective": float(avg_ce_objective),
                         "siglip_distance": float(avg_siglip_distance),
+                        "continuous_clean_gt_action_gap": float(avg_continuous_clean_gt_action_gap),
+                        "continuous_adv_gt_action_gap": float(avg_continuous_adv_gt_action_gap),
+                        "continuous_rollout_delta": float(avg_continuous_rollout_delta),
+                        "impulse_rollout_area": float(avg_impulse_rollout_area),
+                        "window_rollout_clean_gt_action_gap": float(avg_window_rollout_clean_gt_action_gap),
+                        "window_rollout_adv_gt_action_gap": float(avg_window_rollout_adv_gt_action_gap),
+                        "window_rollout_delta_weighted": float(avg_window_rollout_delta_weighted),
+                        "window_rollout_delta_weighted_loss": float(avg_window_rollout_delta_weighted_loss),
+                        "window_rollout_future_steps": "",
+                        "window_phase_name": "",
+                        "window_start_step": "",
+                        "window_end_step": "",
+                        "lambda_window_rollout_loss": float(lambda_window_rollout_loss),
+                        "window_rollout_metric_mode": str(window_rollout_metric_mode),
+                        "window_rollout_metric_value": float(avg_window_rollout_metric_value),
                         "rollout_score": float(rollout_score),
                         "gt_rollout_score": float(gt_rollout_score),
                         "objective_score": float(objective_score),
@@ -1407,6 +1841,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                         "active_action_gap": float(active_action_gap),
                         "active_rollout_score": float(active_rollout_score),
                         "active_objective_score": float(active_objective_score),
+                        "total_rollout_score": float(total_rollout_score),
+                        "total_objective_score": float(total_objective_score),
                         "episode_len": float(avg_ep_len),
                         "done_rate": float(avg_done_rate),
                         "action_gap_joint_0": float(avg_per_joint_gap[0].item()) if avg_per_joint_gap.numel() > 0 else "",
@@ -1446,7 +1882,12 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     and record_online_val_video
                     and ((not record_online_videos_last_only) or (i == num_iter - 1))
                 )
-                eval_rollout_steps = int(max_env_steps) if probe_mode else int(base_rollout_steps)
+                eval_projector_gain, eval_projector_channel_gain = photometric_params.resolved_values()
+                eval_max_env_steps = int(min(int(max_env_steps), int(val_max_env_steps)))
+                eval_rollout_steps = int(eval_max_env_steps)
+                eval_projection_randomization_enabled = bool(
+                    (str(attack_mode).lower() == "projection") and projection_randomization_enabled
+                )
                 val_stats, visual_frames, val_video_episode = self._evaluate_online_rollout(
                     task_suite=task_suite,
                     get_libero_env=get_libero_env,
@@ -1454,7 +1895,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     get_libero_dummy_action=get_libero_dummy_action,
                     projection_texture=projection_texture,
                     rollout_steps=eval_rollout_steps,
-                    max_env_steps=max_env_steps,
+                    max_env_steps=eval_max_env_steps,
                     num_steps_wait=num_steps_wait,
                     online_val_episodes=online_val_episodes,
                     global_iter=i,
@@ -1466,7 +1907,15 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     lambda_action_gap=lambda_action_gap,
                     lambda_history=lambda_history,
                     lambda_history_legacy=lambda_history_legacy,
-                    lambda_ce=lambda_ce,
+                    lambda_ce=effective_lambda_ce,
+                    lambda_continuous_rollout=lambda_continuous_rollout,
+                    lambda_window_rollout_loss=lambda_window_rollout_loss,
+                    impulse_rollout_metric_enabled=impulse_rollout_metric_enabled,
+                    window_rollout_probe_enabled=window_rollout_probe_enabled,
+                    window_rollout_metric_mode=window_rollout_metric_mode,
+                    window_rollout_exp_base=window_rollout_exp_base,
+                    window_rollout_future_horizon=window_rollout_future_horizon,
+                    window_rollout_phase_scope=window_rollout_phase_scope,
                     lambda_siglip=lambda_siglip,
                     siglip_model=siglip_model,
                     siglip_input_size=siglip_input_size,
@@ -1488,8 +1937,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     projection_keystone=projection_keystone,
                     projection_keystone_jitter=projection_keystone_jitter,
                     projector_gamma=projector_gamma,
-                    projector_gain=projector_gain,
-                    projector_channel_gain=projector_channel_gain,
+                    projector_gain=eval_projector_gain,
+                    projector_channel_gain=eval_projector_channel_gain,
                     projector_ambient=projector_ambient,
                     projector_vignetting=projector_vignetting,
                     projector_distance_falloff=projector_distance_falloff,
@@ -1499,6 +1948,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     val_deterministic=val_deterministic,
                     val_seed=val_seed,
                     val_disable_lighting=val_disable_lighting,
+                    projection_randomization_enabled=eval_projection_randomization_enabled,
                     probe_mode=probe_mode,
                     record_video_frames=should_record_val_video,
                     video_frame_source=record_online_video_frame_source,
@@ -1509,8 +1959,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     self._is_lighting_enabled_for_split("val") and (not bool(val_disable_lighting))
                 )
                 val_stats["VAL_effective_projection_randomization_enabled"] = int(
-                    str(attack_mode).lower() == "projection"
+                    eval_projection_randomization_enabled
                 )
+                val_stats["VAL_lambda_ce_effective"] = float(effective_lambda_ce)
                 val_stats["VAL_autotune_enabled"] = int(auto_gpu_tune)
                 val_stats["VAL_autotune_level_snapshot"] = int(tune_level_for_iter)
 
@@ -1529,6 +1980,26 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 self.val_rollout_objective_score.append(val_stats["VAL_online_objective_score"])
                 self.val_gt_rollout_score.append(val_stats["VAL_online_gt_rollout_score"])
                 self.val_gt_rollout_objective_score.append(val_stats["VAL_online_gt_objective_score"])
+                self.val_continuous_clean_gt_action_gap.append(
+                    val_stats["VAL_online_continuous_clean_gt_action_gap"]
+                )
+                self.val_continuous_adv_gt_action_gap.append(
+                    val_stats["VAL_online_continuous_adv_gt_action_gap"]
+                )
+                self.val_continuous_rollout_delta.append(val_stats["VAL_online_continuous_rollout_delta"])
+                self.val_impulse_rollout_area.append(val_stats["VAL_online_impulse_rollout_area"])
+                self.val_window_rollout_clean_gt_action_gap.append(
+                    val_stats["VAL_online_window_rollout_clean_gt_action_gap"]
+                )
+                self.val_window_rollout_adv_gt_action_gap.append(
+                    val_stats["VAL_online_window_rollout_adv_gt_action_gap"]
+                )
+                self.val_window_rollout_delta_weighted.append(val_stats["VAL_online_window_rollout_delta_weighted"])
+                self.val_window_rollout_delta_weighted_loss.append(
+                    val_stats["VAL_online_window_rollout_delta_weighted_loss"]
+                )
+                self.val_total_rollout_score.append(val_stats["VAL_online_total_rollout_score"])
+                self.val_total_objective_score.append(val_stats["VAL_online_total_objective_score"])
                 self.val_active_rollout_action_gap.append(val_stats["VAL_online_active_action_gap"])
                 self.val_active_rollout_score.append(val_stats["VAL_online_active_rollout_score"])
                 self.val_active_rollout_objective_score.append(val_stats["VAL_online_active_objective_score"])
@@ -1556,7 +2027,11 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                             "split": "val",
                             "probe_variant": probe_variant,
                             "rollout_steps_used": int(eval_rollout_steps),
-                            "horizon_type": "full_horizon",
+                            "horizon_type": (
+                                "full_horizon_with_phase_window_metric"
+                                if window_rollout_probe_enabled
+                                else "full_horizon"
+                            ),
                             "action_gap": float(val_stats["VAL_online_rollout_action_gap"]),
                             "gt_action_gap": float(val_stats["VAL_online_gt_action_gap"]),
                             "history1": float(val_stats["VAL_online_rollout_history_div"]),
@@ -1564,6 +2039,37 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                             "ce": float(val_stats["VAL_online_ce"]),
                             "ce_objective": float(val_stats["VAL_online_ce_objective"]),
                             "siglip_distance": float(val_stats["VAL_online_siglip_distance"]),
+                            "continuous_clean_gt_action_gap": float(
+                                val_stats["VAL_online_continuous_clean_gt_action_gap"]
+                            ),
+                            "continuous_adv_gt_action_gap": float(
+                                val_stats["VAL_online_continuous_adv_gt_action_gap"]
+                            ),
+                            "continuous_rollout_delta": float(val_stats["VAL_online_continuous_rollout_delta"]),
+                            "impulse_rollout_area": float(val_stats["VAL_online_impulse_rollout_area"]),
+                            "window_rollout_clean_gt_action_gap": float(
+                                val_stats["VAL_online_window_rollout_clean_gt_action_gap"]
+                            ),
+                            "window_rollout_adv_gt_action_gap": float(
+                                val_stats["VAL_online_window_rollout_adv_gt_action_gap"]
+                            ),
+                            "window_rollout_delta_weighted": float(
+                                val_stats["VAL_online_window_rollout_delta_weighted"]
+                            ),
+                            "window_rollout_delta_weighted_loss": float(
+                                val_stats["VAL_online_window_rollout_delta_weighted_loss"]
+                            ),
+                            "window_rollout_future_steps": float(
+                                val_stats["VAL_online_window_rollout_future_steps"]
+                            ),
+                            "window_phase_name": str(val_stats["VAL_online_window_phase_name"]),
+                            "window_start_step": float(val_stats["VAL_online_window_start_step"]),
+                            "window_end_step": float(val_stats["VAL_online_window_end_step"]),
+                            "lambda_window_rollout_loss": float(lambda_window_rollout_loss),
+                            "window_rollout_metric_mode": str(window_rollout_metric_mode),
+                            "window_rollout_metric_value": float(
+                                val_stats["VAL_online_window_rollout_metric_value"]
+                            ),
                             "rollout_score": float(val_stats["VAL_online_rollout_score"]),
                             "gt_rollout_score": float(val_stats["VAL_online_gt_rollout_score"]),
                             "objective_score": float(val_stats["VAL_online_objective_score"]),
@@ -1572,6 +2078,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                             "active_action_gap": float(val_stats["VAL_online_active_action_gap"]),
                             "active_rollout_score": float(val_stats["VAL_online_active_rollout_score"]),
                             "active_objective_score": float(val_stats["VAL_online_active_objective_score"]),
+                            "total_rollout_score": float(val_stats["VAL_online_total_rollout_score"]),
+                            "total_objective_score": float(val_stats["VAL_online_total_objective_score"]),
                             "episode_len": float(val_stats["VAL_online_episode_len"]),
                             "done_rate": float(val_stats["VAL_online_done_rate"]),
                             "action_gap_joint_0": float(val_stats.get("VAL_online_rollout_action_gap_joint_0", "")) if "VAL_online_rollout_action_gap_joint_0" in val_stats else "",
@@ -1597,7 +2105,17 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                                 "lambda_action_gap": float(lambda_action_gap),
                                 "lambda_history": float(lambda_history),
                                 "lambda_history_legacy": float(lambda_history_legacy),
-                                "lambda_ce": float(lambda_ce),
+                                "lambda_ce": float(effective_lambda_ce),
+                                "lambda_ce_configured": float(lambda_ce),
+                                "lambda_ce_phase2": float(lambda_ce_phase2),
+                                "lambda_continuous_rollout": float(lambda_continuous_rollout),
+                                "lambda_window_rollout_loss": float(lambda_window_rollout_loss),
+                                "impulse_rollout_metric_enabled": int(impulse_rollout_metric_enabled),
+                                "window_rollout_probe_enabled": int(window_rollout_probe_enabled),
+                                "window_rollout_metric_mode": str(window_rollout_metric_mode),
+                                "window_rollout_exp_base": float(window_rollout_exp_base),
+                                "window_rollout_future_horizon": int(window_rollout_future_horizon),
+                                "window_rollout_phase_scope": str(window_rollout_phase_scope),
                                 "lambda_siglip": float(lambda_siglip),
                                 "online_ce_mode": str(online_ce_mode),
                                 "action_gap_mode_active": str(action_gap_mode),
@@ -1610,6 +2128,39 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                                 "final_val_ce": float(val_stats["VAL_online_ce"]),
                                 "final_val_ce_objective": float(val_stats["VAL_online_ce_objective"]),
                                 "final_val_siglip_distance": float(val_stats["VAL_online_siglip_distance"]),
+                                "final_val_continuous_clean_gt_action_gap": float(
+                                    val_stats["VAL_online_continuous_clean_gt_action_gap"]
+                                ),
+                                "final_val_continuous_adv_gt_action_gap": float(
+                                    val_stats["VAL_online_continuous_adv_gt_action_gap"]
+                                ),
+                                "final_val_continuous_rollout_delta": float(
+                                    val_stats["VAL_online_continuous_rollout_delta"]
+                                ),
+                                "final_val_impulse_rollout_area": float(
+                                    val_stats["VAL_online_impulse_rollout_area"]
+                                ),
+                                "final_val_window_rollout_clean_gt_action_gap": float(
+                                    val_stats["VAL_online_window_rollout_clean_gt_action_gap"]
+                                ),
+                                "final_val_window_rollout_adv_gt_action_gap": float(
+                                    val_stats["VAL_online_window_rollout_adv_gt_action_gap"]
+                                ),
+                                "final_val_window_rollout_delta_weighted": float(
+                                    val_stats["VAL_online_window_rollout_delta_weighted"]
+                                ),
+                                "final_val_window_rollout_delta_weighted_loss": float(
+                                    val_stats["VAL_online_window_rollout_delta_weighted_loss"]
+                                ),
+                                "final_val_window_rollout_metric_value": float(
+                                    val_stats["VAL_online_window_rollout_metric_value"]
+                                ),
+                                "final_val_window_rollout_future_steps": float(
+                                    val_stats["VAL_online_window_rollout_future_steps"]
+                                ),
+                                "window_phase_name": str(val_stats["VAL_online_window_phase_name"]),
+                                "window_start_step": float(val_stats["VAL_online_window_start_step"]),
+                                "window_end_step": float(val_stats["VAL_online_window_end_step"]),
                                 "final_val_rollout_score": float(val_stats["VAL_online_rollout_score"]),
                                 "final_val_gt_rollout_score": float(val_stats["VAL_online_gt_rollout_score"]),
                                 "final_val_objective_score": float(val_stats["VAL_online_objective_score"]),
@@ -1617,21 +2168,33 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                                 "final_val_active_action_gap": float(val_stats["VAL_online_active_action_gap"]),
                                 "final_val_active_rollout_score": float(val_stats["VAL_online_active_rollout_score"]),
                                 "final_val_active_objective_score": float(val_stats["VAL_online_active_objective_score"]),
+                                "final_val_total_rollout_score": float(val_stats["VAL_online_total_rollout_score"]),
+                                "final_val_total_objective_score": float(val_stats["VAL_online_total_objective_score"]),
                             }
                         )
 
-                improved = val_stats["VAL_online_active_rollout_score"] > self.best_rollout_score
+                improved = val_stats["VAL_online_total_rollout_score"] > self.best_rollout_score
                 if improved:
-                    self.best_rollout_score = val_stats["VAL_online_active_rollout_score"]
+                    self.best_rollout_score = val_stats["VAL_online_total_rollout_score"]
                     temp_save_dir = os.path.join(self.save_dir, f"{str(i)}")
                     os.makedirs(temp_save_dir, exist_ok=True)
                     torch.save(projection_texture.detach().cpu(), os.path.join(temp_save_dir, "projection_texture.pt"))
                     torch.save(projection_texture.detach().cpu(), os.path.join(temp_save_dir, "patch.pt"))
+                    save_projector_params(
+                        output_dir=temp_save_dir,
+                        projector_gain=current_projector_gain_value,
+                        projector_channel_gain=current_projector_channel_gain_values,
+                    )
 
                 temp_save_dir = os.path.join(self.save_dir, "last")
                 os.makedirs(temp_save_dir, exist_ok=True)
                 torch.save(projection_texture.detach().cpu(), os.path.join(temp_save_dir, "projection_texture.pt"))
                 torch.save(projection_texture.detach().cpu(), os.path.join(temp_save_dir, "patch.pt"))
+                save_projector_params(
+                    output_dir=temp_save_dir,
+                    projector_gain=current_projector_gain_value,
+                    projector_channel_gain=current_projector_channel_gain_values,
+                )
 
                 if viz_enabled:
                     should_dump, vis_reason = self._should_dump_visualization(
@@ -1649,7 +2212,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                             iter_idx=i,
                             phase_id=phase_id,
                             is_best=improved,
-                            val_rollout_score=val_stats["VAL_online_rollout_score"],
+                            val_rollout_score=val_stats["VAL_online_total_rollout_score"],
                             reason=vis_reason,
                             attack_mode=attack_mode,
                             args=args,
@@ -1662,6 +2225,12 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 os.makedirs(temp_save_dir, exist_ok=True)
                 torch.save(projection_texture.detach().cpu(), os.path.join(temp_save_dir, "projection_texture.pt"))
                 torch.save(projection_texture.detach().cpu(), os.path.join(temp_save_dir, "patch.pt"))
+                final_projector_gain, final_projector_channel_gain = photometric_params.resolved_values()
+                save_projector_params(
+                    output_dir=temp_save_dir,
+                    projector_gain=float(final_projector_gain.detach().cpu().item()),
+                    projector_channel_gain=[float(v) for v in final_projector_channel_gain.detach().cpu().tolist()],
+                )
                 self.save_online_info(self.save_dir)
                 torch.cuda.empty_cache()
 
@@ -1686,6 +2255,14 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         lambda_history,
         lambda_history_legacy,
         lambda_ce,
+        lambda_continuous_rollout,
+        lambda_window_rollout_loss,
+        impulse_rollout_metric_enabled,
+        window_rollout_probe_enabled,
+        window_rollout_metric_mode,
+        window_rollout_exp_base,
+        window_rollout_future_horizon,
+        window_rollout_phase_scope,
         lambda_siglip,
         siglip_model,
         siglip_input_size,
@@ -1718,6 +2295,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         val_deterministic,
         val_seed,
         val_disable_lighting,
+        projection_randomization_enabled,
         probe_mode,
         record_video_frames,
         video_frame_source,
@@ -1731,6 +2309,17 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         total_ce = 0.0
         total_ce_objective = 0.0
         total_siglip_distance = 0.0
+        total_continuous_clean_gt_action_gap = 0.0
+        total_continuous_adv_gt_action_gap = 0.0
+        total_continuous_rollout_delta = 0.0
+        total_impulse_rollout_area = 0.0
+        total_window_rollout_clean_gt_action_gap = 0.0
+        total_window_rollout_adv_gt_action_gap = 0.0
+        total_window_rollout_delta_weighted = 0.0
+        total_window_rollout_delta_weighted_loss = 0.0
+        total_window_rollout_future_steps = 0.0
+        total_window_start_step = 0.0
+        total_window_end_step = 0.0
         total_done = 0.0
         total_ep_len = 0.0
         total_proj_alpha = 0.0
@@ -1743,6 +2332,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         total_gt_per_joint = None
         visual_frames = []
         video_episode = None
+        total_eval_cases = 0
+        window_phase_name = ""
 
         n_tasks = task_suite.n_tasks
         with torch.no_grad():
@@ -1751,103 +2342,153 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 task = task_suite.get_task(task_id)
                 init_states = task_suite.get_task_init_states(task_id)
                 episode_seed = (int(val_seed) + int(ep_idx)) if val_deterministic else None
-                init_state = self._sample_init_state(
+                init_state_idx = self._sample_init_state_index(
                     init_states=init_states,
                     iter_idx=global_iter,
                     local_idx=ep_idx,
                     deterministic_seed=episode_seed,
                 )
-                env, task_description = get_libero_env(task, "openvla", resolution=max(64, int(env_resolution)))
-                try:
-                    episode = self._run_online_episode(
-                        env=env,
-                        get_libero_image=get_libero_image,
-                        get_libero_dummy_action=get_libero_dummy_action,
-                        init_state=init_state,
-                        task_description=task_description,
-                        projection_texture=projection_texture,
-                        rollout_steps=rollout_steps,
-                        max_env_steps=max_env_steps,
-                        num_steps_wait=num_steps_wait,
-                        split="val",
-                        global_iter=(global_iter * max(1, int(online_val_episodes))) + ep_idx,
-                        geometry=geometry,
-                        maskidx=maskidx,
-                        use_all_joints=use_all_joints,
-                        gripper_weight=gripper_weight,
-                        action_stats=action_stats,
-                        lambda_action_gap=lambda_action_gap,
-                        lambda_history=lambda_history,
-                        lambda_history_legacy=lambda_history_legacy,
-                        lambda_ce=lambda_ce,
-                        lambda_siglip=lambda_siglip,
-                        siglip_model=siglip_model,
-                        siglip_input_size=siglip_input_size,
-                        online_ce_mode=online_ce_mode,
-                        attack_mode=attack_mode,
-                        projection_alpha=projection_alpha,
-                        projection_alpha_jitter=projection_alpha_jitter,
-                        projection_soft_edge=projection_soft_edge,
-                        projection_angle=projection_angle,
-                        projection_fixed_angle=projection_fixed_angle,
-                        projection_shear=projection_shear,
-                        projection_scale_min=projection_scale_min,
-                        projection_scale_max=projection_scale_max,
-                        projection_region=projection_region,
-                        projection_lower_start=projection_lower_start,
-                        projection_width_ratio=projection_width_ratio,
-                        projection_height_ratio=projection_height_ratio,
-                        projection_margin_x=projection_margin_x,
-                        projection_keystone=projection_keystone,
-                        projection_keystone_jitter=projection_keystone_jitter,
-                        projector_gamma=projector_gamma,
-                        projector_gain=projector_gain,
-                        projector_channel_gain=projector_channel_gain,
-                        projector_ambient=projector_ambient,
-                        projector_vignetting=projector_vignetting,
-                        projector_distance_falloff=projector_distance_falloff,
-                        projector_psf=projector_psf,
-                        projection_randomization_enabled=True,
-                        need_backward=False,
-                        capture_visual=(len(visual_frames) == 0),
-                        deterministic_episode_seed=episode_seed,
-                        disable_lighting=bool(val_disable_lighting),
-                        task_id=task_id,
-                        record_video_frames=bool(record_video_frames and (video_episode is None)),
-                        video_frame_source=video_frame_source,
-                        action_gap_mode=action_gap_mode,
-                        start_phase_name="initial",
-                        gt_softmin_tau=gt_softmin_tau,
-                    )
-                    if episode is None:
-                        continue
+                if init_state_idx is None:
+                    continue
+                init_state = init_states[init_state_idx]
+                phase_scopes = ["initial"]
+                if window_rollout_probe_enabled:
+                    phase_scopes = self._resolve_window_rollout_phase_scopes(window_rollout_phase_scope)
 
-                    total_action_gap += episode["action_gap"]
-                    total_gt_action_gap += episode["gt_action_gap"]
-                    total_history_div += episode["history_div"]
-                    total_history_div_legacy += episode["history_div_legacy"]
-                    total_ce += episode["ce_value"]
-                    total_ce_objective += episode["ce_objective_value"]
-                    total_siglip_distance += episode["siglip_distance"]
-                    total_done += float(episode["done"])
-                    total_ep_len += float(episode["episode_len"])
-                    total_proj_alpha += episode["projection_alpha"]
-                    total_proj_cov += episode["projection_coverage"]
-                    total_proj_bottom += episode["projection_bottom"]
-                    total_proj_keystone += episode["projection_keystone"]
-                    total_action_terms += max(1, episode["action_terms"])
-                    total_history_terms += max(0, episode["history_terms"])
-                    total_per_joint = self._accumulate_joint_values(total_per_joint, episode["per_joint_gap"])
-                    total_gt_per_joint = self._accumulate_joint_values(total_gt_per_joint, episode["gt_per_joint_gap"])
-                    if len(visual_frames) == 0 and len(episode["visual_frames"]) > 0:
-                        visual_frames = episode["visual_frames"][: max(1, int(viz_samples))]
-                    if bool(record_video_frames) and (video_episode is None) and self._should_dump_online_episode_video(episode):
-                        video_episode = episode
-                finally:
-                    if hasattr(env, "close"):
-                        env.close()
+                for phase_name in phase_scopes:
+                    episode_window_rollout_spec = None
+                    phase_init_state = init_state
+                    episode_rollout_steps = rollout_steps
+                    if window_rollout_probe_enabled:
+                        episode_window_rollout_spec = self._resolve_window_rollout_probe_case(
+                            task_id=task_id,
+                            init_state_idx=init_state_idx,
+                            phase_scope=phase_name,
+                            future_horizon=window_rollout_future_horizon,
+                            exp_base=window_rollout_exp_base,
+                            max_env_steps=max_env_steps,
+                        )
+                        if episode_window_rollout_spec is None:
+                            continue
+                        phase_init_state = self._resolve_phase_start_state(
+                            task_id=task_id,
+                            init_state_idx=init_state_idx,
+                            phase_start_name=phase_name,
+                            default_init_state=init_state,
+                        )
+                    env, task_description = get_libero_env(task, "openvla", resolution=max(64, int(env_resolution)))
+                    try:
+                        episode = self._run_online_episode(
+                            env=env,
+                            task=task,
+                            get_libero_env=get_libero_env,
+                            get_libero_image=get_libero_image,
+                            get_libero_dummy_action=get_libero_dummy_action,
+                            init_state=phase_init_state,
+                            init_state_idx=init_state_idx,
+                            task_description=task_description,
+                            projection_texture=projection_texture,
+                            rollout_steps=episode_rollout_steps,
+                            max_env_steps=max_env_steps,
+                            num_steps_wait=num_steps_wait,
+                            split="val",
+                            global_iter=(global_iter * max(1, int(online_val_episodes))) + ep_idx,
+                            geometry=geometry,
+                            maskidx=maskidx,
+                            use_all_joints=use_all_joints,
+                            gripper_weight=gripper_weight,
+                            action_stats=action_stats,
+                            lambda_action_gap=lambda_action_gap,
+                            lambda_history=lambda_history,
+                            lambda_history_legacy=lambda_history_legacy,
+                            lambda_ce=lambda_ce,
+                            lambda_continuous_rollout=lambda_continuous_rollout,
+                            lambda_window_rollout_loss=lambda_window_rollout_loss,
+                            impulse_rollout_metric_enabled=impulse_rollout_metric_enabled,
+                            window_rollout_probe_enabled=bool(episode_window_rollout_spec is not None),
+                            window_rollout_spec=episode_window_rollout_spec,
+                            lambda_siglip=lambda_siglip,
+                            siglip_model=siglip_model,
+                            siglip_input_size=siglip_input_size,
+                            online_ce_mode=online_ce_mode,
+                            attack_mode=attack_mode,
+                            projection_alpha=projection_alpha,
+                            projection_alpha_jitter=projection_alpha_jitter,
+                            projection_soft_edge=projection_soft_edge,
+                            projection_angle=projection_angle,
+                            projection_fixed_angle=projection_fixed_angle,
+                            projection_shear=projection_shear,
+                            projection_scale_min=projection_scale_min,
+                            projection_scale_max=projection_scale_max,
+                            projection_region=projection_region,
+                            projection_lower_start=projection_lower_start,
+                            projection_width_ratio=projection_width_ratio,
+                            projection_height_ratio=projection_height_ratio,
+                            projection_margin_x=projection_margin_x,
+                            projection_keystone=projection_keystone,
+                            projection_keystone_jitter=projection_keystone_jitter,
+                            projector_gamma=projector_gamma,
+                            projector_gain=projector_gain,
+                            projector_channel_gain=projector_channel_gain,
+                            projector_ambient=projector_ambient,
+                            projector_vignetting=projector_vignetting,
+                            projector_distance_falloff=projector_distance_falloff,
+                            projector_psf=projector_psf,
+                            env_resolution=env_resolution,
+                            projection_randomization_enabled=bool(projection_randomization_enabled),
+                            need_backward=False,
+                            capture_visual=(len(visual_frames) == 0),
+                            deterministic_episode_seed=episode_seed,
+                            disable_lighting=bool(val_disable_lighting),
+                            task_id=task_id,
+                            record_video_frames=bool(record_video_frames and (video_episode is None)),
+                            video_frame_source=video_frame_source,
+                            action_gap_mode=action_gap_mode,
+                            start_phase_name=phase_name if window_rollout_probe_enabled else "initial",
+                            gt_softmin_tau=gt_softmin_tau,
+                        )
+                        if episode is None:
+                            continue
 
-        divisor = float(max(1, int(online_val_episodes)))
+                        total_eval_cases += 1
+                        total_action_gap += episode["action_gap"]
+                        total_gt_action_gap += episode["gt_action_gap"]
+                        total_history_div += episode["history_div"]
+                        total_history_div_legacy += episode["history_div_legacy"]
+                        total_ce += episode["ce_value"]
+                        total_ce_objective += episode["ce_objective_value"]
+                        total_siglip_distance += episode["siglip_distance"]
+                        total_continuous_clean_gt_action_gap += episode["continuous_clean_gt_action_gap"]
+                        total_continuous_adv_gt_action_gap += episode["continuous_adv_gt_action_gap"]
+                        total_continuous_rollout_delta += episode["continuous_rollout_delta"]
+                        total_impulse_rollout_area += episode["impulse_rollout_area"]
+                        total_window_rollout_clean_gt_action_gap += episode["window_rollout_clean_gt_action_gap"]
+                        total_window_rollout_adv_gt_action_gap += episode["window_rollout_adv_gt_action_gap"]
+                        total_window_rollout_delta_weighted += episode["window_rollout_delta_weighted"]
+                        total_window_rollout_delta_weighted_loss += episode["window_rollout_delta_weighted_loss"]
+                        total_window_rollout_future_steps += float(episode["window_rollout_future_steps"])
+                        total_window_start_step += float(episode["window_start_step"])
+                        total_window_end_step += float(episode["window_end_step"])
+                        total_done += float(episode["done"])
+                        total_ep_len += float(episode["episode_len"])
+                        total_proj_alpha += episode["projection_alpha"]
+                        total_proj_cov += episode["projection_coverage"]
+                        total_proj_bottom += episode["projection_bottom"]
+                        total_proj_keystone += episode["projection_keystone"]
+                        total_action_terms += max(1, episode["action_terms"])
+                        total_history_terms += max(0, episode["history_terms"])
+                        total_per_joint = self._accumulate_joint_values(total_per_joint, episode["per_joint_gap"])
+                        total_gt_per_joint = self._accumulate_joint_values(total_gt_per_joint, episode["gt_per_joint_gap"])
+                        window_phase_name = str(episode.get("window_phase_name", window_phase_name or phase_name))
+                        if len(visual_frames) == 0 and len(episode["visual_frames"]) > 0:
+                            visual_frames = episode["visual_frames"][: max(1, int(viz_samples))]
+                        if bool(record_video_frames) and (video_episode is None) and self._should_dump_online_episode_video(episode):
+                            video_episode = episode
+                    finally:
+                        if hasattr(env, "close"):
+                            env.close()
+
+        divisor = float(max(1, int(total_eval_cases if total_eval_cases > 0 else online_val_episodes)))
         avg_action_gap = total_action_gap / divisor
         avg_gt_action_gap = total_gt_action_gap / divisor
         avg_history_div = total_history_div / divisor
@@ -1855,6 +2496,22 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         avg_ce = total_ce / divisor
         avg_ce_objective = total_ce_objective / divisor
         avg_siglip_distance = total_siglip_distance / divisor
+        avg_continuous_clean_gt_action_gap = total_continuous_clean_gt_action_gap / divisor
+        avg_continuous_adv_gt_action_gap = total_continuous_adv_gt_action_gap / divisor
+        avg_continuous_rollout_delta = total_continuous_rollout_delta / divisor
+        avg_impulse_rollout_area = total_impulse_rollout_area / divisor
+        avg_window_rollout_clean_gt_action_gap = total_window_rollout_clean_gt_action_gap / divisor
+        avg_window_rollout_adv_gt_action_gap = total_window_rollout_adv_gt_action_gap / divisor
+        avg_window_rollout_delta_weighted = total_window_rollout_delta_weighted / divisor
+        avg_window_rollout_delta_weighted_loss = total_window_rollout_delta_weighted_loss / divisor
+        avg_window_rollout_metric_value = select_window_rollout_metric_value(
+            metric_mode=window_rollout_metric_mode,
+            delta_weighted=avg_window_rollout_delta_weighted,
+            adv_gt_action_gap=avg_window_rollout_adv_gt_action_gap,
+        )
+        avg_window_rollout_future_steps = total_window_rollout_future_steps / divisor
+        avg_window_start_step = total_window_start_step / divisor
+        avg_window_end_step = total_window_end_step / divisor
         avg_done = total_done / divisor
         avg_ep_len = total_ep_len / divisor
         avg_proj_alpha = total_proj_alpha / divisor
@@ -1897,6 +2554,16 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         avg_active_action_gap = avg_gt_action_gap if action_gap_mode == "gt_farthest" else avg_action_gap
         avg_active_rollout_score = avg_gt_rollout_score if action_gap_mode == "gt_farthest" else avg_rollout_score
         avg_active_objective_score = avg_gt_objective_score if action_gap_mode == "gt_farthest" else avg_objective_score
+        avg_total_rollout_score = (
+            avg_active_rollout_score
+            + (lambda_continuous_rollout * avg_continuous_rollout_delta)
+            + (lambda_window_rollout_loss * avg_window_rollout_metric_value)
+        )
+        avg_total_objective_score = avg_total_rollout_score - (lambda_ce * avg_ce_objective)
+        current_projector_gain = float(
+            projector_gain.detach().cpu().item() if torch.is_tensor(projector_gain) else projector_gain
+        )
+        current_projector_channel_gain = parse_projector_channel_gain(projector_channel_gain)
 
         stats = {
             "VAL_online_rollout_action_gap": avg_action_gap,
@@ -1917,10 +2584,36 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             "VAL_online_episode_len": avg_ep_len,
             "VAL_online_ce": avg_ce,
             "VAL_online_ce_objective": avg_ce_objective,
+            "VAL_lambda_continuous_rollout": float(lambda_continuous_rollout),
+            "VAL_lambda_window_rollout_loss": float(lambda_window_rollout_loss),
+            "VAL_impulse_rollout_metric_enabled": int(impulse_rollout_metric_enabled),
+            "VAL_online_continuous_clean_gt_action_gap": avg_continuous_clean_gt_action_gap,
+            "VAL_online_continuous_adv_gt_action_gap": avg_continuous_adv_gt_action_gap,
+            "VAL_online_continuous_rollout_delta": avg_continuous_rollout_delta,
+            "VAL_online_impulse_rollout_area": avg_impulse_rollout_area,
+            "VAL_online_window_rollout_clean_gt_action_gap": avg_window_rollout_clean_gt_action_gap,
+            "VAL_online_window_rollout_adv_gt_action_gap": avg_window_rollout_adv_gt_action_gap,
+            "VAL_online_window_rollout_delta_weighted": avg_window_rollout_delta_weighted,
+            "VAL_online_window_rollout_delta_weighted_loss": avg_window_rollout_delta_weighted_loss,
+            "VAL_online_window_rollout_metric_mode": str(window_rollout_metric_mode),
+            "VAL_online_window_rollout_metric_value": avg_window_rollout_metric_value,
+            "VAL_online_window_rollout_future_steps": avg_window_rollout_future_steps,
+            "VAL_online_window_rollout_probe_enabled": int(window_rollout_probe_enabled),
+            "VAL_online_window_rollout_exp_base": float(window_rollout_exp_base),
+            "VAL_online_window_rollout_future_horizon": int(window_rollout_future_horizon),
+            "VAL_online_window_phase_name": str(window_phase_name),
+            "VAL_online_window_start_step": avg_window_start_step,
+            "VAL_online_window_end_step": avg_window_end_step,
+            "VAL_online_total_rollout_score": avg_total_rollout_score,
+            "VAL_online_total_objective_score": avg_total_objective_score,
             "VAL_projection_alpha_mean": avg_proj_alpha,
             "VAL_projection_coverage_ratio": avg_proj_cov,
             "VAL_projection_bottom_ratio": avg_proj_bottom,
             "VAL_projection_keystone": avg_proj_keystone,
+            "VAL_projector_gain": current_projector_gain,
+            "VAL_projector_channel_gain_r": float(current_projector_channel_gain[0]),
+            "VAL_projector_channel_gain_g": float(current_projector_channel_gain[1]),
+            "VAL_projector_channel_gain_b": float(current_projector_channel_gain[2]),
             "VAL_effective_lighting_enabled": int(self._is_lighting_enabled_for_split("val") and (not bool(val_disable_lighting))),
             "VAL_lighting_backend": str(getattr(self.lighting_augmentor, "backend", "disabled")),
             "ic_light_scope": getattr(self.lighting_augmentor, "scope", "n/a") if self.lighting_augmentor is not None else "n/a",
@@ -1935,9 +2628,100 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             stats[f"VAL_online_gt_action_gap_joint_{joint_idx}"] = float(joint_gap_value)
         return stats, visual_frames, video_episode
 
+    @staticmethod
+    def _clone_init_state(init_state):
+        return np.asarray(init_state, dtype=np.float32).copy()
+
+    def _initialize_online_rollout_env(self, env, init_state, get_libero_dummy_action, effective_num_steps_wait):
+        env.reset()
+        obs = env.set_init_state(self._clone_init_state(init_state))
+        for _ in range(max(0, int(effective_num_steps_wait))):
+            obs, _, done_wait, _ = env.step(get_libero_dummy_action("openvla"))
+            if done_wait:
+                break
+        return obs
+
+    def _forward_clean_branch_gt_step(
+        self,
+        obs,
+        rollout_input_ids,
+        get_libero_image,
+        attention_mask,
+        labels_full,
+        action_mask_full,
+        gt_candidate_actions,
+        maskidx,
+        use_all_joints,
+        gripper_weight,
+        gt_softmin_tau,
+        split,
+        global_iter,
+        max_steps,
+        step_idx,
+        step_seed,
+        disable_lighting,
+        episode_lighting_map_idx,
+    ):
+        branch_image = get_libero_image(obs, (224, 224))
+        branch_pixels = [branch_image]
+
+        with self._temporary_rng_seed(step_seed):
+            if not bool(disable_lighting):
+                branch_pixels = self._apply_lighting_augmentation(
+                    pixel_values=branch_pixels,
+                    iteration_idx=(int(global_iter) * max(1, int(max_steps))) + int(step_idx),
+                    split=split,
+                    fixed_map_idx=episode_lighting_map_idx,
+                )
+            branch_images = self.randomPatchTransform.im_process(branch_pixels, mean=self.mean, std=self.std)
+
+        with torch.no_grad():
+            output_branch: CausalLMOutputWithPast = self.vla(
+                input_ids=rollout_input_ids,
+                attention_mask=attention_mask,
+                pixel_values=branch_images.to(torch.bfloat16),
+                labels=None,
+                output_hidden_states=False,
+                use_cache=False,
+            )
+        branch_pred_tokens = self._extract_pred_action_tokens_from_logits(output_branch.logits, labels_full)
+        if gt_candidate_actions is None:
+            zero = torch.zeros((), device=self.vla.device, dtype=torch.float32)
+            per_joint_zero = torch.zeros((self.default_action_dim,), device=self.vla.device, dtype=torch.float32)
+            return branch_pred_tokens.detach(), zero, zero.detach(), per_joint_zero
+
+        branch_gt_loss, branch_gt_metric, branch_gt_per_joint, _ = self._compute_gt_action_gap_losses(
+            adv_logits=output_branch.logits,
+            labels_full=labels_full,
+            action_mask_full=action_mask_full,
+            gt_candidate_actions=gt_candidate_actions,
+            maskidx=maskidx,
+            use_all_joints=use_all_joints,
+            gripper_weight=gripper_weight,
+            gt_softmin_tau=gt_softmin_tau,
+        )
+        return (
+            branch_pred_tokens.detach(),
+            branch_gt_loss.detach(),
+            branch_gt_metric.detach(),
+            branch_gt_per_joint.detach(),
+        )
+
+    def _step_rollout_branch_env(self, env, obs, rollout_input_ids, pred_action_tokens, action_mask_full, action_stats):
+        env_action = self._decode_env_action(pred_action_tokens, action_mask_full, action_stats)
+        next_obs, _, done, _ = env.step(env_action.tolist())
+        next_rollout_input_ids = self._update_rollout_inputs(
+            rollout_input_ids=rollout_input_ids,
+            pred_action_tokens=pred_action_tokens,
+            action_mask_full=action_mask_full,
+        )
+        return next_obs, bool(done), next_rollout_input_ids
+
     def _run_online_episode(
         self,
         env,
+        task,
+        get_libero_env,
         get_libero_image,
         get_libero_dummy_action,
         init_state,
@@ -1957,6 +2741,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         lambda_history,
         lambda_history_legacy,
         lambda_ce,
+        lambda_continuous_rollout,
+        lambda_window_rollout_loss,
+        impulse_rollout_metric_enabled,
         lambda_siglip,
         siglip_model,
         siglip_input_size,
@@ -1984,6 +2771,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         projector_vignetting,
         projector_distance_falloff,
         projector_psf,
+        env_resolution,
         projection_randomization_enabled,
         need_backward,
         capture_visual,
@@ -1995,403 +2783,751 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         action_gap_mode="clean_adv",
         start_phase_name="initial",
         gt_softmin_tau=0.05,
+        window_rollout_probe_enabled=False,
+        window_rollout_metric_mode="delta_weighted",
+        window_rollout_spec=None,
+        learnable_projector_params=None,
+        init_state_idx=None,
     ):
         action_dim = len(action_stats["q01"])
         start_phase_name = self._normalize_phase_start_name(start_phase_name)
         video_frame_source = str(video_frame_source).lower().strip()
         if video_frame_source not in ("next_obs", "orig", "projected_input", "adv"):
             video_frame_source = "projected_input"
-        env.reset()
-        obs = env.set_init_state(init_state)
-        effective_num_steps_wait = 0 if start_phase_name != "initial" else max(0, int(num_steps_wait))
-        for _ in range(effective_num_steps_wait):
-            obs, _, done_wait, _ = env.step(get_libero_dummy_action("openvla"))
-            if done_wait:
-                break
 
-        labels_full, attention_mask, input_ids = self._build_prompt_tensors(
-            task_description=task_description,
-            action_dim=action_dim,
+        continuous_enabled = float(lambda_continuous_rollout) > 0.0
+        lambda_window_rollout_loss = float(lambda_window_rollout_loss)
+        impulse_enabled = bool(impulse_rollout_metric_enabled)
+        window_rollout_metric_mode = normalize_window_rollout_metric_mode(window_rollout_metric_mode)
+        window_rollout_enabled = bool(window_rollout_probe_enabled) and isinstance(window_rollout_spec, dict)
+        need_aux_clean_branch = continuous_enabled or impulse_enabled or window_rollout_enabled
+        need_any_gt_rollout = (
+            (action_gap_mode == "gt_farthest") or continuous_enabled or impulse_enabled or window_rollout_enabled
         )
-        labels_masked = self.mask_labels(labels_full.clone(), maskidx=maskidx, use_all_joints=use_all_joints)
-        action_mask_full = self._build_action_mask(labels_full)
-        if action_mask_full.sum().item() == 0:
-            return None
 
-        clean_rollout_input_ids = input_ids.clone()
-        adv_rollout_input_ids = input_ids.clone()
-        total_loss = torch.zeros((), device=self.vla.device, dtype=torch.float32)
-        episode_weight_sum = 0.0
-        grad_before_episode = None
-        if need_backward and (projection_texture.grad is not None):
-            grad_before_episode = projection_texture.grad.detach().clone()
-        total_action_gap = 0.0
-        total_gt_action_gap = 0.0
-        total_history_div = 0.0
-        total_history_div_legacy = 0.0
-        total_ce = 0.0
-        total_ce_objective = 0.0
-        total_siglip_distance = 0.0
-        total_action_terms = 0
-        total_history_terms = 0
-        total_history_terms_legacy = 0
-        total_per_joint = None
-        total_gt_per_joint = None
-        total_proj_alpha = 0.0
-        total_proj_cov = 0.0
-        total_proj_bottom = 0.0
-        total_proj_keystone = 0.0
-        gt_candidate_count = 0
-        gt_reference_instruction = self._normalize_instruction_key(task_description)
-        gt_reference_phase = self._phase_start_to_gt_phase(start_phase_name)
-        last_done = False
-        visual_frames = []
-        video_frames = []
+        effective_num_steps_wait = 0 if start_phase_name != "initial" else max(0, int(num_steps_wait))
+        obs = self._initialize_online_rollout_env(
+            env=env,
+            init_state=init_state,
+            get_libero_dummy_action=get_libero_dummy_action,
+            effective_num_steps_wait=effective_num_steps_wait,
+        )
 
-        max_steps = int(min(int(rollout_steps), int(max_env_steps)))
-        need_history = (max_steps > 0) and ((not need_backward) or (lambda_history > 0) or (lambda_history_legacy > 0))
-        prev_adv_history_state = None
-        episode_lighting_map_idx = None
-        episode_lighting_backend = "disabled"
-        episode_effective_lighting_enabled = 0
-        if (not bool(disable_lighting)) and (self.lighting_augmentor is not None):
-            if deterministic_episode_seed is not None:
-                episode_lighting_map_idx = int(deterministic_episode_seed)
-            else:
-                episode_lighting_map_idx = random.randint(0, (2**31) - 1)
-        for step_idx in range(max_steps):
-            current_image = get_libero_image(obs, (224, 224))
-            pixel_values = [current_image]
-            step_seed = None
-            if deterministic_episode_seed is not None:
-                step_seed = int(deterministic_episode_seed) + (int(step_idx) * 10007)
-            try:
-                with self._temporary_rng_seed(step_seed):
-                    if not bool(disable_lighting):
-                        pixel_values = self._apply_lighting_augmentation(
-                            pixel_values=pixel_values,
-                            iteration_idx=(int(global_iter) * max(1, int(max_steps))) + int(step_idx),
-                            split=split,
-                            fixed_map_idx=episode_lighting_map_idx,
-                        )
-                        episode_effective_lighting_enabled = 1
-                        episode_lighting_backend = str(getattr(self.lighting_augmentor, "backend", "disabled"))
-                    clean_images = self.randomPatchTransform.im_process(pixel_values, mean=self.mean, std=self.std)
-                    adv_images, attack_aux = self.randomPatchTransform.apply_attack_batch(
-                        images=pixel_values,
-                        attack_texture=projection_texture,
-                        mean=self.mean,
-                        std=self.std,
-                        attack_mode=attack_mode,
-                        geometry=geometry,
-                        projection_alpha=projection_alpha,
-                        projection_alpha_jitter=projection_alpha_jitter,
-                        projection_soft_edge=projection_soft_edge,
-                        projection_angle=projection_angle,
-                        projection_fixed_angle=projection_fixed_angle,
-                        projection_shear=projection_shear,
-                        projection_scale_min=projection_scale_min,
-                        projection_scale_max=projection_scale_max,
-                        projection_region=projection_region,
-                        projection_lower_start=projection_lower_start,
-                        projection_width_ratio=projection_width_ratio,
-                        projection_height_ratio=projection_height_ratio,
-                        projection_margin_x=projection_margin_x,
-                        projection_keystone=projection_keystone,
-                        projection_keystone_jitter=projection_keystone_jitter,
-                        projector_gamma=projector_gamma,
-                        projector_gain=projector_gain,
-                        projector_channel_gain=projector_channel_gain,
-                        projector_ambient=projector_ambient,
-                        projector_vignetting=projector_vignetting,
-                        projector_distance_falloff=projector_distance_falloff,
-                        projector_psf=projector_psf,
-                        projection_randomization_enabled=projection_randomization_enabled,
-                        return_aux=True,
-                    )
-            except RuntimeError as err:
-                recover_ok = self._recover_from_cuda_alloc_failure(err, split=split)
-                if (not self._is_cuda_alloc_failure(err)) or (not recover_ok):
-                    raise
-                # Retry once with lighting disabled for this episode after forcing procedural fallback.
-                disable_lighting = True
-                episode_effective_lighting_enabled = 0
-                episode_lighting_backend = str(getattr(self.lighting_augmentor, "backend", "disabled"))
+        clean_branch_env = None
+        clean_branch_obs = None
+        clean_branch_active = False
+        clean_branch_rollout_input_ids = None
+
+        impulse_branch_env = None
+        impulse_branch_obs = None
+        impulse_branch_active = False
+        impulse_branch_rollout_input_ids = None
+
+        try:
+            if need_aux_clean_branch:
+                clean_branch_env, _ = get_libero_env(task, "openvla", resolution=max(64, int(env_resolution)))
+                clean_branch_obs = self._initialize_online_rollout_env(
+                    env=clean_branch_env,
+                    init_state=init_state,
+                    get_libero_dummy_action=get_libero_dummy_action,
+                    effective_num_steps_wait=effective_num_steps_wait,
+                )
+                clean_branch_active = True
+            if impulse_enabled:
+                impulse_branch_env, _ = get_libero_env(task, "openvla", resolution=max(64, int(env_resolution)))
+                impulse_branch_obs = self._initialize_online_rollout_env(
+                    env=impulse_branch_env,
+                    init_state=init_state,
+                    get_libero_dummy_action=get_libero_dummy_action,
+                    effective_num_steps_wait=effective_num_steps_wait,
+                )
+                impulse_branch_active = True
+
+            labels_full, attention_mask, input_ids = self._build_prompt_tensors(
+                task_description=task_description,
+                action_dim=action_dim,
+            )
+            labels_masked = self.mask_labels(labels_full.clone(), maskidx=maskidx, use_all_joints=use_all_joints)
+            action_mask_full = self._build_action_mask(labels_full)
+            if action_mask_full.sum().item() == 0:
+                return None
+
+            clean_rollout_input_ids = input_ids.clone()
+            adv_rollout_input_ids = input_ids.clone()
+            if need_aux_clean_branch:
+                clean_branch_rollout_input_ids = input_ids.clone()
+            if impulse_enabled:
+                impulse_branch_rollout_input_ids = input_ids.clone()
+
+            total_loss = torch.zeros((), device=self.vla.device, dtype=torch.float32)
+            episode_weight_sum = 0.0
+            grad_before_episode = None
+            if need_backward and (projection_texture.grad is not None):
+                grad_before_episode = projection_texture.grad.detach().clone()
+            photometric_grads_before_episode = None
+            if need_backward and (learnable_projector_params is not None) and learnable_projector_params.has_trainable_params():
+                photometric_grads_before_episode = []
+                for param in learnable_projector_params.parameters():
+                    if param.grad is None:
+                        photometric_grads_before_episode.append(None)
+                    else:
+                        photometric_grads_before_episode.append(param.grad.detach().clone())
+            total_action_gap = 0.0
+            total_gt_action_gap = 0.0
+            total_history_div = 0.0
+            total_history_div_legacy = 0.0
+            total_ce = 0.0
+            total_ce_objective = 0.0
+            total_siglip_distance = 0.0
+            total_continuous_clean_gt_gap = 0.0
+            total_continuous_adv_gt_gap = 0.0
+            total_continuous_rollout_delta = 0.0
+            total_impulse_rollout_area = 0.0
+            total_action_terms = 0
+            total_history_terms = 0
+            total_history_terms_legacy = 0
+            total_continuous_terms = 0
+            total_impulse_terms = 0
+            total_per_joint = None
+            total_gt_per_joint = None
+            total_proj_alpha = 0.0
+            total_proj_cov = 0.0
+            total_proj_bottom = 0.0
+            total_proj_keystone = 0.0
+            gt_candidate_count = 0
+            gt_reference_instruction = self._normalize_instruction_key(task_description)
+            gt_reference_phase = self._phase_start_to_gt_phase(start_phase_name)
+            episode_phase_boundary_info = None
+            if window_rollout_enabled and task_id is not None and init_state_idx is not None:
+                episode_phase_boundary_info = self._get_phase_boundary_info(
+                    task_id=task_id,
+                    init_state_idx=init_state_idx,
+                )
+            last_done = False
+            visual_frames = []
+            video_frames = []
+            window_step_count = int(window_rollout_spec.get("window_step_count", 0)) if window_rollout_enabled else 0
+            window_future_steps = int(window_rollout_spec.get("future_steps", 0)) if window_rollout_enabled else 0
+            window_exp_base = float(window_rollout_spec.get("exp_base", 0.9)) if window_rollout_enabled else 0.9
+            total_window_rollout_clean_gt_gap = 0.0
+            total_window_rollout_adv_gt_gap = 0.0
+            total_window_rollout_delta_weighted = 0.0
+            total_window_rollout_delta_weighted_loss = 0.0
+            total_window_rollout_terms = 0
+
+            max_steps = int(min(int(rollout_steps), int(max_env_steps)))
+            need_history = (max_steps > 0) and (
+                (not need_backward) or (lambda_history > 0) or (lambda_history_legacy > 0)
+            )
+            prev_adv_history_state = None
+            episode_lighting_map_idx = None
+            episode_lighting_backend = "disabled"
+            episode_effective_lighting_enabled = 0
+            episode_projection_seed = None
+            if (not bool(disable_lighting)) and (self.lighting_augmentor is not None):
+                if deterministic_episode_seed is not None:
+                    episode_lighting_map_idx = int(deterministic_episode_seed)
+                else:
+                    episode_lighting_map_idx = random.randint(0, (2**31) - 1)
+            if bool(projection_randomization_enabled):
+                if deterministic_episode_seed is not None:
+                    episode_projection_seed = int(deterministic_episode_seed) + 17
+                else:
+                    episode_projection_seed = random.randint(0, (2**31) - 1)
+
+            for step_idx in range(max_steps):
+                current_image = get_libero_image(obs, (224, 224))
                 pixel_values = [current_image]
-                with self._temporary_rng_seed(step_seed):
-                    clean_images = self.randomPatchTransform.im_process(pixel_values, mean=self.mean, std=self.std)
-                    adv_images, attack_aux = self.randomPatchTransform.apply_attack_batch(
-                        images=pixel_values,
-                        attack_texture=projection_texture,
-                        mean=self.mean,
-                        std=self.std,
-                        attack_mode=attack_mode,
-                        geometry=geometry,
-                        projection_alpha=projection_alpha,
-                        projection_alpha_jitter=projection_alpha_jitter,
-                        projection_soft_edge=projection_soft_edge,
-                        projection_angle=projection_angle,
-                        projection_fixed_angle=projection_fixed_angle,
-                        projection_shear=projection_shear,
-                        projection_scale_min=projection_scale_min,
-                        projection_scale_max=projection_scale_max,
-                        projection_region=projection_region,
-                        projection_lower_start=projection_lower_start,
-                        projection_width_ratio=projection_width_ratio,
-                        projection_height_ratio=projection_height_ratio,
-                        projection_margin_x=projection_margin_x,
-                        projection_keystone=projection_keystone,
-                        projection_keystone_jitter=projection_keystone_jitter,
-                        projector_gamma=projector_gamma,
-                        projector_gain=projector_gain,
-                        projector_channel_gain=projector_channel_gain,
-                        projector_ambient=projector_ambient,
-                        projector_vignetting=projector_vignetting,
-                        projector_distance_falloff=projector_distance_falloff,
-                        projector_psf=projector_psf,
-                        projection_randomization_enabled=projection_randomization_enabled,
-                        return_aux=True,
-                    )
+                step_seed = None
+                if deterministic_episode_seed is not None:
+                    step_seed = int(deterministic_episode_seed) + (int(step_idx) * 10007)
+                try:
+                    current_projector_gain = projector_gain
+                    current_projector_channel_gain = projector_channel_gain
+                    if learnable_projector_params is not None:
+                        current_projector_gain, current_projector_channel_gain = (
+                            learnable_projector_params.resolved_values()
+                        )
+                    with self._temporary_rng_seed(step_seed):
+                        if not bool(disable_lighting):
+                            pixel_values = self._apply_lighting_augmentation(
+                                pixel_values=pixel_values,
+                                iteration_idx=(int(global_iter) * max(1, int(max_steps))) + int(step_idx),
+                                split=split,
+                                fixed_map_idx=episode_lighting_map_idx,
+                            )
+                            episode_effective_lighting_enabled = 1
+                            episode_lighting_backend = str(getattr(self.lighting_augmentor, "backend", "disabled"))
+                        clean_images = self.randomPatchTransform.im_process(pixel_values, mean=self.mean, std=self.std)
+                    with self._temporary_rng_seed(episode_projection_seed):
+                        adv_images, attack_aux = self.randomPatchTransform.apply_attack_batch(
+                            images=pixel_values,
+                            attack_texture=projection_texture,
+                            mean=self.mean,
+                            std=self.std,
+                            attack_mode=attack_mode,
+                            geometry=geometry,
+                            projection_alpha=projection_alpha,
+                            projection_alpha_jitter=projection_alpha_jitter,
+                            projection_soft_edge=projection_soft_edge,
+                            projection_angle=projection_angle,
+                            projection_fixed_angle=projection_fixed_angle,
+                            projection_shear=projection_shear,
+                            projection_scale_min=projection_scale_min,
+                            projection_scale_max=projection_scale_max,
+                            projection_region=projection_region,
+                            projection_lower_start=projection_lower_start,
+                            projection_width_ratio=projection_width_ratio,
+                            projection_height_ratio=projection_height_ratio,
+                            projection_margin_x=projection_margin_x,
+                            projection_keystone=projection_keystone,
+                            projection_keystone_jitter=projection_keystone_jitter,
+                            projector_gamma=projector_gamma,
+                            projector_gain=current_projector_gain,
+                            projector_channel_gain=current_projector_channel_gain,
+                            projector_ambient=projector_ambient,
+                            projector_vignetting=projector_vignetting,
+                            projector_distance_falloff=projector_distance_falloff,
+                            projector_psf=projector_psf,
+                            projection_randomization_enabled=projection_randomization_enabled,
+                            return_aux=True,
+                        )
+                except RuntimeError as err:
+                    recover_ok = self._recover_from_cuda_alloc_failure(err, split=split)
+                    if (not self._is_cuda_alloc_failure(err)) or (not recover_ok):
+                        raise
+                    disable_lighting = True
+                    episode_effective_lighting_enabled = 0
+                    episode_lighting_backend = str(getattr(self.lighting_augmentor, "backend", "disabled"))
+                    pixel_values = [current_image]
+                    current_projector_gain = projector_gain
+                    current_projector_channel_gain = projector_channel_gain
+                    if learnable_projector_params is not None:
+                        current_projector_gain, current_projector_channel_gain = (
+                            learnable_projector_params.resolved_values()
+                        )
+                    with self._temporary_rng_seed(step_seed):
+                        clean_images = self.randomPatchTransform.im_process(pixel_values, mean=self.mean, std=self.std)
+                    with self._temporary_rng_seed(episode_projection_seed):
+                        adv_images, attack_aux = self.randomPatchTransform.apply_attack_batch(
+                            images=pixel_values,
+                            attack_texture=projection_texture,
+                            mean=self.mean,
+                            std=self.std,
+                            attack_mode=attack_mode,
+                            geometry=geometry,
+                            projection_alpha=projection_alpha,
+                            projection_alpha_jitter=projection_alpha_jitter,
+                            projection_soft_edge=projection_soft_edge,
+                            projection_angle=projection_angle,
+                            projection_fixed_angle=projection_fixed_angle,
+                            projection_shear=projection_shear,
+                            projection_scale_min=projection_scale_min,
+                            projection_scale_max=projection_scale_max,
+                            projection_region=projection_region,
+                            projection_lower_start=projection_lower_start,
+                            projection_width_ratio=projection_width_ratio,
+                            projection_height_ratio=projection_height_ratio,
+                            projection_margin_x=projection_margin_x,
+                            projection_keystone=projection_keystone,
+                            projection_keystone_jitter=projection_keystone_jitter,
+                            projector_gamma=projector_gamma,
+                            projector_gain=current_projector_gain,
+                            projector_channel_gain=current_projector_channel_gain,
+                            projector_ambient=projector_ambient,
+                            projector_vignetting=projector_vignetting,
+                            projector_distance_falloff=projector_distance_falloff,
+                            projector_psf=projector_psf,
+                            projection_randomization_enabled=projection_randomization_enabled,
+                            return_aux=True,
+                        )
 
-            with torch.no_grad():
-                output_clean: CausalLMOutputWithPast = self.vla(
-                    input_ids=clean_rollout_input_ids,
+                with torch.no_grad():
+                    output_clean: CausalLMOutputWithPast = self.vla(
+                        input_ids=clean_rollout_input_ids,
+                        attention_mask=attention_mask,
+                        pixel_values=clean_images.to(torch.bfloat16),
+                        labels=None,
+                        output_hidden_states=need_history,
+                        use_cache=False,
+                    )
+                adv_labels = labels_masked if online_ce_mode == "pseudo_clean" else None
+                output_adv: CausalLMOutputWithPast = self.vla(
+                    input_ids=adv_rollout_input_ids,
                     attention_mask=attention_mask,
-                    pixel_values=clean_images.to(torch.bfloat16),
-                    labels=None,
+                    pixel_values=adv_images.to(torch.bfloat16),
+                    labels=adv_labels,
                     output_hidden_states=need_history,
                     use_cache=False,
                 )
-            adv_labels = labels_masked if online_ce_mode == "pseudo_clean" else None
-            output_adv: CausalLMOutputWithPast = self.vla(
-                input_ids=adv_rollout_input_ids,
-                attention_mask=attention_mask,
-                pixel_values=adv_images.to(torch.bfloat16),
-                labels=adv_labels,
-                output_hidden_states=need_history,
-                use_cache=False,
-            )
 
-            step_action_gap_loss, step_action_gap_metric, step_per_joint_gap, adv_pred_tokens = self._compute_action_gap_losses(
-                adv_logits=output_adv.logits,
-                clean_logits=output_clean.logits,
-                labels_full=labels_full,
-                action_mask_full=action_mask_full,
-                maskidx=maskidx,
-                use_all_joints=use_all_joints,
-                gripper_weight=gripper_weight,
-            )
-            step_gt_action_gap_loss = torch.zeros((), device=self.vla.device, dtype=torch.float32)
-            step_gt_action_gap_metric = torch.zeros((), device=self.vla.device, dtype=torch.float32)
-            step_gt_per_joint_gap = torch.zeros((self.default_action_dim,), device=self.vla.device, dtype=torch.float32)
-            if action_gap_mode == "gt_farthest":
-                gt_phase_name = self._infer_gt_phase_for_step(
-                    split=split,
-                    task_description=task_description,
-                    step_idx=step_idx,
-                    horizon=max_steps,
-                    phase_start_name=start_phase_name,
-                )
-                gt_candidate_actions, gt_candidate_count, gt_reference_instruction, gt_reference_phase = self._get_gt_candidate_actions(
-                    split=split,
-                    task_description=task_description,
-                    step_idx=step_idx,
-                    horizon=max_steps,
-                    action_dim=action_dim,
-                    phase_name=gt_phase_name,
-                )
-                step_gt_action_gap_loss, step_gt_action_gap_metric, step_gt_per_joint_gap, _ = self._compute_gt_action_gap_losses(
-                    adv_logits=output_adv.logits,
-                    labels_full=labels_full,
-                    action_mask_full=action_mask_full,
-                    gt_candidate_actions=gt_candidate_actions,
-                    maskidx=maskidx,
-                    use_all_joints=use_all_joints,
-                    gripper_weight=gripper_weight,
-                    gt_softmin_tau=gt_softmin_tau,
-                )
-            total_action_gap += step_action_gap_metric.item()
-            total_gt_action_gap += step_gt_action_gap_metric.item()
-            total_action_terms += 1
-            total_per_joint = self._accumulate_joint_values(total_per_joint, step_per_joint_gap)
-            total_gt_per_joint = self._accumulate_joint_values(total_gt_per_joint, step_gt_per_joint_gap)
-
-            clean_pred_tokens = self._extract_pred_action_tokens_from_logits(output_clean.logits, labels_full)
-            step_history_div = torch.zeros((), device=self.vla.device, dtype=torch.float32)
-            step_history_div_legacy = torch.zeros((), device=self.vla.device, dtype=torch.float32)
-            if need_history:
-                step_history_div, _clean_history_state, adv_history_state = self._compute_clean_adv_history_divergence(
-                    clean_hidden_states=output_clean.hidden_states[-1],
-                    adv_hidden_states=output_adv.hidden_states[-1],
-                    labels_full=labels_full,
-                    action_mask_full=action_mask_full,
-                )
-                total_history_div += step_history_div.detach().item()
-                total_history_terms += 1
-                step_history_div_legacy = self._compute_legacy_history_divergence(adv_history_state, prev_adv_history_state)
-                if prev_adv_history_state is not None:
-                    total_history_div_legacy += step_history_div_legacy.detach().item()
-                    total_history_terms_legacy += 1
-                prev_adv_history_state = adv_history_state.detach()
-
-            step_weight = float(self._get_rollout_step_weight(step_idx))
-            episode_weight_sum += step_weight
-
-            step_siglip_distance = torch.zeros((), device=self.vla.device, dtype=torch.float32)
-            if (siglip_model is not None) and (lambda_siglip > 0.0):
-                step_siglip_distance = self._compute_siglip_embedding_distance(
-                    siglip_model=siglip_model,
-                    reference_images=attack_aux["pre_projection_tensors"],
-                    projected_images=attack_aux["projected_input_tensors"],
-                    input_size=siglip_input_size,
-                )
-
-            active_step_action_gap_loss = step_gt_action_gap_loss if action_gap_mode == "gt_farthest" else step_action_gap_loss
-            step_loss = -(lambda_action_gap * active_step_action_gap_loss)
-            if need_history:
-                step_loss = step_loss - (lambda_history * step_history_div)
-                step_loss = step_loss - (lambda_history_legacy * step_history_div_legacy)
-            step_loss = step_loss - (lambda_siglip * step_siglip_distance)
-            step_ce = torch.zeros((), device=self.vla.device, dtype=torch.float32)
-            step_ce_objective = torch.zeros((), device=self.vla.device, dtype=torch.float32)
-            if online_ce_mode in ("pseudo_clean", "uada_inverse_pseudo_clean"):
-                step_ce = self._compute_pseudo_clean_ce(
-                    adv_logits=output_adv.logits,
-                    clean_logits=output_clean.logits,
-                    labels_full=labels_full,
-                    action_mask_full=action_mask_full,
-                )
-                if online_ce_mode == "pseudo_clean":
-                    step_ce_objective = step_ce
-                else:
-                    step_ce_objective = self._compute_uada_inverse_ce_objective(step_ce)
-                step_loss = step_loss + (lambda_ce * step_ce_objective)
-            weighted_step_loss = step_loss * step_weight
-            total_ce += step_ce.detach().item()
-            total_ce_objective += step_ce_objective.detach().item()
-            total_siglip_distance += step_siglip_distance.detach().item()
-            if need_backward:
-                if weighted_step_loss.requires_grad:
-                    weighted_step_loss.backward()
-                total_loss = total_loss + weighted_step_loss.detach()
-            else:
-                total_loss = total_loss + weighted_step_loss
-
-            env_action = self._decode_env_action(adv_pred_tokens, action_mask_full, action_stats)
-            obs, _, done, _ = env.step(env_action.tolist())
-            last_done = bool(done)
-
-            next_image = None
-            if capture_visual or (record_video_frames and video_frame_source == "next_obs"):
-                next_image = get_libero_image(obs, (224, 224))
-
-            adv_frame_pil = None
-            if capture_visual or (record_video_frames and video_frame_source == "adv"):
-                adv_frame_pil = self._to_pil(
-                    self.randomPatchTransform.denormalize(
-                        adv_images[0, 0:3, :, :].detach().cpu().unsqueeze(0),
-                        mean=self.mean[0],
-                        std=self.std[0],
+                step_action_gap_loss, step_action_gap_metric, step_per_joint_gap, adv_pred_tokens = (
+                    self._compute_action_gap_losses(
+                        adv_logits=output_adv.logits,
+                        clean_logits=output_clean.logits,
+                        labels_full=labels_full,
+                        action_mask_full=action_mask_full,
+                        maskidx=maskidx,
+                        use_all_joints=use_all_joints,
+                        gripper_weight=gripper_weight,
                     )
-                    .squeeze(0)
-                    .clamp(0, 1)
                 )
+                total_action_gap += step_action_gap_metric.item()
+                total_action_terms += 1
+                total_per_joint = self._accumulate_joint_values(total_per_joint, step_per_joint_gap)
 
-            if record_video_frames:
-                if video_frame_source == "orig":
-                    video_frame = self._to_pil(current_image)
-                elif video_frame_source == "projected_input":
-                    video_frame = self._to_pil(attack_aux["projected_inputs"][0])
-                elif video_frame_source == "adv":
-                    video_frame = adv_frame_pil
-                else:
-                    video_frame = self._to_pil(next_image if next_image is not None else current_image)
-                video_frames.append(video_frame)
+                gt_candidate_actions = None
+                if need_any_gt_rollout:
+                    absolute_step_idx = None
+                    if window_rollout_enabled:
+                        absolute_step_idx = int(window_rollout_spec.get("window_start_step", 0)) + int(step_idx)
+                    gt_phase_name = self._infer_gt_phase_for_episode_step(
+                        split=split,
+                        task_description=task_description,
+                        step_idx=step_idx,
+                        horizon=max_steps,
+                        phase_start_name=start_phase_name,
+                        phase_boundary_info=episode_phase_boundary_info,
+                        absolute_step_idx=absolute_step_idx,
+                    )
+                    gt_candidate_actions, gt_candidate_count, gt_reference_instruction, gt_reference_phase = (
+                        self._get_gt_candidate_actions(
+                            split=split,
+                            task_description=task_description,
+                            step_idx=step_idx,
+                            horizon=max_steps,
+                            action_dim=action_dim,
+                            phase_name=gt_phase_name,
+                        )
+                    )
 
-            if capture_visual and self._is_visual_step(step_idx, max_steps):
-                if next_image is None:
-                    next_image = get_libero_image(obs, (224, 224))
-                visual_frames.append(
-                    {
-                        "step_idx": int(step_idx),
-                        "orig": self._to_pil(current_image),
-                        "projected_input": self._to_pil(attack_aux["projected_inputs"][0]),
-                        "adv": adv_frame_pil
-                        if adv_frame_pil is not None
-                        else self._to_pil(
-                            self.randomPatchTransform.denormalize(
-                                adv_images[0, 0:3, :, :].detach().cpu().unsqueeze(0),
-                                mean=self.mean[0],
-                                std=self.std[0],
+                zero = torch.zeros((), device=self.vla.device, dtype=torch.float32)
+                step_gt_action_gap_loss = zero
+                step_gt_action_gap_metric = zero.detach()
+                step_gt_per_joint_gap = torch.zeros(
+                    (self.default_action_dim,),
+                    device=self.vla.device,
+                    dtype=torch.float32,
+                )
+                if action_gap_mode == "gt_farthest":
+                    step_gt_action_gap_loss, step_gt_action_gap_metric, step_gt_per_joint_gap, _ = (
+                        self._compute_gt_action_gap_losses(
+                            adv_logits=output_adv.logits,
+                            labels_full=labels_full,
+                            action_mask_full=action_mask_full,
+                            gt_candidate_actions=gt_candidate_actions,
+                            maskidx=maskidx,
+                            use_all_joints=use_all_joints,
+                            gripper_weight=gripper_weight,
+                            gt_softmin_tau=gt_softmin_tau,
+                        )
+                    )
+                elif continuous_enabled or impulse_enabled or window_rollout_enabled:
+                    step_gt_action_gap_loss, step_gt_action_gap_metric, step_gt_per_joint_gap, _ = (
+                        self._compute_gt_action_gap_losses(
+                            adv_logits=output_adv.logits,
+                            labels_full=labels_full,
+                            action_mask_full=action_mask_full,
+                            gt_candidate_actions=gt_candidate_actions,
+                            maskidx=maskidx,
+                            use_all_joints=use_all_joints,
+                            gripper_weight=gripper_weight,
+                            gt_softmin_tau=gt_softmin_tau,
+                        )
+                    )
+                if action_gap_mode == "gt_farthest":
+                    total_gt_action_gap += step_gt_action_gap_metric.item()
+                    total_gt_per_joint = self._accumulate_joint_values(total_gt_per_joint, step_gt_per_joint_gap)
+
+                clean_pred_tokens = self._extract_pred_action_tokens_from_logits(output_clean.logits, labels_full)
+                step_history_div = torch.zeros((), device=self.vla.device, dtype=torch.float32)
+                step_history_div_legacy = torch.zeros((), device=self.vla.device, dtype=torch.float32)
+                if need_history:
+                    step_history_div, _clean_history_state, adv_history_state = self._compute_clean_adv_history_divergence(
+                        clean_hidden_states=output_clean.hidden_states[-1],
+                        adv_hidden_states=output_adv.hidden_states[-1],
+                        labels_full=labels_full,
+                        action_mask_full=action_mask_full,
+                    )
+                    total_history_div += step_history_div.detach().item()
+                    total_history_terms += 1
+                    step_history_div_legacy = self._compute_legacy_history_divergence(
+                        adv_history_state, prev_adv_history_state
+                    )
+                    if prev_adv_history_state is not None:
+                        total_history_div_legacy += step_history_div_legacy.detach().item()
+                        total_history_terms_legacy += 1
+                    prev_adv_history_state = adv_history_state.detach()
+
+                step_weight = float(self._get_rollout_step_weight(step_idx))
+                episode_weight_sum += step_weight
+
+                step_siglip_distance = torch.zeros((), device=self.vla.device, dtype=torch.float32)
+                if (siglip_model is not None) and (lambda_siglip > 0.0):
+                    step_siglip_distance = self._compute_siglip_embedding_distance(
+                        siglip_model=siglip_model,
+                        reference_images=attack_aux["pre_projection_tensors"],
+                        projected_images=attack_aux["projected_input_tensors"],
+                        input_size=siglip_input_size,
+                    )
+
+                clean_branch_pred_tokens = None
+                clean_branch_gt_loss = zero.detach()
+                clean_branch_gt_metric = zero.detach()
+                if clean_branch_active:
+                    if step_idx == 0:
+                        clean_branch_pred_tokens = clean_pred_tokens.detach()
+                        if gt_candidate_actions is not None:
+                            clean_branch_gt_loss, clean_branch_gt_metric, _, _ = self._compute_gt_action_gap_losses(
+                                adv_logits=output_clean.logits,
+                                labels_full=labels_full,
+                                action_mask_full=action_mask_full,
+                                gt_candidate_actions=gt_candidate_actions,
+                                maskidx=maskidx,
+                                use_all_joints=use_all_joints,
+                                gripper_weight=gripper_weight,
+                                gt_softmin_tau=gt_softmin_tau,
                             )
-                            .squeeze(0)
-                            .clamp(0, 1)
-                        ),
-                        "next_obs": self._to_pil(next_image),
-                    }
+                            clean_branch_gt_loss = clean_branch_gt_loss.detach()
+                    else:
+                        (
+                            clean_branch_pred_tokens,
+                            clean_branch_gt_loss,
+                            clean_branch_gt_metric,
+                            _,
+                        ) = self._forward_clean_branch_gt_step(
+                            obs=clean_branch_obs,
+                            rollout_input_ids=clean_branch_rollout_input_ids,
+                            get_libero_image=get_libero_image,
+                            attention_mask=attention_mask,
+                            labels_full=labels_full,
+                            action_mask_full=action_mask_full,
+                            gt_candidate_actions=gt_candidate_actions,
+                            maskidx=maskidx,
+                            use_all_joints=use_all_joints,
+                            gripper_weight=gripper_weight,
+                            gt_softmin_tau=gt_softmin_tau,
+                            split=split,
+                            global_iter=global_iter,
+                            max_steps=max_steps,
+                            step_idx=step_idx,
+                            step_seed=step_seed,
+                            disable_lighting=disable_lighting,
+                            episode_lighting_map_idx=episode_lighting_map_idx,
+                        )
+
+                impulse_branch_pred_tokens = None
+                impulse_branch_gt_metric = zero.detach()
+                if impulse_branch_active:
+                    if step_idx == 0:
+                        impulse_branch_pred_tokens = adv_pred_tokens.detach()
+                    else:
+                        (
+                            impulse_branch_pred_tokens,
+                            _impulse_gt_loss_unused,
+                            impulse_branch_gt_metric,
+                            _,
+                        ) = self._forward_clean_branch_gt_step(
+                            obs=impulse_branch_obs,
+                            rollout_input_ids=impulse_branch_rollout_input_ids,
+                            get_libero_image=get_libero_image,
+                            attention_mask=attention_mask,
+                            labels_full=labels_full,
+                            action_mask_full=action_mask_full,
+                            gt_candidate_actions=gt_candidate_actions,
+                            maskidx=maskidx,
+                            use_all_joints=use_all_joints,
+                            gripper_weight=gripper_weight,
+                            gt_softmin_tau=gt_softmin_tau,
+                            split=split,
+                            global_iter=global_iter,
+                            max_steps=max_steps,
+                            step_idx=step_idx,
+                            step_seed=step_seed,
+                            disable_lighting=disable_lighting,
+                            episode_lighting_map_idx=episode_lighting_map_idx,
+                        )
+
+                active_step_action_gap_loss = (
+                    step_gt_action_gap_loss if action_gap_mode == "gt_farthest" else step_action_gap_loss
                 )
+                step_loss = -(lambda_action_gap * active_step_action_gap_loss)
+                if continuous_enabled and clean_branch_active:
+                    continuous_step_delta_loss = step_gt_action_gap_loss - clean_branch_gt_loss.detach()
+                    continuous_step_delta_metric = step_gt_action_gap_metric - clean_branch_gt_metric
+                    step_loss = step_loss - (float(lambda_continuous_rollout) * continuous_step_delta_loss)
+                    total_continuous_adv_gt_gap += float(step_gt_action_gap_metric.item())
+                    total_continuous_clean_gt_gap += float(clean_branch_gt_metric.item())
+                    total_continuous_rollout_delta += float(continuous_step_delta_metric.item())
+                    total_continuous_terms += 1
+                if window_rollout_enabled and clean_branch_active and (step_idx >= window_step_count):
+                    future_step_idx = int(step_idx - window_step_count)
+                    if future_step_idx < window_future_steps:
+                        step_window_delta = step_gt_action_gap_metric - clean_branch_gt_metric
+                        step_window_delta_loss = step_gt_action_gap_loss - clean_branch_gt_loss.detach()
+                        if window_rollout_metric_mode == "adv_gt":
+                            step_window_metric_loss = step_gt_action_gap_loss
+                        else:
+                            step_window_metric_loss = step_window_delta_loss
+                        step_window_weight = compute_window_rollout_weight(
+                            future_step_idx=future_step_idx,
+                            exp_base=window_exp_base,
+                        )
+                        total_window_rollout_adv_gt_gap += float(step_gt_action_gap_metric.item())
+                        total_window_rollout_clean_gt_gap += float(clean_branch_gt_metric.item())
+                        total_window_rollout_delta_weighted += float(step_window_delta.item()) * float(step_window_weight)
+                        total_window_rollout_delta_weighted_loss += float(step_window_delta_loss.detach().item()) * float(
+                            step_window_weight
+                        )
+                        if lambda_window_rollout_loss != 0.0:
+                            step_loss = step_loss - (
+                                float(lambda_window_rollout_loss) * float(step_window_weight) * step_window_metric_loss
+                            )
+                        total_window_rollout_terms += 1
+                if need_history:
+                    step_loss = step_loss - (lambda_history * step_history_div)
+                    step_loss = step_loss - (lambda_history_legacy * step_history_div_legacy)
+                step_loss = step_loss - (lambda_siglip * step_siglip_distance)
 
-            total_proj_alpha += float(attack_aux["projection_alpha_mean"])
-            total_proj_cov += float(attack_aux["projection_coverage_ratio"])
-            total_proj_bottom += float(attack_aux["projection_bottom_ratio"])
-            total_proj_keystone += float(attack_aux["projection_keystone"])
+                step_ce = torch.zeros((), device=self.vla.device, dtype=torch.float32)
+                step_ce_objective = torch.zeros((), device=self.vla.device, dtype=torch.float32)
+                if online_ce_mode in ("pseudo_clean", "uada_inverse_pseudo_clean"):
+                    step_ce = self._compute_pseudo_clean_ce(
+                        adv_logits=output_adv.logits,
+                        clean_logits=output_clean.logits,
+                        labels_full=labels_full,
+                        action_mask_full=action_mask_full,
+                    )
+                    if online_ce_mode == "pseudo_clean":
+                        step_ce_objective = step_ce
+                    else:
+                        step_ce_objective = self._compute_uada_inverse_ce_objective(step_ce)
+                    step_loss = step_loss + (lambda_ce * step_ce_objective)
+                weighted_step_loss = step_loss * step_weight
+                total_ce += step_ce.detach().item()
+                total_ce_objective += step_ce_objective.detach().item()
+                total_siglip_distance += step_siglip_distance.detach().item()
+                if need_backward:
+                    if weighted_step_loss.requires_grad:
+                        weighted_step_loss.backward()
+                    total_loss = total_loss + weighted_step_loss.detach()
+                else:
+                    total_loss = total_loss + weighted_step_loss
 
-            clean_rollout_input_ids = self._update_rollout_inputs(
-                rollout_input_ids=clean_rollout_input_ids,
-                pred_action_tokens=clean_pred_tokens,
-                action_mask_full=action_mask_full,
+                next_obs, done, adv_rollout_input_ids = self._step_rollout_branch_env(
+                    env=env,
+                    obs=obs,
+                    rollout_input_ids=adv_rollout_input_ids,
+                    pred_action_tokens=adv_pred_tokens.detach(),
+                    action_mask_full=action_mask_full,
+                    action_stats=action_stats,
+                )
+                last_done = bool(done)
+
+                if clean_branch_active and (clean_branch_pred_tokens is not None):
+                    clean_branch_obs, clean_branch_done, clean_branch_rollout_input_ids = self._step_rollout_branch_env(
+                        env=clean_branch_env,
+                        obs=clean_branch_obs,
+                        rollout_input_ids=clean_branch_rollout_input_ids,
+                        pred_action_tokens=clean_branch_pred_tokens,
+                        action_mask_full=action_mask_full,
+                        action_stats=action_stats,
+                    )
+                    clean_branch_active = not clean_branch_done
+                if impulse_branch_active and (impulse_branch_pred_tokens is not None):
+                    impulse_branch_obs, impulse_branch_done, impulse_branch_rollout_input_ids = self._step_rollout_branch_env(
+                        env=impulse_branch_env,
+                        obs=impulse_branch_obs,
+                        rollout_input_ids=impulse_branch_rollout_input_ids,
+                        pred_action_tokens=impulse_branch_pred_tokens,
+                        action_mask_full=action_mask_full,
+                        action_stats=action_stats,
+                    )
+                    impulse_branch_active = not impulse_branch_done
+
+                if impulse_enabled and (step_idx >= 1) and clean_branch_pred_tokens is not None and (impulse_branch_pred_tokens is not None):
+                    impulse_step_area = torch.clamp(impulse_branch_gt_metric - clean_branch_gt_metric, min=0.0)
+                    total_impulse_rollout_area += float(impulse_step_area.item())
+                    total_impulse_terms += 1
+
+                obs = next_obs
+
+                next_image = None
+                if capture_visual or (record_video_frames and video_frame_source == "next_obs"):
+                    next_image = get_libero_image(obs, (224, 224))
+
+                adv_frame_pil = None
+                if capture_visual or (record_video_frames and video_frame_source == "adv"):
+                    adv_frame_pil = self._to_pil(
+                        self.randomPatchTransform.denormalize(
+                            adv_images[0, 0:3, :, :].detach().cpu().unsqueeze(0),
+                            mean=self.mean[0],
+                            std=self.std[0],
+                        )
+                        .squeeze(0)
+                        .clamp(0, 1)
+                    )
+
+                if record_video_frames:
+                    if video_frame_source == "orig":
+                        video_frame = self._to_pil(current_image)
+                    elif video_frame_source == "projected_input":
+                        video_frame = self._to_pil(attack_aux["projected_inputs"][0])
+                    elif video_frame_source == "adv":
+                        video_frame = adv_frame_pil
+                    else:
+                        video_frame = self._to_pil(next_image if next_image is not None else current_image)
+                    video_frames.append(video_frame)
+
+                if capture_visual and self._is_visual_step(step_idx, max_steps):
+                    if next_image is None:
+                        next_image = get_libero_image(obs, (224, 224))
+                    visual_frames.append(
+                        {
+                            "step_idx": int(step_idx),
+                            "orig": self._to_pil(current_image),
+                            "projected_input": self._to_pil(attack_aux["projected_inputs"][0]),
+                            "adv": adv_frame_pil
+                            if adv_frame_pil is not None
+                            else self._to_pil(
+                                self.randomPatchTransform.denormalize(
+                                    adv_images[0, 0:3, :, :].detach().cpu().unsqueeze(0),
+                                    mean=self.mean[0],
+                                    std=self.std[0],
+                                )
+                                .squeeze(0)
+                                .clamp(0, 1)
+                            ),
+                            "next_obs": self._to_pil(next_image),
+                        }
+                    )
+
+                total_proj_alpha += float(attack_aux["projection_alpha_mean"])
+                total_proj_cov += float(attack_aux["projection_coverage_ratio"])
+                total_proj_bottom += float(attack_aux["projection_bottom_ratio"])
+                total_proj_keystone += float(attack_aux["projection_keystone"])
+
+                clean_rollout_input_ids = self._update_rollout_inputs(
+                    rollout_input_ids=clean_rollout_input_ids,
+                    pred_action_tokens=clean_pred_tokens,
+                    action_mask_full=action_mask_full,
+                )
+                if done:
+                    break
+
+            weight_denom = float(max(episode_weight_sum, 1e-8))
+            total_loss = total_loss / weight_denom
+            if need_backward and (projection_texture.grad is not None):
+                inv_weight_denom = 1.0 / weight_denom
+                if grad_before_episode is None:
+                    projection_texture.grad.mul_(inv_weight_denom)
+                else:
+                    episode_delta_grad = projection_texture.grad - grad_before_episode
+                    projection_texture.grad.copy_(grad_before_episode + (episode_delta_grad * inv_weight_denom))
+            if (
+                need_backward
+                and (learnable_projector_params is not None)
+                and learnable_projector_params.has_trainable_params()
+                and (photometric_grads_before_episode is not None)
+            ):
+                inv_weight_denom = 1.0 / weight_denom
+                for param, grad_before in zip(learnable_projector_params.parameters(), photometric_grads_before_episode):
+                    if param.grad is None:
+                        continue
+                    if grad_before is None:
+                        param.grad.mul_(inv_weight_denom)
+                    else:
+                        episode_delta_grad = param.grad - grad_before
+                        param.grad.copy_(grad_before + (episode_delta_grad * inv_weight_denom))
+
+            ep_steps = max(1, int(total_action_terms))
+            avg_window_rollout_clean_gt_action_gap = (
+                total_window_rollout_clean_gt_gap / float(max(1, total_window_rollout_terms))
+                if total_window_rollout_terms > 0
+                else 0.0
             )
-            adv_rollout_input_ids = self._update_rollout_inputs(
-                rollout_input_ids=adv_rollout_input_ids,
-                pred_action_tokens=adv_pred_tokens,
-                action_mask_full=action_mask_full,
+            avg_window_rollout_adv_gt_action_gap = (
+                total_window_rollout_adv_gt_gap / float(max(1, total_window_rollout_terms))
+                if total_window_rollout_terms > 0
+                else 0.0
             )
-            if done:
-                break
-
-        weight_denom = float(max(episode_weight_sum, 1e-8))
-        total_loss = total_loss / weight_denom
-        if need_backward and (projection_texture.grad is not None):
-            inv_weight_denom = 1.0 / weight_denom
-            if grad_before_episode is None:
-                projection_texture.grad.mul_(inv_weight_denom)
-            else:
-                episode_delta_grad = projection_texture.grad - grad_before_episode
-                projection_texture.grad.copy_(grad_before_episode + (episode_delta_grad * inv_weight_denom))
-
-        ep_steps = max(1, int(total_action_terms))
-        return {
-            "loss": total_loss if need_backward else total_loss.detach(),
-            "action_gap": total_action_gap / float(ep_steps),
-            "gt_action_gap": total_gt_action_gap / float(ep_steps),
-            "history_div": total_history_div / float(max(1, total_history_terms)),
-            "history_div_legacy": total_history_div_legacy / float(max(1, total_history_terms_legacy)),
-            "ce_value": total_ce / float(ep_steps),
-            "ce_objective_value": total_ce_objective / float(ep_steps),
-            "siglip_distance": total_siglip_distance / float(ep_steps),
-            "action_terms": total_action_terms,
-            "history_terms": total_history_terms,
-            "history_terms_legacy": total_history_terms_legacy,
-            "done": last_done,
-            "episode_len": total_action_terms,
-            "per_joint_gap": self._normalize_joint_values(total_per_joint, float(ep_steps)),
-            "gt_per_joint_gap": self._normalize_joint_values(total_gt_per_joint, float(ep_steps)),
-            "projection_alpha": total_proj_alpha / float(ep_steps),
-            "projection_coverage": total_proj_cov / float(ep_steps),
-            "projection_bottom": total_proj_bottom / float(ep_steps),
-            "projection_keystone": total_proj_keystone / float(ep_steps),
-            "visual_frames": visual_frames,
-            "video_frames": video_frames,
-            "lighting_backend": str(episode_lighting_backend),
-            "effective_lighting_enabled": int(episode_effective_lighting_enabled),
-            "task_id": -1 if task_id is None else int(task_id),
-            "task_description": str(task_description),
-            "phase_start_name": str(start_phase_name),
-            "effective_num_steps_wait": int(effective_num_steps_wait),
-            "gt_candidate_count": int(gt_candidate_count),
-            "gt_reference_instruction": str(gt_reference_instruction),
-            "gt_reference_phase": str(gt_reference_phase),
-        }
+            window_rollout_metric_value = select_window_rollout_metric_value(
+                metric_mode=window_rollout_metric_mode,
+                delta_weighted=float(total_window_rollout_delta_weighted),
+                adv_gt_action_gap=avg_window_rollout_adv_gt_action_gap,
+            )
+            return {
+                "loss": total_loss if need_backward else total_loss.detach(),
+                "action_gap": total_action_gap / float(ep_steps),
+                "gt_action_gap": total_gt_action_gap / float(ep_steps),
+                "history_div": total_history_div / float(max(1, total_history_terms)),
+                "history_div_legacy": total_history_div_legacy / float(max(1, total_history_terms_legacy)),
+                "ce_value": total_ce / float(ep_steps),
+                "ce_objective_value": total_ce_objective / float(ep_steps),
+                "siglip_distance": total_siglip_distance / float(ep_steps),
+                "continuous_clean_gt_action_gap": (
+                    total_continuous_clean_gt_gap / float(max(1, total_continuous_terms))
+                    if total_continuous_terms > 0
+                    else 0.0
+                ),
+                "continuous_adv_gt_action_gap": (
+                    total_continuous_adv_gt_gap / float(max(1, total_continuous_terms))
+                    if total_continuous_terms > 0
+                    else 0.0
+                ),
+                "continuous_rollout_delta": (
+                    total_continuous_rollout_delta / float(max(1, total_continuous_terms))
+                    if total_continuous_terms > 0
+                    else 0.0
+                ),
+                "impulse_rollout_area": total_impulse_rollout_area,
+                "window_rollout_clean_gt_action_gap": (
+                    avg_window_rollout_clean_gt_action_gap
+                ),
+                "window_rollout_adv_gt_action_gap": (
+                    avg_window_rollout_adv_gt_action_gap
+                ),
+                "window_rollout_delta_weighted": float(total_window_rollout_delta_weighted),
+                "window_rollout_delta_weighted_loss": float(total_window_rollout_delta_weighted_loss),
+                "window_rollout_metric_mode": str(window_rollout_metric_mode),
+                "window_rollout_metric_value": float(window_rollout_metric_value),
+                "window_rollout_future_steps": int(total_window_rollout_terms),
+                "action_terms": total_action_terms,
+                "history_terms": total_history_terms,
+                "history_terms_legacy": total_history_terms_legacy,
+                "continuous_terms": total_continuous_terms,
+                "impulse_terms": total_impulse_terms,
+                "done": last_done,
+                "episode_len": total_action_terms,
+                "per_joint_gap": self._normalize_joint_values(total_per_joint, float(ep_steps)),
+                "gt_per_joint_gap": self._normalize_joint_values(total_gt_per_joint, float(ep_steps)),
+                "projection_alpha": total_proj_alpha / float(ep_steps),
+                "projection_coverage": total_proj_cov / float(ep_steps),
+                "projection_bottom": total_proj_bottom / float(ep_steps),
+                "projection_keystone": total_proj_keystone / float(ep_steps),
+                "visual_frames": visual_frames,
+                "video_frames": video_frames,
+                "lighting_backend": str(episode_lighting_backend),
+                "effective_lighting_enabled": int(episode_effective_lighting_enabled),
+                "task_id": -1 if task_id is None else int(task_id),
+                "task_description": str(task_description),
+                "phase_start_name": str(start_phase_name),
+                "effective_num_steps_wait": int(effective_num_steps_wait),
+                "gt_candidate_count": int(gt_candidate_count),
+                "gt_reference_instruction": str(gt_reference_instruction),
+                "gt_reference_phase": str(gt_reference_phase),
+                "window_phase_name": str(window_rollout_spec.get("phase_name", "")) if window_rollout_enabled else "",
+                "window_start_step": float(window_rollout_spec.get("window_start_step", 0.0))
+                if window_rollout_enabled
+                else 0.0,
+                "window_end_step": float(window_rollout_spec.get("window_end_step", 0.0))
+                if window_rollout_enabled
+                else 0.0,
+            }
+        finally:
+            for branch_env in (clean_branch_env, impulse_branch_env):
+                if (branch_env is not None) and hasattr(branch_env, "close"):
+                    branch_env.close()
 
     def _is_cuda_alloc_failure(self, err):
         message = str(err).lower()
@@ -2902,6 +4038,26 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             pickle.dump(self.train_gt_rollout_score, file)
         with open(os.path.join(path, "train_online_gt_objective_score.pkl"), "wb") as file:
             pickle.dump(self.train_gt_rollout_objective_score, file)
+        with open(os.path.join(path, "train_online_continuous_clean_gt_action_gap.pkl"), "wb") as file:
+            pickle.dump(self.train_continuous_clean_gt_action_gap, file)
+        with open(os.path.join(path, "train_online_continuous_adv_gt_action_gap.pkl"), "wb") as file:
+            pickle.dump(self.train_continuous_adv_gt_action_gap, file)
+        with open(os.path.join(path, "train_online_continuous_rollout_delta.pkl"), "wb") as file:
+            pickle.dump(self.train_continuous_rollout_delta, file)
+        with open(os.path.join(path, "train_online_impulse_rollout_area.pkl"), "wb") as file:
+            pickle.dump(self.train_impulse_rollout_area, file)
+        with open(os.path.join(path, "train_online_window_rollout_clean_gt_action_gap.pkl"), "wb") as file:
+            pickle.dump(self.train_window_rollout_clean_gt_action_gap, file)
+        with open(os.path.join(path, "train_online_window_rollout_adv_gt_action_gap.pkl"), "wb") as file:
+            pickle.dump(self.train_window_rollout_adv_gt_action_gap, file)
+        with open(os.path.join(path, "train_online_window_rollout_delta_weighted.pkl"), "wb") as file:
+            pickle.dump(self.train_window_rollout_delta_weighted, file)
+        with open(os.path.join(path, "train_online_window_rollout_delta_weighted_loss.pkl"), "wb") as file:
+            pickle.dump(self.train_window_rollout_delta_weighted_loss, file)
+        with open(os.path.join(path, "train_online_total_rollout_score.pkl"), "wb") as file:
+            pickle.dump(self.train_total_rollout_score, file)
+        with open(os.path.join(path, "train_online_total_objective_score.pkl"), "wb") as file:
+            pickle.dump(self.train_total_objective_score, file)
         with open(os.path.join(path, "train_online_active_rollout_action_gap.pkl"), "wb") as file:
             pickle.dump(self.train_active_rollout_action_gap, file)
         with open(os.path.join(path, "train_online_active_rollout_score.pkl"), "wb") as file:
@@ -2936,6 +4092,26 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             pickle.dump(self.val_gt_rollout_score, file)
         with open(os.path.join(path, "val_online_gt_objective_score.pkl"), "wb") as file:
             pickle.dump(self.val_gt_rollout_objective_score, file)
+        with open(os.path.join(path, "val_online_continuous_clean_gt_action_gap.pkl"), "wb") as file:
+            pickle.dump(self.val_continuous_clean_gt_action_gap, file)
+        with open(os.path.join(path, "val_online_continuous_adv_gt_action_gap.pkl"), "wb") as file:
+            pickle.dump(self.val_continuous_adv_gt_action_gap, file)
+        with open(os.path.join(path, "val_online_continuous_rollout_delta.pkl"), "wb") as file:
+            pickle.dump(self.val_continuous_rollout_delta, file)
+        with open(os.path.join(path, "val_online_impulse_rollout_area.pkl"), "wb") as file:
+            pickle.dump(self.val_impulse_rollout_area, file)
+        with open(os.path.join(path, "val_online_window_rollout_clean_gt_action_gap.pkl"), "wb") as file:
+            pickle.dump(self.val_window_rollout_clean_gt_action_gap, file)
+        with open(os.path.join(path, "val_online_window_rollout_adv_gt_action_gap.pkl"), "wb") as file:
+            pickle.dump(self.val_window_rollout_adv_gt_action_gap, file)
+        with open(os.path.join(path, "val_online_window_rollout_delta_weighted.pkl"), "wb") as file:
+            pickle.dump(self.val_window_rollout_delta_weighted, file)
+        with open(os.path.join(path, "val_online_window_rollout_delta_weighted_loss.pkl"), "wb") as file:
+            pickle.dump(self.val_window_rollout_delta_weighted_loss, file)
+        with open(os.path.join(path, "val_online_total_rollout_score.pkl"), "wb") as file:
+            pickle.dump(self.val_total_rollout_score, file)
+        with open(os.path.join(path, "val_online_total_objective_score.pkl"), "wb") as file:
+            pickle.dump(self.val_total_objective_score, file)
         with open(os.path.join(path, "val_online_active_rollout_action_gap.pkl"), "wb") as file:
             pickle.dump(self.val_active_rollout_action_gap, file)
         with open(os.path.join(path, "val_online_active_rollout_score.pkl"), "wb") as file:
@@ -2948,3 +4124,4 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             pickle.dump(self.val_online_done_rate, file)
         with open(os.path.join(path, "val_online_episode_len.pkl"), "wb") as file:
             pickle.dump(self.val_online_episode_len, file)
+        self._write_run_metadata()

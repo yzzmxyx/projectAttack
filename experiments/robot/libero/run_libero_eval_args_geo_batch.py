@@ -21,6 +21,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+import time
 from typing import Optional, Union
 
 import draccus
@@ -29,16 +30,19 @@ import tqdm
 from libero.libero import benchmark
 
 import wandb
-import sys
-sys.path.append("PATH TO/white_patch")
-from appply_random_transform import RandomPatchTransform
 import torch
-import os
 import random
 
+REPO_ROOT = Path(__file__).resolve().parents[3]
+VLA_ATTACKER_ROOT = REPO_ROOT / "VLAAttacker"
+for path in (REPO_ROOT, VLA_ATTACKER_ROOT):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
 
-# Append current directory so that interpreter can find experiments.robot
-sys.path.append("../..")
+from white_patch.appply_random_transform import RandomPatchTransform
+
+
 from experiments.robot.libero.libero_utils import (
     get_libero_dummy_action,
     get_libero_env,
@@ -111,7 +115,7 @@ def eval_libero(cfg) -> None:
     cfg.unnorm_key = cfg.task_suite_name
 
     # Load model
-    model = get_model(cfg,DEVICE=f"cuda:{cfg.cudaid}")
+    model = get_model(cfg)
 
     # [OpenVLA] Check that the model contains the action un-normalization key
     if cfg.model_family == "openvla":
@@ -153,6 +157,23 @@ def eval_libero(cfg) -> None:
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
 
+    risk_window_adapter = None
+    if getattr(cfg, "risk_window_enable", False):
+        if str(getattr(cfg, "risk_window_asset_root", "")).strip() == "":
+            raise ValueError("risk_window_enable=True requires a non-empty `risk_window_asset_root`.")
+        from risk_window.adapters.libero import LiberoRiskWindowAdapter
+
+        default_log_dir = str(getattr(cfg, "risk_window_log_dir", "")).strip()
+        if default_log_dir == "":
+            default_log_dir = os.path.join(cfg.local_log_dir, "risk_window")
+        risk_window_adapter = LiberoRiskWindowAdapter.from_runtime_args(
+            config_path=str(getattr(cfg, "risk_window_config", "")),
+            asset_root=str(cfg.risk_window_asset_root),
+            log_dir=default_log_dir,
+            action_policy=str(getattr(cfg, "risk_window_action", "log_only")),
+            overlay=bool(getattr(cfg, "risk_window_overlay", False)),
+        )
+
     # Start evaluation
     total_episodes, total_successes = 0, 0
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
@@ -163,122 +184,147 @@ def eval_libero(cfg) -> None:
         initial_states = task_suite.get_task_init_states(task_id)
 
         # Initialize LIBERO environment and task description
-        env, task_description = get_libero_env(task, cfg.model_family, resolution=256)
+        env = None
+        try:
+            env, task_description = get_libero_env(task, cfg.model_family, resolution=256)
 
-        # Start episodes
-        task_episodes, task_successes = 0, 0
-        for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
-            print(f"\nTask: {task_description}")
-            log_file.write(f"\nTask: {task_description}\n")
+            # Start episodes
+            task_episodes, task_successes = 0, 0
+            for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
+                print(f"\nTask: {task_description}")
+                log_file.write(f"\nTask: {task_description}\n")
 
-            # Reset environment
-            env.reset()
+                # Reset environment
+                env.reset()
 
-            # Set initial states
-            obs = env.set_init_state(initial_states[episode_idx]) #
+                # Set initial states
+                obs = env.set_init_state(initial_states[episode_idx]) #
+                if risk_window_adapter is not None:
+                    risk_window_adapter.reset(task_id=task_id, episode_id=episode_idx, init_state_idx=episode_idx)
 
-            # Setup
-            t = 0
-            replay_images = []
-            if cfg.task_suite_name == "libero_spatial":
-                max_steps = 193  # longest training demo has 193 steps
-            elif cfg.task_suite_name == "libero_object":
-                max_steps = 254  # longest training demo has 254 steps
-            elif cfg.task_suite_name == "libero_goal":
-                max_steps = 270  # longest training demo has 270 steps
-            elif cfg.task_suite_name == "libero_10":
-                max_steps = 505  # longest training demo has 505 steps
-            elif cfg.task_suite_name == "libero_90":
-                max_steps = 373  # longest training demo has 373 steps
-            print(f"Starting episode {task_episodes+1}...")
-            log_file.write(f"Starting episode {task_episodes+1}...\n")
-            while t < max_steps + cfg.num_steps_wait:
-                try:
-                    # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
-                    # and we need to wait for them to fall
-                    if t < cfg.num_steps_wait:
-                        obs, reward, done, info = env.step(get_libero_dummy_action(cfg.model_family))
+                # Setup
+                t = 0
+                replay_images = []
+                if cfg.task_suite_name == "libero_spatial":
+                    max_steps = 193  # longest training demo has 193 steps
+                elif cfg.task_suite_name == "libero_object":
+                    max_steps = 254  # longest training demo has 254 steps
+                elif cfg.task_suite_name == "libero_goal":
+                    max_steps = 270  # longest training demo has 270 steps
+                elif cfg.task_suite_name == "libero_10":
+                    max_steps = 505  # longest training demo has 505 steps
+                elif cfg.task_suite_name == "libero_90":
+                    max_steps = 373  # longest training demo has 373 steps
+                print(f"Starting episode {task_episodes+1}...")
+                log_file.write(f"Starting episode {task_episodes+1}...\n")
+                while t < max_steps + cfg.num_steps_wait:
+                    try:
+                        # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
+                        # and we need to wait for them to fall
+                        if t < cfg.num_steps_wait:
+                            obs, reward, done, info = env.step(get_libero_dummy_action(cfg.model_family))
+                            t += 1
+                            continue
+
+                        # Get preprocessed image
+                        img = get_libero_image(obs, resize_size) # TODO: ATTACK Here
+                        # img = randomPatchTransform.simulation_paste_patch(img,patch)
+                        img = randomPatchTransform.simulation_random_patch(img, patch, geometry=True,colorjitter=False, angle=cfg.angle, shx=cfg.shx, shy=cfg.shy,position=(cfg.x,cfg.y))
+                        if risk_window_adapter is not None:
+                            risk_window_adapter.inspect(frame=img, timestamp=time.time())
+                        # Save preprocessed image for replay video
+                        replay_images.append(img)
+
+                        # Prepare observations dict
+                        # Note: OpenVLA does not take proprio state as input
+                        observation = {
+                            "full_image": img,
+                            "state": np.concatenate(
+                                (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
+                            ),
+                        }
+
+                        # Query model to get action
+                        action = get_action(
+                            cfg,
+                            model,
+                            observation,
+                            task_description,
+                            processor=processor,
+                        )
+
+                        # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
+                        action = normalize_gripper_action(action, binarize=True)
+
+                        # [OpenVLA] The dataloader flips the sign of the gripper action to align with other datasets
+                        # (0 = close, 1 = open), so flip it back (-1 = open, +1 = close) before executing the action
+                        if cfg.model_family == "openvla":
+                            action = invert_gripper_action(action)
+
+                        if risk_window_adapter is not None:
+                            policy_result = risk_window_adapter.apply_action_policy(
+                                proposed_action=action,
+                                dummy_wait_action=np.asarray(get_libero_dummy_action(cfg.model_family), dtype=np.float32),
+                            )
+                            if policy_result["abort_episode"]:
+                                print("[risk_window] abort_episode triggered; ending current episode early.")
+                                done = False
+                                break
+                            action = policy_result["action"]
+
+                        # Execute action in environment
+                        obs, reward, done, info = env.step(action.tolist())
+                        if done:
+                            task_successes += 1
+                            total_successes += 1
+                            break
                         t += 1
-                        continue
 
-                    # Get preprocessed image
-                    img = get_libero_image(obs, resize_size) # TODO: ATTACK Here
-                    # img = randomPatchTransform.simulation_paste_patch(img,patch)
-                    img = randomPatchTransform.simulation_random_patch(img, patch, geometry=True,colorjitter=False, angle=cfg.angle, shx=cfg.shx, shy=cfg.shy,position=(cfg.x,cfg.y))
-                    # Save preprocessed image for replay video
-                    replay_images.append(img)
-
-                    # Prepare observations dict
-                    # Note: OpenVLA does not take proprio state as input
-                    observation = {
-                        "full_image": img,
-                        "state": np.concatenate(
-                            (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
-                        ),
-                    }
-
-                    # Query model to get action
-                    action = get_action(
-                        cfg,
-                        model,
-                        observation,
-                        task_description,
-                        processor=processor,
-                        DEVICE=f"cuda:{cfg.cudaid}",
-                    )
-
-                    # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
-                    action = normalize_gripper_action(action, binarize=True)
-
-                    # [OpenVLA] The dataloader flips the sign of the gripper action to align with other datasets
-                    # (0 = close, 1 = open), so flip it back (-1 = open, +1 = close) before executing the action
-                    if cfg.model_family == "openvla":
-                        action = invert_gripper_action(action)
-
-                    # Execute action in environment
-                    obs, reward, done, info = env.step(action.tolist())
-                    if done:
-                        task_successes += 1
-                        total_successes += 1
+                    except Exception as e:
+                        print(f"Caught exception: {e}")
+                        log_file.write(f"Caught exception: {e}\n")
                         break
-                    t += 1
 
-                except Exception as e:
-                    print(f"Caught exception: {e}")
-                    log_file.write(f"Caught exception: {e}\n")
-                    break
+                task_episodes += 1
+                total_episodes += 1
 
-            task_episodes += 1
-            total_episodes += 1
+                # Save a replay video of the episode
+                print(f"Saving replay video...")
+                save_rollout_video(
+                    replay_images, total_episodes, success=done, task_description=task_description, log_file=log_file,exp_name=cfg.exp_name
+                )
 
-            # Save a replay video of the episode
-            print(f"Saving replay video...")
-            save_rollout_video(
-                replay_images, total_episodes, success=done, task_description=task_description, log_file=log_file,exp_name=cfg.exp_name
-            )
+                # Log current results
+                print(f"Success: {done}")
+                print(f"# episodes completed so far: {total_episodes}")
+                print(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
+                log_file.write(f"Success: {done}\n")
+                log_file.write(f"# episodes completed so far: {total_episodes}\n")
+                log_file.write(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)\n")
+                if risk_window_adapter is not None:
+                    risk_summary = risk_window_adapter.flush()
+                    log_file.write(f"[risk_window] summary: {risk_summary}\n")
+                log_file.flush()
 
-            # Log current results
-            print(f"Success: {done}")
-            print(f"# episodes completed so far: {total_episodes}")
-            print(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
-            log_file.write(f"Success: {done}\n")
-            log_file.write(f"# episodes completed so far: {total_episodes}\n")
-            log_file.write(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)\n")
+            # Log final results
+            print(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
+            print(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
+            log_file.write(f"Current task success rate: {float(task_successes) / float(task_episodes)}\n")
+            log_file.write(f"Current total success rate: {float(total_successes) / float(total_episodes)}\n")
             log_file.flush()
-
-        # Log final results
-        print(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
-        print(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
-        log_file.write(f"Current task success rate: {float(task_successes) / float(task_episodes)}\n")
-        log_file.write(f"Current total success rate: {float(total_successes) / float(total_episodes)}\n")
-        log_file.flush()
-        if cfg.use_wandb:
-            wandb.log(
-                {
-                    f"success_rate/{task_description}": float(task_successes) / float(task_episodes),
-                    f"num_episodes/{task_description}": task_episodes,
-                }
-            )
+            if cfg.use_wandb:
+                wandb.log(
+                    {
+                        f"success_rate/{task_description}": float(task_successes) / float(task_episodes),
+                        f"num_episodes/{task_description}": task_episodes,
+                    }
+                )
+        finally:
+            if env is not None:
+                try:
+                    env.close()
+                except Exception as close_exc:
+                    print(f"Warning: failed to close LIBERO env cleanly: {close_exc}")
 
     # Save local log file
     log_file.close()
@@ -300,6 +346,16 @@ def eval_libero(cfg) -> None:
 import argparse
 from pathlib import Path
 from typing import Optional, Union
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("yes", "true", "t", "y", "1"):
+        return True
+    if text in ("no", "false", "f", "n", "0"):
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected.")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Generate configuration for model training/evaluation")
@@ -336,6 +392,12 @@ def parse_args():
     parser.add_argument("--shx", type=float, default=2, help="")
     parser.add_argument("--shy", type=float, default=2, help="")
     parser.add_argument("--cudaid", type=int, default=2, help="")
+    parser.add_argument("--risk_window_enable", type=str2bool, default=False, help="Enable risk_window runtime detector")
+    parser.add_argument("--risk_window_config", type=str, default="", help="Optional risk_window JSON/YAML config path")
+    parser.add_argument("--risk_window_asset_root", type=str, default="", help="Existing vulnerability-window asset root")
+    parser.add_argument("--risk_window_log_dir", type=str, default="", help="Optional detector log root")
+    parser.add_argument("--risk_window_action", type=str, default="log_only", help="log_only | hold_last_action | dummy_wait | abort_episode")
+    parser.add_argument("--risk_window_overlay", type=str2bool, default=False, help="Reserved for future visualization overlay")
 
     args = parser.parse_args()
     return args

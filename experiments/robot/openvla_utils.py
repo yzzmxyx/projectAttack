@@ -28,6 +28,18 @@ OPENVLA_V01_SYSTEM_PROMPT = (
 )
 
 
+def resolve_device(cfg=None):
+    """Resolve the torch device, preferring `cfg.cudaid` when available."""
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+
+    cudaid = getattr(cfg, "cudaid", None)
+    if cudaid is not None:
+        return torch.device(f"cuda:{cudaid}")
+
+    return DEVICE
+
+
 def get_vla(cfg):
     """Loads and returns a VLA model from checkpoint."""
     # Load VLA checkpoint.
@@ -53,8 +65,9 @@ def get_vla(cfg):
     # Move model to device.
     # Note: `.to()` is not supported for 8-bit or 4-bit bitsandbytes models, but the model will
     #       already be set to the right devices and casted to the correct dtype upon loading.
+    device = resolve_device(cfg)
     if not cfg.load_in_8bit and not cfg.load_in_4bit:
-        vla = vla.to(DEVICE)
+        vla = vla.to(device)
 
     # Load dataset stats used during finetuning (for action un-normalization).
     dataset_statistics_path = os.path.join(cfg.pretrained_checkpoint, "dataset_statistics.json")
@@ -163,7 +176,10 @@ def get_vla_action(vla, processor, base_vla_name, obs, task_label, unnorm_key, c
         prompt = f"In: What action should the robot take to {task_label.lower()}?\nOut:"
 
     # Process inputs.
-    inputs = processor(prompt, image).to(DEVICE, dtype=torch.bfloat16)
+    model_device = getattr(vla, "device", None)
+    if model_device is None:
+        model_device = next(vla.parameters()).device
+    inputs = processor(prompt, image).to(model_device, dtype=torch.bfloat16)
 
     # Get action.
     action = vla.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False)

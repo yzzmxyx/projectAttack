@@ -24,6 +24,7 @@ if str(VLA_ATTACKER_ROOT) not in sys.path:
     sys.path.insert(0, str(VLA_ATTACKER_ROOT))
 
 from white_patch.UADA_rollout_online_env import OpenVLAOnlineEnvAttacker
+from white_patch.projector_photometric_params import resolve_projector_params_for_patch
 
 
 def str2bool(value):
@@ -162,18 +163,18 @@ def build_arg_parser():
     parser.add_argument("--projection_alpha", default=0.55, type=float)
     parser.add_argument("--projection_alpha_jitter", default=0.00, type=float)
     parser.add_argument("--projection_soft_edge", default=1.2, type=float)
-    parser.add_argument("--projection_angle", default=0.0, type=float)
-    parser.add_argument("--projection_fixed_angle", type=str2bool, default=True)
-    parser.add_argument("--projection_shear", default=0.00, type=float)
-    parser.add_argument("--projection_scale_min", default=1.0, type=float)
-    parser.add_argument("--projection_scale_max", default=1.0, type=float)
+    parser.add_argument("--projection_angle", default=25.0, type=float)
+    parser.add_argument("--projection_fixed_angle", type=str2bool, default=False)
+    parser.add_argument("--projection_shear", default=0.15, type=float)
+    parser.add_argument("--projection_scale_min", default=0.8, type=float)
+    parser.add_argument("--projection_scale_max", default=1.2, type=float)
     parser.add_argument("--projection_region", default="lower_half_fixed", type=str)
     parser.add_argument("--projection_lower_start", default=0.55, type=float)
     parser.add_argument("--projection_width_ratio", default=0.90, type=float)
     parser.add_argument("--projection_height_ratio", default=0.95, type=float)
     parser.add_argument("--projection_margin_x", default=0.04, type=float)
     parser.add_argument("--projection_keystone", default=0.22, type=float)
-    parser.add_argument("--projection_keystone_jitter", default=0.00, type=float)
+    parser.add_argument("--projection_keystone_jitter", default=0.03, type=float)
     parser.add_argument("--projector_gamma", default=1.8, type=float)
     parser.add_argument("--projector_gain", default=1.35, type=float)
     parser.add_argument("--projector_channel_gain", default="1.08,1.04,1.00", type=str)
@@ -181,7 +182,7 @@ def build_arg_parser():
     parser.add_argument("--projector_vignetting", default=0.08, type=float)
     parser.add_argument("--projector_distance_falloff", default=0.10, type=float)
     parser.add_argument("--projector_psf", type=str2bool, default=False)
-    parser.add_argument("--projection_randomization_enabled", type=str2bool, default=False)
+    parser.add_argument("--projection_randomization_enabled", type=str2bool, default=True)
 
     parser.add_argument("--lighting_aug_enabled", type=str2bool, default=True)
     parser.add_argument("--lighting_backend", default="ic_light", type=str)
@@ -293,7 +294,6 @@ def main():
     eval_rollout_steps = resolve_eval_rollout_steps(args.eval_rollout_steps, max_env_steps=max_env_steps)
     unnorm_key = attacker._resolve_unnorm_key(task_suite_name)
     action_stats = attacker.vla.get_action_stats(unnorm_key)
-    projector_channel_gain = tuple(float(x) for x in str(args.projector_channel_gain).split(","))
     effective_lighting_enabled = bool(args.lighting_aug_enabled) and (not bool(args.val_disable_lighting))
     print(
         "[EvalConfig] "
@@ -320,14 +320,37 @@ def main():
         task_ids = task_ids[: int(args.max_tasks)]
 
     patch_specs = [
-        ("patch_a", str(args.patch_a_subdir), patch_a_path),
-        ("patch_b", str(args.patch_b_subdir), patch_b_path),
+        (
+            "patch_a",
+            str(args.patch_a_subdir),
+            patch_a_path,
+            resolve_projector_params_for_patch(
+                patch_path=patch_a_path,
+                default_projector_gain=args.projector_gain,
+                default_projector_channel_gain=args.projector_channel_gain,
+            ),
+        ),
+        (
+            "patch_b",
+            str(args.patch_b_subdir),
+            patch_b_path,
+            resolve_projector_params_for_patch(
+                patch_path=patch_b_path,
+                default_projector_gain=args.projector_gain,
+                default_projector_channel_gain=args.projector_channel_gain,
+            ),
+        ),
     ]
     episode_rows: List[Dict] = []
 
-    for patch_tag, patch_subdir, patch_path in patch_specs:
-        print(f"[Eval] running {patch_tag} ({patch_path})")
+    for patch_tag, patch_subdir, patch_path, projector_params in patch_specs:
+        print(
+            f"[Eval] running {patch_tag} ({patch_path}) "
+            f"projector_params_source={'sidecar' if projector_params['loaded_from_sidecar'] else 'cli'}"
+        )
         projection_texture = load_patch_tensor(path=patch_path, device=device)
+        patch_projector_gain = float(projector_params["projector_gain"])
+        patch_projector_channel_gain = tuple(float(x) for x in projector_params["projector_channel_gain"])
         for task_id in task_ids:
             task = task_suite.get_task(task_id)
             init_states = task_suite.get_task_init_states(task_id)
@@ -379,8 +402,8 @@ def main():
                         projection_keystone=float(args.projection_keystone),
                         projection_keystone_jitter=float(args.projection_keystone_jitter),
                         projector_gamma=float(args.projector_gamma),
-                        projector_gain=float(args.projector_gain),
-                        projector_channel_gain=projector_channel_gain,
+                        projector_gain=patch_projector_gain,
+                        projector_channel_gain=patch_projector_channel_gain,
                         projector_ambient=float(args.projector_ambient),
                         projector_vignetting=float(args.projector_vignetting),
                         projector_distance_falloff=float(args.projector_distance_falloff),

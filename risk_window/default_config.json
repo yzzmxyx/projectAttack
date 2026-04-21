@@ -1,0 +1,37 @@
+{
+  "camera": {
+    "roi": null,
+    "resize": null,
+    "rotation": 0,
+    "perspective_correction": null
+  },
+  "features": {
+    "frame_diff_threshold": 12.0,
+    "edge_density_threshold": 18.0,
+    "min_visibility_score": 0.08,
+    "min_brightness": 0.04,
+    "max_brightness": 0.98
+  },
+  "matching": {
+    "prototype_topk": 3,
+    "dtw_band": 4,
+    "cosine_weight": 0.7
+  },
+  "risk": {
+    "allowed_phases": [],
+    "enter_threshold": 0.7,
+    "enter_consecutive": 3,
+    "exit_threshold": 0.45,
+    "exit_consecutive": 5,
+    "ema_alpha": 0.35,
+    "contact_ratio": 0.3,
+    "post_ratio": 0.7,
+    "window_margin": 0.08
+  },
+  "runtime": {
+    "update_interval_ms": 150,
+    "temporal_window": 12,
+    "log_dir": "",
+    "action_policy": "log_only"
+  }
+}

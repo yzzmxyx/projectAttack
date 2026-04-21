@@ -26,7 +26,6 @@ from rlds_recovery_utils import (  # noqa: E402
     DEFAULT_RLDS_ROOT,
     VisionFeatureExtractor,
     _load_selected_rlds_record,
-    _load_sidecar_episode,
     build_single_state_recovery_asset,
     compute_image_alignment_metrics,
     compute_robot_state_distance,
@@ -52,7 +51,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rlds_root", type=str, default=DEFAULT_RLDS_ROOT)
     parser.add_argument("--steps_parquet", type=str, required=True)
     parser.add_argument("--phases_parquet", type=str, required=True)
-    parser.add_argument("--phase_state_cache_path", type=str, required=True)
     parser.add_argument("--output_root", type=str, required=True)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--num_steps_wait", type=int, default=10)
@@ -64,17 +62,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_anchors", type=int, default=3)
     parser.add_argument("--force_rebuild", action="store_true")
     return parser
-
-
-def load_phase_state_payload(path: str | os.PathLike[str]) -> dict[str, Any]:
-    payload = torch.load(Path(path).expanduser().resolve(), map_location="cpu")
-    if not isinstance(payload, dict):
-        raise TypeError(f"Phase-state cache `{path}` is not a dict payload.")
-    states = payload.get("states", {})
-    records = payload.get("records", {})
-    if not isinstance(states, dict) or not isinstance(records, dict):
-        raise TypeError(f"Phase-state cache `{path}` does not contain dict `states` and `records`.")
-    return payload
 
 
 def parse_anchor_steps(value: str) -> list[int] | None:
@@ -331,15 +318,7 @@ def main() -> None:
         force_rebuild=bool(args.force_rebuild),
     )
 
-    phase_payload = load_phase_state_payload(str(args.phase_state_cache_path))
-    legacy_record = phase_payload["records"].get((int(args.task_id), int(args.init_state_idx), "initial"))
-    if legacy_record is None:
-        raise KeyError(
-            f"No legacy phase-state record found for task_id={args.task_id}, init_state_idx={args.init_state_idx}."
-        )
-    legacy_source_episode_key = str(legacy_record["source_episode_key"])
     recovered_source_episode_key = str(recovery_asset["source_episode_key"])
-
     matched_episode_cache = load_matched_episode_cache(recovery_asset["matched_episode_cache_path"])
     aligned_state_payload = torch.load(recovery_asset["aligned_state_cache_path"], map_location="cpu")
     if not isinstance(aligned_state_payload, dict):
@@ -347,40 +326,26 @@ def main() -> None:
     aligned_states = aligned_state_payload.get("step_states", {})
     if not isinstance(aligned_states, dict):
         raise TypeError("Aligned state cache does not contain dict `step_states`.")
+    if 0 not in aligned_states:
+        raise KeyError("Aligned state cache is missing step 0; cannot run recovery-only visual smoke.")
 
     anchor_steps = select_visual_anchor_steps(
         requested_steps=parse_anchor_steps(args.anchor_steps),
         available_steps=recovery_asset.get("anchor_steps", sorted(aligned_states.keys())),
         max_anchors=int(args.max_anchors),
     )
-    legacy_max_steps = int(legacy_record.get("source_T", 0))
     recovered_max_steps = int(matched_episode_cache["raw_actions"].shape[0])
     anchor_steps = [
         int(step)
         for step in anchor_steps
-        if int(step) in aligned_states and 0 <= int(step) < legacy_max_steps and 0 <= int(step) < recovered_max_steps
+        if int(step) in aligned_states and 0 <= int(step) < recovered_max_steps
     ]
     if not anchor_steps:
-        raise RuntimeError(
-            "No valid shared anchor steps remain after intersecting aligned anchors with legacy/recovered episode lengths."
-        )
-    missing_steps = [step for step in anchor_steps if int(step) not in aligned_states]
-    if missing_steps:
-        raise KeyError(
-            f"Requested anchor steps {missing_steps} are not present in aligned_state_cache. "
-            f"Available steps: {sorted(int(step) for step in aligned_states.keys())}"
-        )
+        raise RuntimeError("No valid recovered anchor steps remain after intersecting with aligned_state_cache.")
 
-    import pandas as pd
     from libero.libero import benchmark
 
     from experiments.robot.libero.libero_utils import get_libero_dummy_action, get_libero_env
-
-    steps_df = pd.read_parquet(
-        args.steps_parquet,
-        columns=["episode_key", "t", "raw_action", "normalized_action", "eef_state", "gripper_state", "joint_state"],
-    )
-    legacy_sidecar = _load_sidecar_episode(steps_df=steps_df, source_episode_key=legacy_source_episode_key)
 
     suite_name = resolve_task_suite_name(dataset=str(args.dataset), task_suite_name=str(args.task_suite_name))
     task_suite = benchmark.get_benchmark_dict()[suite_name]()
@@ -399,11 +364,6 @@ def main() -> None:
     rlds_dataset_name = resolve_rlds_dataset_name(dataset=str(args.dataset), task_suite_name=str(suite_name))
 
     try:
-        legacy_rlds_record = _load_selected_rlds_record(
-            dataset_name=str(rlds_dataset_name),
-            rlds_root=str(args.rlds_root),
-            source_episode_key=legacy_source_episode_key,
-        )
         recovered_rlds_record = _load_selected_rlds_record(
             dataset_name=str(rlds_dataset_name),
             rlds_root=str(args.rlds_root),
@@ -423,58 +383,62 @@ def main() -> None:
         target_agent_path = save_rgb(target_dir / "agentview.png", target_views["agentview"])
         target_wrist_path = save_rgb(target_dir / "wrist.png", target_views["wrist"])
 
-        initial_legacy_ref = build_reference_views(
-            record=legacy_rlds_record,
-            step=0,
-            resize_size=max(64, int(args.env_resolution)),
-        )
         initial_recovered_ref = build_reference_views(
             record=recovered_rlds_record,
             step=0,
             resize_size=max(64, int(args.env_resolution)),
         )
-        target_vs_legacy = compute_image_alignment_metrics(
-            env_views=target_views,
-            ref_views=initial_legacy_ref,
+        recovered_initial_obs = restore_env_from_sim_state(env=env, sim_state=aligned_states[0])
+        recovered_initial_metrics = compare_env_to_reference(
+            env_obs=recovered_initial_obs,
+            reference_views=initial_recovered_ref,
+            reference_robot_state={
+                "joint_state": matched_episode_cache["joint_states"][0],
+                "gripper_state": matched_episode_cache["gripper_states"][0],
+                "eef_state": matched_episode_cache["eef_states"][0],
+            },
             feature_extractor=feature_extractor,
+            resize_size=max(64, int(args.env_resolution)),
         )
         target_vs_recovered = compute_image_alignment_metrics(
             env_views=target_views,
             ref_views=initial_recovered_ref,
             feature_extractor=feature_extractor,
         )
+        recovered_initial_env_path = save_rgb(
+            target_dir / "recovered_env_agentview.png",
+            recovered_initial_metrics["env_views"]["agentview"],
+        )
+        save_rgb(target_dir / "recovered_rlds_ref_agentview.png", initial_recovered_ref["agentview"])
+        save_rgb(target_dir / "recovered_env_wrist.png", recovered_initial_metrics["env_views"]["wrist"])
+        save_rgb(target_dir / "recovered_rlds_ref_wrist.png", initial_recovered_ref["wrist"])
 
-        target_sheet_panels = [
-            {
-                "image": target_views["agentview"],
-                "label": "Target Init Env",
-                "lines": [
-                    f"task={args.task_id} init={args.init_state_idx}",
-                    f"wait={int(args.num_steps_wait)}",
-                ],
-            },
-            {
-                "image": initial_legacy_ref["agentview"],
-                "label": "Legacy RLDS Ref",
-                "lines": [
-                    short_episode_key(legacy_source_episode_key),
-                    f"img_l1={target_vs_legacy['agentview_l1']:.4f}" if target_vs_legacy["agentview_l1"] is not None else "img_l1=n/a",
-                    f"img_feat={target_vs_legacy['agentview_feature_distance']:.4f}" if target_vs_legacy["agentview_feature_distance"] is not None else "img_feat=n/a",
-                ],
-            },
-            {
-                "image": initial_recovered_ref["agentview"],
-                "label": "Recovered RLDS Ref",
-                "lines": [
-                    short_episode_key(recovered_source_episode_key),
-                    f"img_l1={target_vs_recovered['agentview_l1']:.4f}" if target_vs_recovered["agentview_l1"] is not None else "img_l1=n/a",
-                    f"img_feat={target_vs_recovered['agentview_feature_distance']:.4f}" if target_vs_recovered["agentview_feature_distance"] is not None else "img_feat=n/a",
-                ],
-            },
-        ]
         render_text_sheet(
-            panel_groups=target_sheet_panels,
-            title=f"Single-State Pairing Smoke | task={args.task_id} init={args.init_state_idx}",
+            panel_groups=[
+                {
+                    "image": target_views["agentview"],
+                    "label": "Target Init Env",
+                    "lines": [
+                        f"task={args.task_id} init={args.init_state_idx}",
+                        f"wait={int(args.num_steps_wait)}",
+                    ],
+                },
+                {
+                    "image": initial_recovered_ref["agentview"],
+                    "label": "Recovered RLDS Ref",
+                    "lines": [
+                        short_episode_key(recovered_source_episode_key),
+                        f"img_l1={target_vs_recovered['agentview_l1']:.4f}" if target_vs_recovered["agentview_l1"] is not None else "img_l1=n/a",
+                        f"img_feat={target_vs_recovered['agentview_feature_distance']:.4f}" if target_vs_recovered["agentview_feature_distance"] is not None else "img_feat=n/a",
+                    ],
+                },
+                {
+                    "image": recovered_initial_metrics["env_views"]["agentview"],
+                    "label": "Recovered Env",
+                    "lines": format_metric_lines("", recovered_initial_metrics),
+                },
+            ],
+            title=f"Single-State Recovery Smoke | task={args.task_id} init={args.init_state_idx}",
             output_path=output_root / "target_vs_reference_agentview.png",
         )
 
@@ -483,32 +447,6 @@ def main() -> None:
 
         for step in anchor_steps:
             anchor_dir = output_root / f"anchor_{int(step):03d}"
-
-            legacy_obs = restore_env_with_init_and_actions(
-                env=env,
-                initial_state=initial_state,
-                dummy_action=dummy_action,
-                raw_actions=np.asarray(legacy_sidecar["raw_actions"], dtype=np.float32),
-                step=int(step),
-                num_steps_wait=int(args.num_steps_wait),
-            )
-            legacy_ref = build_reference_views(
-                record=legacy_rlds_record,
-                step=int(step),
-                resize_size=max(64, int(args.env_resolution)),
-            )
-            legacy_metrics = compare_env_to_reference(
-                env_obs=legacy_obs,
-                reference_views=legacy_ref,
-                reference_robot_state={
-                    "joint_state": legacy_sidecar["joint_states"][int(step)],
-                    "gripper_state": legacy_sidecar["gripper_states"][int(step)],
-                    "eef_state": legacy_sidecar["eef_states"][int(step)],
-                },
-                feature_extractor=feature_extractor,
-                resize_size=max(64, int(args.env_resolution)),
-            )
-
             recovered_obs = restore_env_from_sim_state(env=env, sim_state=aligned_states[int(step)])
             recovered_ref = {
                 "agentview": resize_uint8_image(
@@ -532,27 +470,13 @@ def main() -> None:
                 resize_size=max(64, int(args.env_resolution)),
             )
 
-            legacy_ref_agent_path = save_rgb(anchor_dir / "legacy_rlds_ref_agentview.png", legacy_ref["agentview"])
-            legacy_env_agent_path = save_rgb(anchor_dir / "legacy_env_agentview.png", legacy_metrics["env_views"]["agentview"])
             recovered_ref_agent_path = save_rgb(anchor_dir / "recovered_rlds_ref_agentview.png", recovered_ref["agentview"])
             recovered_env_agent_path = save_rgb(anchor_dir / "recovered_env_agentview.png", recovered_metrics["env_views"]["agentview"])
-            save_rgb(anchor_dir / "legacy_rlds_ref_wrist.png", legacy_ref["wrist"])
-            save_rgb(anchor_dir / "legacy_env_wrist.png", legacy_metrics["env_views"]["wrist"])
-            save_rgb(anchor_dir / "recovered_rlds_ref_wrist.png", recovered_ref["wrist"])
-            save_rgb(anchor_dir / "recovered_env_wrist.png", recovered_metrics["env_views"]["wrist"])
+            recovered_ref_wrist_path = save_rgb(anchor_dir / "recovered_rlds_ref_wrist.png", recovered_ref["wrist"])
+            recovered_env_wrist_path = save_rgb(anchor_dir / "recovered_env_wrist.png", recovered_metrics["env_views"]["wrist"])
 
             render_text_sheet(
                 panel_groups=[
-                    {
-                        "image": legacy_ref["agentview"],
-                        "label": "Legacy RLDS Ref",
-                        "lines": [short_episode_key(legacy_source_episode_key)],
-                    },
-                    {
-                        "image": legacy_metrics["env_views"]["agentview"],
-                        "label": "Legacy Env Replay",
-                        "lines": format_metric_lines("", legacy_metrics),
-                    },
                     {
                         "image": recovered_ref["agentview"],
                         "label": "Recovered RLDS Ref",
@@ -568,22 +492,9 @@ def main() -> None:
                 output_path=anchor_dir / "agentview_comparison.png",
             )
 
-            if legacy_ref["wrist"] is not None and legacy_metrics["env_views"]["wrist"] is not None and recovered_ref["wrist"] is not None and recovered_metrics["env_views"]["wrist"] is not None:
+            if recovered_ref["wrist"] is not None and recovered_metrics["env_views"]["wrist"] is not None:
                 render_text_sheet(
                     panel_groups=[
-                        {
-                            "image": legacy_ref["wrist"],
-                            "label": "Legacy RLDS Wrist",
-                            "lines": [short_episode_key(legacy_source_episode_key)],
-                        },
-                        {
-                            "image": legacy_metrics["env_views"]["wrist"],
-                            "label": "Legacy Env Wrist",
-                            "lines": [
-                                f"wrist_l1={legacy_metrics['wrist_l1']:.4f}" if legacy_metrics["wrist_l1"] is not None else "wrist_l1=n/a",
-                                f"wrist_feat={legacy_metrics['wrist_feature_distance']:.4f}" if legacy_metrics["wrist_feature_distance"] is not None else "wrist_feat=n/a",
-                            ],
-                        },
                         {
                             "image": recovered_ref["wrist"],
                             "label": "Recovered RLDS Wrist",
@@ -602,14 +513,6 @@ def main() -> None:
                     output_path=anchor_dir / "wrist_comparison.png",
                 )
 
-            legacy_row = flatten_anchor_metric_row(
-                step=int(step),
-                method="legacy",
-                source_episode_key=legacy_source_episode_key,
-                metrics=legacy_metrics,
-                anchor_image_path=legacy_env_agent_path,
-                reference_image_path=legacy_ref_agent_path,
-            )
             recovered_row = flatten_anchor_metric_row(
                 step=int(step),
                 method="recovered",
@@ -618,36 +521,20 @@ def main() -> None:
                 anchor_image_path=recovered_env_agent_path,
                 reference_image_path=recovered_ref_agent_path,
             )
-            metric_rows.extend([legacy_row, recovered_row])
+            metric_rows.append(recovered_row)
 
-            improvement = {
-                "agentview_l1_delta_recovered_minus_legacy": None
-                if legacy_metrics["agentview_l1"] is None or recovered_metrics["agentview_l1"] is None
-                else float(recovered_metrics["agentview_l1"]) - float(legacy_metrics["agentview_l1"]),
-                "agentview_feature_distance_delta_recovered_minus_legacy": None
-                if legacy_metrics["agentview_feature_distance"] is None or recovered_metrics["agentview_feature_distance"] is None
-                else float(recovered_metrics["agentview_feature_distance"]) - float(legacy_metrics["agentview_feature_distance"]),
-                "total_alignment_score_delta_recovered_minus_legacy": float(recovered_metrics["total_alignment_score"]) - float(legacy_metrics["total_alignment_score"]),
-            }
             anchor_summary = {
                 "step": int(step),
-                "legacy": {
-                    "source_episode_key": legacy_source_episode_key,
-                    "metrics": {key: value for key, value in legacy_metrics.items() if key != "env_views"},
-                    "agentview_paths": {
-                        "reference": legacy_ref_agent_path,
-                        "env": legacy_env_agent_path,
-                    },
+                "source_episode_key": recovered_source_episode_key,
+                "metrics": {key: value for key, value in recovered_metrics.items() if key != "env_views"},
+                "agentview_paths": {
+                    "reference": recovered_ref_agent_path,
+                    "env": recovered_env_agent_path,
                 },
-                "recovered": {
-                    "source_episode_key": recovered_source_episode_key,
-                    "metrics": {key: value for key, value in recovered_metrics.items() if key != "env_views"},
-                    "agentview_paths": {
-                        "reference": recovered_ref_agent_path,
-                        "env": recovered_env_agent_path,
-                    },
+                "wrist_paths": {
+                    "reference": recovered_ref_wrist_path,
+                    "env": recovered_env_wrist_path,
                 },
-                "improvement": improvement,
             }
             write_json(anchor_dir / "summary.json", anchor_summary)
             anchor_results.append(anchor_summary)
@@ -660,16 +547,17 @@ def main() -> None:
             "task_id": int(args.task_id),
             "init_state_idx": int(args.init_state_idx),
             "task_description": str(task_description),
-            "legacy_alignment": str(legacy_record.get("alignment", "unknown")),
-            "legacy_source_episode_key": legacy_source_episode_key,
-            "recovered_source_episode_key": recovered_source_episode_key,
+            "source_episode_key": recovered_source_episode_key,
             "target_initial_paths": {
                 "agentview": target_agent_path,
                 "wrist": target_wrist_path,
+                "recovered_env_agentview": recovered_initial_env_path,
             },
             "target_initial_reference_comparison": {
-                "legacy": to_jsonable(target_vs_legacy),
                 "recovered": to_jsonable(target_vs_recovered),
+                "recovered_env_alignment": to_jsonable(
+                    {key: value for key, value in recovered_initial_metrics.items() if key != "env_views"}
+                ),
             },
             "anchor_steps": [int(step) for step in anchor_steps],
             "vision_backend": str(feature_extractor.backend_name),
@@ -681,8 +569,7 @@ def main() -> None:
 
         print(f"[VisualSmoke] output_root={output_root}")
         print(f"[VisualSmoke] task_id={int(args.task_id)} init_state_idx={int(args.init_state_idx)}")
-        print(f"[VisualSmoke] legacy_source_episode_key={legacy_source_episode_key}")
-        print(f"[VisualSmoke] recovered_source_episode_key={recovered_source_episode_key}")
+        print(f"[VisualSmoke] source_episode_key={recovered_source_episode_key}")
         print(f"[VisualSmoke] anchor_steps={json.dumps([int(step) for step in anchor_steps])}")
         print(f"[VisualSmoke] summary_path={output_root / 'summary.json'}")
         print(f"[VisualSmoke] metrics_path={output_root / 'metrics.csv'}")

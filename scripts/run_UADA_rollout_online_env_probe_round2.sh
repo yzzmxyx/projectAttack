@@ -47,23 +47,23 @@ run_variant() {
         --tags "UADA_rollout_online_env_probe_round2" "${variant}" \
         --geometry true \
         --attack_mode "${attack_mode}" \
-        --patch_size "3,22,22" \
-        --projection_size "3,22,22" \
+        --patch_size "3,50,50" \
+        --projection_size "3,50,50" \
         --projection_alpha 0.55 \
         --projection_alpha_jitter 0.00 \
         --projection_soft_edge 1.2 \
-        --projection_angle 0 \
-        --projection_fixed_angle true \
-        --projection_shear 0.00 \
-        --projection_scale_min 1.0 \
-        --projection_scale_max 1.0 \
+        --projection_angle "${PROJECTION_ANGLE:-25}" \
+        --projection_fixed_angle "${PROJECTION_FIXED_ANGLE:-false}" \
+        --projection_shear "${PROJECTION_SHEAR:-0.15}" \
+        --projection_scale_min "${PROJECTION_SCALE_MIN:-0.8}" \
+        --projection_scale_max "${PROJECTION_SCALE_MAX:-1.2}" \
         --projection_region "lower_half_fixed" \
         --projection_lower_start 0.55 \
         --projection_width_ratio 0.90 \
         --projection_height_ratio 0.95 \
         --projection_margin_x 0.04 \
         --projection_keystone 0.22 \
-        --projection_keystone_jitter 0.00 \
+        --projection_keystone_jitter "${PROJECTION_KEYSTONE_JITTER:-0.03}" \
         --projector_gamma 1.8 \
         --projector_gain 1.35 \
         --projector_channel_gain "1.08,1.04,1.00" \
@@ -117,7 +117,7 @@ run_variant() {
         --viz_save_last false \
         --task_suite_name "auto" \
         --online_train_tasks_per_iter 1 \
-        --online_train_episodes_per_task 1 \
+        --online_train_episodes_per_task 10 \
         --online_val_episodes 8 \
         --num_steps_wait 10 \
         --max_env_steps "auto_by_suite" \

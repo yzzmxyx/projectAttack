@@ -4,33 +4,86 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 current_dir="$(cd "${SCRIPT_DIR}/.." && pwd)"
 echo "${current_dir}"
-export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128,garbage_collection_threshold:0.8"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.8}"
 
 # Match the historical probe budget/task-suite defaults so GT runs stay directly comparable.
 DATASET_NAME="${DATASET:-libero_spatial}"
-DEVICE_ID="${DEVICE:-6}"
+DEVICE_ID="${DEVICE:-7}"
 ACCUMULATE_STEPS="${ACCUMULATE:-1}"
 WARMUP_STEPS="${WARMUP:-2}"
 PHASE2_ROLLOUT_STEPS="${PHASE2_ROLLOUT:-24}"
-SAVE_INTERVAL_STEPS="${SAVE_INTERVAL:-5}"
-WANDB_PROJECT_NAME="${WANDB_PROJECT:-false}"
+SAVE_INTERVAL_STEPS="${SAVE_INTERVAL:-50}"
+WANDB_PROJECT_NAME="${WANDB_PROJECT:-projectAttack}"
 WANDB_ENTITY_NAME="${WANDB_ENTITY:-1473195970-beihang-university}"
 LAMBDA_ACTION_GAP="${LAMBDA_ACTION_GAP:-1.0}"
-LAMBDA_HISTORY="${LAMBDA_HISTORY:-0.5}"
-LAMBDA_HISTORY_LEGACY="${LAMBDA_HISTORY_LEGACY:-0.5}"
-LAMBDA_CE="${LAMBDA_CE:-0.1}"
-LAMBDA_SIGLIP="${LAMBDA_SIGLIP:-0.0}"
+LAMBDA_HISTORY="${LAMBDA_HISTORY:-0.0}"
+LAMBDA_HISTORY_LEGACY="${LAMBDA_HISTORY_LEGACY:-0.0}"
+LAMBDA_CE="${LAMBDA_CE:-0.02}"
+LAMBDA_CE_PHASE2="${LAMBDA_CE_PHASE2:-0.0}"
+LAMBDA_CONTINUOUS_ROLLOUT="${LAMBDA_CONTINUOUS_ROLLOUT:-0.0}"
+IMPULSE_ROLLOUT_METRIC_ENABLED="${IMPULSE_ROLLOUT_METRIC_ENABLED:-false}"
+LAMBDA_SIGLIP="${LAMBDA_SIGLIP:-0.15}"
 ONLINE_CE_MODE_NAME="${ONLINE_CE_MODE:-pseudo_clean}"
 SIGLIP_MODEL_NAME_VALUE="${SIGLIP_MODEL_NAME:-google/siglip-so400m-patch14-384}"
 SIGLIP_INPUT_SIZE_VALUE="${SIGLIP_INPUT_SIZE:-384}"
+PATCH_SIZE_VALUE="${PATCH_SIZE:-3,50,50}"
+PROJECTION_SIZE_VALUE="${PROJECTION_SIZE:-${PATCH_SIZE_VALUE}}"
+ENV_RESOLUTION_VALUE="${ENV_RESOLUTION:-256}"
 TRAIN_TASKS_PER_ITER="${ONLINE_TRAIN_TASKS_PER_ITER:-1}"
-TRAIN_EPISODES_PER_TASK="${ONLINE_TRAIN_EPISODES_PER_TASK:-1}"
+TRAIN_EPISODES_PER_TASK="${ONLINE_TRAIN_EPISODES_PER_TASK:-4}"
 VAL_EPISODES="${ONLINE_VAL_EPISODES:-8}"
+VAL_MAX_ENV_STEPS="${VAL_MAX_ENV_STEPS:-120}"
 TASK_SUITE_NAME="${TASK_SUITE_NAME:-auto}"
 VIZ_ENABLED_VALUE="${VIZ_ENABLED:-false}"
 VIZ_SAVE_BEST_VALUE="${VIZ_SAVE_BEST:-false}"
 VIZ_SAVE_LAST_VALUE="${VIZ_SAVE_LAST:-false}"
-PHASE1_DISABLE_PROJ_RAND="${PHASE1_DISABLE_PROJECTION_RANDOMIZATION:-false}"
+PHASE1_DISABLE_PROJ_RAND="${PHASE1_DISABLE_PROJECTION_RANDOMIZATION:-true}"
+LEARN_PROJECTOR_GAIN="${LEARN_PROJECTOR_GAIN:-true}"
+LEARN_PROJECTOR_CHANNEL_GAIN="${LEARN_PROJECTOR_CHANNEL_GAIN:-true}"
+PHOTOMETRIC_LR_RATIO="${PHOTOMETRIC_LR_RATIO:-0.1}"
+LOW_MEM_PRESET="${LOW_MEM_PRESET:-false}"
+ULTRA_LOW_MEM_PRESET="${ULTRA_LOW_MEM_PRESET:-false}"
+EVAL_ENABLED_VALUE="${EVAL_ENABLED:-true}"
+RECORD_ONLINE_VIDEOS_VALUE="${RECORD_ONLINE_VIDEOS:-true}"
+RECORD_ONLINE_VIDEOS_LAST_ONLY_VALUE="${RECORD_ONLINE_VIDEOS_LAST_ONLY:-false}"
+RECORD_ONLINE_TRAIN_VIDEO_VALUE="${RECORD_ONLINE_TRAIN_VIDEO:-false}"
+RECORD_ONLINE_VAL_VIDEO_VALUE="${RECORD_ONLINE_VAL_VIDEO:-true}"
+
+if [[ "${LOW_MEM_PRESET}" == "true" ]]; then
+    PATCH_SIZE_VALUE="${PATCH_SIZE:-3,22,22}"
+    PROJECTION_SIZE_VALUE="${PROJECTION_SIZE:-${PATCH_SIZE_VALUE}}"
+    # Keep SigLIP input size aligned with model positional embeddings.
+    # For the default `...patch14-384` model, forcing 224 triggers shape mismatch
+    # like: tensor a (256) vs tensor b (729).
+    if [[ -n "${SIGLIP_INPUT_SIZE:-}" ]]; then
+        SIGLIP_INPUT_SIZE_VALUE="${SIGLIP_INPUT_SIZE}"
+    elif [[ "${SIGLIP_MODEL_NAME_VALUE}" == *"384"* ]]; then
+        SIGLIP_INPUT_SIZE_VALUE="384"
+    else
+        SIGLIP_INPUT_SIZE_VALUE="224"
+    fi
+    TRAIN_EPISODES_PER_TASK="${ONLINE_TRAIN_EPISODES_PER_TASK:-2}"
+    VAL_EPISODES="${ONLINE_VAL_EPISODES:-2}"
+    PHASE2_ROLLOUT_STEPS="${PHASE2_ROLLOUT:-8}"
+    VAL_MAX_ENV_STEPS="${VAL_MAX_ENV_STEPS:-80}"
+    ENV_RESOLUTION_VALUE="${ENV_RESOLUTION:-224}"
+fi
+
+if [[ "${ULTRA_LOW_MEM_PRESET}" == "true" ]]; then
+    PATCH_SIZE_VALUE="${PATCH_SIZE:-3,18,18}"
+    PROJECTION_SIZE_VALUE="${PROJECTION_SIZE:-${PATCH_SIZE_VALUE}}"
+    ENV_RESOLUTION_VALUE="${ENV_RESOLUTION:-192}"
+    TRAIN_EPISODES_PER_TASK="${ONLINE_TRAIN_EPISODES_PER_TASK:-1}"
+    VAL_EPISODES="${ONLINE_VAL_EPISODES:-1}"
+    PHASE2_ROLLOUT_STEPS="${PHASE2_ROLLOUT:-6}"
+    VAL_MAX_ENV_STEPS="${VAL_MAX_ENV_STEPS:-60}"
+    LAMBDA_SIGLIP="${LAMBDA_SIGLIP:-0.0}"
+    EVAL_ENABLED_VALUE="${EVAL_ENABLED:-false}"
+    RECORD_ONLINE_VIDEOS_VALUE="${RECORD_ONLINE_VIDEOS:-false}"
+    RECORD_ONLINE_VIDEOS_LAST_ONLY_VALUE="${RECORD_ONLINE_VIDEOS_LAST_ONLY:-true}"
+    RECORD_ONLINE_TRAIN_VIDEO_VALUE="${RECORD_ONLINE_TRAIN_VIDEO:-false}"
+    RECORD_ONLINE_VAL_VIDEO_VALUE="${RECORD_ONLINE_VAL_VIDEO:-false}"
+fi
 
 python3.10 - <<'PY'
 import importlib.util
@@ -54,37 +107,42 @@ python3.10 VLAAttacker/UADA_rollout_online_env_wrapper.py \
     --lr 2e-3 \
     --server "$current_dir" \
     --device "${DEVICE_ID}" \
-    --iter 20 \
+    --iter 1000 \
     --accumulate "${ACCUMULATE_STEPS}" \
     --bs 1 \
     --warmup "${WARMUP_STEPS}" \
     --tags "UADA_rollout_online_env" "fair_compare" \
     --geometry true \
     --attack_mode "projection" \
-    --patch_size "3,22,22" \
-    --projection_size "3,22,22" \
+    --patch_size "${PATCH_SIZE_VALUE}" \
+    --projection_size "${PROJECTION_SIZE_VALUE}" \
+    --init_projection_texture_path "${INIT_PROJECTION_TEXTURE_PATH:-}" \
     --projection_alpha 0.55 \
     --projection_alpha_jitter 0.00 \
     --projection_soft_edge 1.2 \
-    --projection_angle 0 \
-    --projection_fixed_angle true \
-    --projection_shear 0.00 \
-    --projection_scale_min 1.0 \
-    --projection_scale_max 1.0 \
+    --projection_angle "${PROJECTION_ANGLE:-25}" \
+    --projection_fixed_angle "${PROJECTION_FIXED_ANGLE:-false}" \
+    --projection_shear "${PROJECTION_SHEAR:-0.15}" \
+    --projection_scale_min "${PROJECTION_SCALE_MIN:-0.3}" \
+    --projection_scale_max "${PROJECTION_SCALE_MAX:-0.7}" \
     --projection_region "lower_half_fixed" \
     --projection_lower_start 0.55 \
     --projection_width_ratio 0.90 \
     --projection_height_ratio 0.95 \
     --projection_margin_x 0.04 \
     --projection_keystone 0.22 \
-    --projection_keystone_jitter 0.00 \
+    --projection_keystone_jitter "${PROJECTION_KEYSTONE_JITTER:-0.03}" \
     --projector_gamma 1.8 \
     --projector_gain 1.35 \
     --projector_channel_gain "1.08,1.04,1.00" \
+    --learn_projector_gain "${LEARN_PROJECTOR_GAIN}" \
+    --learn_projector_channel_gain "${LEARN_PROJECTOR_CHANNEL_GAIN}" \
+    --photometric_lr_ratio "${PHOTOMETRIC_LR_RATIO}" \
     --projector_ambient 0.08 \
     --projector_vignetting 0.08 \
     --projector_distance_falloff 0.10 \
     --projector_psf false \
+    --projection_randomization_enabled "${PROJECTION_RANDOMIZATION_ENABLED:-true}" \
     --wandb_project "${WANDB_PROJECT_NAME}" \
     --wandb_entity "${WANDB_ENTITY_NAME}" \
     --dataset "${DATASET_NAME}" \
@@ -96,11 +154,14 @@ python3.10 VLAAttacker/UADA_rollout_online_env_wrapper.py \
     --lambda_history "${LAMBDA_HISTORY}" \
     --lambda_history_legacy "${LAMBDA_HISTORY_LEGACY}" \
     --lambda_ce "${LAMBDA_CE}" \
+    --lambda_ce_phase2 "${LAMBDA_CE_PHASE2}" \
+    --lambda_continuous_rollout "${LAMBDA_CONTINUOUS_ROLLOUT}" \
+    --impulse_rollout_metric_enabled "${IMPULSE_ROLLOUT_METRIC_ENABLED}" \
     --lambda_siglip "${LAMBDA_SIGLIP}" \
     --siglip_model_name "${SIGLIP_MODEL_NAME_VALUE}" \
     --siglip_input_size "${SIGLIP_INPUT_SIZE_VALUE}" \
     --save_interval "${SAVE_INTERVAL_STEPS}" \
-    --eval_enabled true \
+    --eval_enabled "${EVAL_ENABLED_VALUE}" \
     --val_deterministic true \
     --val_seed 42 \
     --val_disable_lighting true \
@@ -122,10 +183,10 @@ python3.10 VLAAttacker/UADA_rollout_online_env_wrapper.py \
     --ic_light_model_path "/home/yxx/IC-Light/models/iclight_sd15_fbc.safetensors" \
     --ic_light_scope "full" \
     --ic_light_bg_control "legacy_prompt" \
-    --record_online_videos true \
-    --record_online_videos_last_only false \
-    --record_online_train_video false \
-    --record_online_val_video true \
+    --record_online_videos "${RECORD_ONLINE_VIDEOS_VALUE}" \
+    --record_online_videos_last_only "${RECORD_ONLINE_VIDEOS_LAST_ONLY_VALUE}" \
+    --record_online_train_video "${RECORD_ONLINE_TRAIN_VIDEO_VALUE}" \
+    --record_online_val_video "${RECORD_ONLINE_VAL_VIDEO_VALUE}" \
     --record_online_video_frame_source "projected_input" \
     --record_online_video_fps 10 \
     --viz_enabled "${VIZ_ENABLED_VALUE}" \
@@ -139,7 +200,8 @@ python3.10 VLAAttacker/UADA_rollout_online_env_wrapper.py \
     --online_val_episodes "${VAL_EPISODES}" \
     --num_steps_wait 10 \
     --max_env_steps "auto_by_suite" \
-    --env_resolution 256 \
+    --val_max_env_steps "${VAL_MAX_ENV_STEPS}" \
+    --env_resolution "${ENV_RESOLUTION_VALUE}" \
     --online_ce_mode "${ONLINE_CE_MODE_NAME}" \
     --env_action_source "adv" \
     --env_seed 42 \

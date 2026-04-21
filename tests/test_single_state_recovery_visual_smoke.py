@@ -48,6 +48,7 @@ def test_visual_smoke_cli_defaults_match_smoke_expectations():
     assert defaults["--recovery_image_resize_strategy"] == "resize-naive"
     assert defaults["--anchor_steps"] == "auto"
     assert defaults["--max_anchors"] == 3
+    assert "--phase_state_cache_path" not in defaults
 
 
 def test_parse_anchor_steps_and_auto_mode():
@@ -67,3 +68,4 @@ def test_visual_smoke_run_script_defaults_to_lightweight_recovery_settings():
     assert '--task_id "${TASK_ID:-4}"' in contents
     assert '--recovery_vision_backbone "${RECOVERY_VISION_BACKBONE:-pixel}"' in contents
     assert '--anchor_steps "${ANCHOR_STEPS:-auto}"' in contents
+    assert "phase_state_cache" not in contents

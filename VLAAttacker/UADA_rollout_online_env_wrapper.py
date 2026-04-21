@@ -75,7 +75,13 @@ def main(args):
         f"{args.dataset}_UADA_rollout_onlineEnv_atk{args.attack_mode}_lr{format(args.lr, '.0e')}_iter{args.iter}_"
         f"phase1R{args.phase1_rollout}_phase2R{args.phase2_rollout}_"
         f"lamA{args.lambda_action_gap}_lamH{args.lambda_history}_lamHL{args.lambda_history_legacy}_"
+        f"lamC{args.lambda_continuous_rollout}_"
+        f"lamW{args.lambda_window_rollout_loss}_"
+        f"winProbe{int(args.window_rollout_probe_enabled)}_"
+        f"winMetric{args.window_rollout_metric_mode}_"
+        f"winA{args.window_rollout_exp_base}_winK{args.window_rollout_future_horizon}_winPhase{args.window_rollout_phase_scope}_"
         f"lamS{args.lambda_siglip}_"
+        f"impMetric{int(args.impulse_rollout_metric_enabled)}_"
         f"agMode{args.action_gap_mode}_"
         f"phaseState{args.phase_state_mode}_tau{args.gt_softmin_tau}_"
         f"ceMode{args.online_ce_mode}_probe{int(args.probe_mode)}_{args.probe_variant}_"
@@ -117,6 +123,15 @@ def main(args):
             "lambda_history": args.lambda_history,
             "lambda_history_legacy": args.lambda_history_legacy,
             "lambda_ce": args.lambda_ce,
+            "lambda_ce_phase2": args.lambda_ce_phase2,
+            "lambda_continuous_rollout": args.lambda_continuous_rollout,
+            "lambda_window_rollout_loss": args.lambda_window_rollout_loss,
+            "impulse_rollout_metric_enabled": args.impulse_rollout_metric_enabled,
+            "window_rollout_probe_enabled": args.window_rollout_probe_enabled,
+            "window_rollout_metric_mode": args.window_rollout_metric_mode,
+            "window_rollout_exp_base": args.window_rollout_exp_base,
+            "window_rollout_future_horizon": args.window_rollout_future_horizon,
+            "window_rollout_phase_scope": args.window_rollout_phase_scope,
             "lambda_siglip": args.lambda_siglip,
             "siglip_model_name": args.siglip_model_name,
             "siglip_input_size": args.siglip_input_size,
@@ -130,6 +145,7 @@ def main(args):
             "lighting_aug_enabled": args.lighting_aug_enabled,
             "lighting_aug_train_only": args.lighting_aug_train_only,
             "phase1_disable_lighting": args.phase1_disable_lighting,
+            "projection_randomization_enabled": args.projection_randomization_enabled,
             "phase1_disable_projection_randomization": args.phase1_disable_projection_randomization,
             "lighting_backend": args.lighting_backend,
             "lighting_model_id": args.lighting_model_id,
@@ -147,6 +163,7 @@ def main(args):
             "ic_light_bg_control": args.ic_light_bg_control,
             "attack_mode": args.attack_mode,
             "projection_size": projection_size,
+            "init_projection_texture_path": args.init_projection_texture_path,
             "projection_alpha": args.projection_alpha,
             "projection_alpha_jitter": args.projection_alpha_jitter,
             "projection_soft_edge": args.projection_soft_edge,
@@ -165,6 +182,9 @@ def main(args):
             "projector_gamma": args.projector_gamma,
             "projector_gain": args.projector_gain,
             "projector_channel_gain": args.projector_channel_gain,
+            "learn_projector_gain": args.learn_projector_gain,
+            "learn_projector_channel_gain": args.learn_projector_channel_gain,
+            "photometric_lr_ratio": args.photometric_lr_ratio,
             "projector_ambient": args.projector_ambient,
             "projector_vignetting": args.projector_vignetting,
             "projector_distance_falloff": args.projector_distance_falloff,
@@ -186,6 +206,7 @@ def main(args):
             "online_val_episodes": args.online_val_episodes,
             "num_steps_wait": args.num_steps_wait,
             "max_env_steps": args.max_env_steps,
+            "val_max_env_steps": args.val_max_env_steps,
             "env_resolution": args.env_resolution,
             "online_ce_mode": args.online_ce_mode,
             "env_action_source": args.env_action_source,
@@ -228,6 +249,7 @@ def main(args):
         num_iter=args.iter,
         patch_size=args.patch_size,
         projection_size=projection_size,
+        init_projection_texture_path=args.init_projection_texture_path,
         lr=args.lr,
         accumulate_steps=args.accumulate,
         maskidx=args.maskidx,
@@ -243,6 +265,15 @@ def main(args):
         lambda_history=args.lambda_history,
         lambda_history_legacy=args.lambda_history_legacy,
         lambda_ce=args.lambda_ce,
+        lambda_ce_phase2=args.lambda_ce_phase2,
+        lambda_continuous_rollout=args.lambda_continuous_rollout,
+        lambda_window_rollout_loss=args.lambda_window_rollout_loss,
+        impulse_rollout_metric_enabled=args.impulse_rollout_metric_enabled,
+        window_rollout_probe_enabled=args.window_rollout_probe_enabled,
+        window_rollout_metric_mode=args.window_rollout_metric_mode,
+        window_rollout_exp_base=args.window_rollout_exp_base,
+        window_rollout_future_horizon=args.window_rollout_future_horizon,
+        window_rollout_phase_scope=args.window_rollout_phase_scope,
         lambda_siglip=args.lambda_siglip,
         siglip_model_name=args.siglip_model_name,
         siglip_input_size=args.siglip_input_size,
@@ -266,6 +297,7 @@ def main(args):
         ic_light_bg_control=args.ic_light_bg_control,
         attack_mode=args.attack_mode,
         phase1_disable_lighting=args.phase1_disable_lighting,
+        projection_randomization_enabled=args.projection_randomization_enabled,
         phase1_disable_projection_randomization=args.phase1_disable_projection_randomization,
         projection_alpha=args.projection_alpha,
         projection_alpha_jitter=args.projection_alpha_jitter,
@@ -285,6 +317,9 @@ def main(args):
         projector_gamma=args.projector_gamma,
         projector_gain=args.projector_gain,
         projector_channel_gain=args.projector_channel_gain,
+        learn_projector_gain=args.learn_projector_gain,
+        learn_projector_channel_gain=args.learn_projector_channel_gain,
+        photometric_lr_ratio=args.photometric_lr_ratio,
         projector_ambient=args.projector_ambient,
         projector_vignetting=args.projector_vignetting,
         projector_distance_falloff=args.projector_distance_falloff,
@@ -306,6 +341,7 @@ def main(args):
         online_val_episodes=args.online_val_episodes,
         num_steps_wait=args.num_steps_wait,
         max_env_steps=args.max_env_steps,
+        val_max_env_steps=args.val_max_env_steps,
         env_resolution=args.env_resolution,
         online_ce_mode=args.online_ce_mode,
         env_action_source=args.env_action_source,
@@ -353,6 +389,7 @@ def arg_parser():
     parser.add_argument("--patch_size", default="3,50,50", type=list_of_ints)
     parser.add_argument("--attack_mode", default="projection", type=str)
     parser.add_argument("--projection_size", default=None, type=list_of_ints_or_none)
+    parser.add_argument("--init_projection_texture_path", default="", type=str)
     parser.add_argument("--projection_alpha", default=0.55, type=float)
     parser.add_argument("--projection_alpha_jitter", default=0.10, type=float)
     parser.add_argument("--projection_soft_edge", default=1.2, type=float)
@@ -371,6 +408,9 @@ def arg_parser():
     parser.add_argument("--projector_gamma", default=1.8, type=float)
     parser.add_argument("--projector_gain", default=1.35, type=float)
     parser.add_argument("--projector_channel_gain", default="1.08,1.04,1.00", type=list_of_floats)
+    parser.add_argument("--learn_projector_gain", type=str2bool, default=False)
+    parser.add_argument("--learn_projector_channel_gain", type=str2bool, default=False)
+    parser.add_argument("--photometric_lr_ratio", default=0.1, type=float)
     parser.add_argument("--projector_ambient", default=0.08, type=float)
     parser.add_argument("--projector_vignetting", default=0.08, type=float)
     parser.add_argument("--projector_distance_falloff", default=0.10, type=float)
@@ -390,10 +430,19 @@ def arg_parser():
     parser.add_argument("--gt_softmin_tau", default=0.05, type=float)
     parser.add_argument("--phase_state_mode", default="phase_cycle", type=str)
     parser.add_argument("--phase_state_cache_path", default="", type=str)
-    parser.add_argument("--lambda_history", default=0.5, type=float)
+    parser.add_argument("--lambda_history", default=0.0, type=float)
     parser.add_argument("--lambda_history_legacy", default=0.0, type=float)
-    parser.add_argument("--lambda_ce", default=0.1, type=float)
-    parser.add_argument("--lambda_siglip", default=0.0, type=float)
+    parser.add_argument("--lambda_ce", default=0.02, type=float)
+    parser.add_argument("--lambda_ce_phase2", default=0.0, type=float)
+    parser.add_argument("--lambda_continuous_rollout", default=0.0, type=float)
+    parser.add_argument("--lambda_window_rollout_loss", default=0.0, type=float)
+    parser.add_argument("--impulse_rollout_metric_enabled", type=str2bool, default=False)
+    parser.add_argument("--window_rollout_probe_enabled", type=str2bool, default=False)
+    parser.add_argument("--window_rollout_metric_mode", default="delta_weighted", type=str)
+    parser.add_argument("--window_rollout_exp_base", default=0.9, type=float)
+    parser.add_argument("--window_rollout_future_horizon", default=8, type=int)
+    parser.add_argument("--window_rollout_phase_scope", default="all", type=str)
+    parser.add_argument("--lambda_siglip", default=0.15, type=float)
     parser.add_argument("--siglip_model_name", default="google/siglip-so400m-patch14-384", type=str)
     parser.add_argument("--siglip_input_size", default=384, type=int)
     parser.add_argument("--probe_mode", type=str2bool, default=False)
@@ -406,6 +455,7 @@ def arg_parser():
     parser.add_argument("--lighting_aug_enabled", type=str2bool, default=False)
     parser.add_argument("--lighting_aug_train_only", type=str2bool, default=False)
     parser.add_argument("--phase1_disable_lighting", type=str2bool, default=False)
+    parser.add_argument("--projection_randomization_enabled", type=str2bool, default=True)
     parser.add_argument("--phase1_disable_projection_randomization", type=str2bool, default=False)
     parser.add_argument("--lighting_backend", default="ic_light", type=str)
     parser.add_argument("--lighting_model_id", default="stabilityai/sdxl-turbo", type=str)
@@ -439,10 +489,11 @@ def arg_parser():
 
     parser.add_argument("--task_suite_name", default="auto", type=str)
     parser.add_argument("--online_train_tasks_per_iter", default=1, type=int)
-    parser.add_argument("--online_train_episodes_per_task", default=1, type=int)
+    parser.add_argument("--online_train_episodes_per_task", default=10, type=int)
     parser.add_argument("--online_val_episodes", default=8, type=int)
     parser.add_argument("--num_steps_wait", default=10, type=int)
     parser.add_argument("--max_env_steps", default="auto_by_suite", type=str)
+    parser.add_argument("--val_max_env_steps", default=120, type=int)
     parser.add_argument("--env_resolution", default=256, type=int)
     parser.add_argument("--online_ce_mode", default="pseudo_clean", type=str)
     parser.add_argument("--env_action_source", default="adv", type=str)
@@ -500,6 +551,7 @@ if __name__ == "__main__":
         f" online_train_episodes_per_task:{args.online_train_episodes_per_task}\n"
         f" online_val_episodes:{args.online_val_episodes}\n"
         f" num_steps_wait:{args.num_steps_wait}\n max_env_steps:{args.max_env_steps}\n"
+        f" val_max_env_steps:{args.val_max_env_steps}\n"
         f" env_resolution:{args.env_resolution}\n online_ce_mode:{args.online_ce_mode}\n"
         f" env_action_source:{args.env_action_source}\n env_seed:{args.env_seed}\n"
         f" auto_gpu_tune:{args.auto_gpu_tune}\n gpu_tune_mode:{args.gpu_tune_mode}\n"
@@ -512,19 +564,34 @@ if __name__ == "__main__":
         f" maskidx:{args.maskidx}\n use_all_joints:{args.use_all_joints}\n gripper_weight:{args.gripper_weight}\n"
         f" lr:{args.lr}\n device:{args.device}\n tags:{args.tags}\n"
         f" attack_mode:{args.attack_mode}\n projection_size:{args.projection_size}\n"
+        f" init_projection_texture_path:{args.init_projection_texture_path}\n"
+        f" projector_gain:{args.projector_gain}\n projector_channel_gain:{args.projector_channel_gain}\n"
+        f" learn_projector_gain:{args.learn_projector_gain}\n"
+        f" learn_projector_channel_gain:{args.learn_projector_channel_gain}\n"
+        f" photometric_lr_ratio:{args.photometric_lr_ratio}\n"
         f" phase1_ratio:{args.phase1_ratio}\n phase1_rollout:{args.phase1_rollout}\n"
         f" phase2_rollout:{args.phase2_rollout}\n lambda_action_gap:{args.lambda_action_gap}\n"
         f" action_gap_mode:{args.action_gap_mode}\n gt_dataset_root:{args.gt_dataset_root}\n"
         f" gt_action_bank_path:{args.gt_action_bank_path}\n gt_softmin_tau:{args.gt_softmin_tau}\n"
         f" phase_state_mode:{args.phase_state_mode}\n phase_state_cache_path:{args.phase_state_cache_path}\n"
         f" lambda_history:{args.lambda_history}\n lambda_history_legacy:{args.lambda_history_legacy}\n"
-        f" lambda_ce:{args.lambda_ce}\n lambda_siglip:{args.lambda_siglip}\n"
+        f" lambda_ce:{args.lambda_ce}\n lambda_ce_phase2:{args.lambda_ce_phase2}\n"
+        f" lambda_continuous_rollout:{args.lambda_continuous_rollout}\n"
+        f" lambda_window_rollout_loss:{args.lambda_window_rollout_loss}\n"
+        f" impulse_rollout_metric_enabled:{args.impulse_rollout_metric_enabled}\n"
+        f" window_rollout_probe_enabled:{args.window_rollout_probe_enabled}\n"
+        f" window_rollout_metric_mode:{args.window_rollout_metric_mode}\n"
+        f" window_rollout_exp_base:{args.window_rollout_exp_base}\n"
+        f" window_rollout_future_horizon:{args.window_rollout_future_horizon}\n"
+        f" window_rollout_phase_scope:{args.window_rollout_phase_scope}\n"
+        f" lambda_siglip:{args.lambda_siglip}\n"
         f" siglip_model_name:{args.siglip_model_name}\n siglip_input_size:{args.siglip_input_size}\n"
         f" probe_mode:{args.probe_mode}\n probe_variant:{args.probe_variant}\n"
         f" save_interval:{args.save_interval}\n eval_enabled:{args.eval_enabled}\n"
         f" val_deterministic:{args.val_deterministic}\n val_seed:{args.val_seed}\n"
         f" val_disable_lighting:{args.val_disable_lighting}\n"
         f" phase1_disable_lighting:{args.phase1_disable_lighting}\n"
+        f" projection_randomization_enabled:{args.projection_randomization_enabled}\n"
         f" phase1_disable_projection_randomization:{args.phase1_disable_projection_randomization}\n"
         f" lighting_backend:{args.lighting_backend}\n lighting_model_id:{args.lighting_model_id}\n"
         f" lighting_pool_size:{args.lighting_pool_size}\n lighting_refresh_interval:{args.lighting_refresh_interval}\n"

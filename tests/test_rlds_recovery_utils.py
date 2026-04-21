@@ -116,7 +116,58 @@ def test_window_search_script_includes_recovery_builder_and_asset_flags():
     contents = SCRIPT_PATH.read_text(encoding="utf-8")
     assert "build_single_state_rlds_recovery_asset.py" in contents
     assert '--recovery_asset_path "${RECOVERY_ASSET_PATH_VALUE}"' in contents
-    assert 'USE_RLDS_RECOVERY_VALUE' in contents
+    assert '--rlds_root "${RLDS_ROOT_VALUE}"' in contents
+    assert 'USE_RLDS_RECOVERY_VALUE' not in contents
+
+
+def test_validate_sidecar_rlds_episode_pair_accepts_matching_actions_and_step0_states():
+    utils = _load_module(UTILS_PATH, "test_rlds_recovery_utils_validate_match")
+    sidecar_episode = {
+        "raw_actions": np.asarray([[0.1, 0.2], [0.3, 0.4]], dtype=np.float32),
+        "joint_states": np.asarray([[1.0, 2.0, 3.0]], dtype=np.float32),
+        "eef_states": np.asarray([[4.0, 5.0, 6.0, 7.0, 8.0, 9.0]], dtype=np.float32),
+        "gripper_states": np.asarray([[0.01, -0.01]], dtype=np.float32),
+    }
+    rlds_record = {
+        "actions": np.asarray([[0.1, 0.2], [0.3, 0.4]], dtype=np.float32),
+        "joint_state": np.asarray([[1.0, 2.0, 3.0]], dtype=np.float32),
+        "eef_gripper_state": np.asarray([[4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 0.01, -0.01]], dtype=np.float32),
+    }
+    utils._validate_sidecar_rlds_episode_pair(sidecar_episode, rlds_record, "episode_ok")
+
+
+def test_validate_sidecar_rlds_episode_pair_raises_on_action_mismatch():
+    utils = _load_module(UTILS_PATH, "test_rlds_recovery_utils_validate_action_mismatch")
+    sidecar_episode = {
+        "raw_actions": np.asarray([[0.1, 0.2]], dtype=np.float32),
+        "joint_states": np.asarray([[1.0, 2.0, 3.0]], dtype=np.float32),
+        "eef_states": np.asarray([[4.0, 5.0, 6.0, 7.0, 8.0, 9.0]], dtype=np.float32),
+        "gripper_states": np.asarray([[0.01, -0.01]], dtype=np.float32),
+    }
+    rlds_record = {
+        "actions": np.asarray([[0.1, 0.25]], dtype=np.float32),
+        "joint_state": np.asarray([[1.0, 2.0, 3.0]], dtype=np.float32),
+        "eef_gripper_state": np.asarray([[4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 0.01, -0.01]], dtype=np.float32),
+    }
+    with pytest.raises(RuntimeError, match="raw actions differ"):
+        utils._validate_sidecar_rlds_episode_pair(sidecar_episode, rlds_record, "episode_bad_actions")
+
+
+def test_validate_sidecar_rlds_episode_pair_raises_on_step0_robot_state_mismatch():
+    utils = _load_module(UTILS_PATH, "test_rlds_recovery_utils_validate_state_mismatch")
+    sidecar_episode = {
+        "raw_actions": np.asarray([[0.1, 0.2]], dtype=np.float32),
+        "joint_states": np.asarray([[1.0, 2.0, 3.0]], dtype=np.float32),
+        "eef_states": np.asarray([[4.0, 5.0, 6.0, 7.0, 8.0, 9.0]], dtype=np.float32),
+        "gripper_states": np.asarray([[0.01, -0.01]], dtype=np.float32),
+    }
+    rlds_record = {
+        "actions": np.asarray([[0.1, 0.2]], dtype=np.float32),
+        "joint_state": np.asarray([[1.0, 2.0, 3.5]], dtype=np.float32),
+        "eef_gripper_state": np.asarray([[4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 0.01, -0.01]], dtype=np.float32),
+    }
+    with pytest.raises(RuntimeError, match="step-0 `joint_state` differs"):
+        utils._validate_sidecar_rlds_episode_pair(sidecar_episode, rlds_record, "episode_bad_state")
 
 
 def test_unwrap_object_env_prefers_inner_domain_env_over_outer_wrapper():

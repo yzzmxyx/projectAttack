@@ -507,6 +507,55 @@ def _load_sidecar_episode(steps_df, source_episode_key: str) -> dict[str, np.nda
     }
 
 
+def _validate_sidecar_rlds_episode_pair(
+    sidecar_episode: Mapping[str, np.ndarray],
+    rlds_record: Mapping[str, Any],
+    source_episode_key: str,
+) -> None:
+    sidecar_raw_actions = np.asarray(sidecar_episode["raw_actions"], dtype=np.float32)
+    rlds_actions = np.asarray(rlds_record["actions"], dtype=np.float32)
+    if sidecar_raw_actions.shape != rlds_actions.shape:
+        raise RuntimeError(
+            f"Sidecar / RLDS action shape mismatch for `{source_episode_key}`: "
+            f"{sidecar_raw_actions.shape} vs {rlds_actions.shape}"
+        )
+    if not np.allclose(sidecar_raw_actions, rlds_actions):
+        max_abs_diff = float(np.max(np.abs(sidecar_raw_actions - rlds_actions)))
+        raise RuntimeError(
+            f"Sidecar / RLDS raw actions differ for `{source_episode_key}`; "
+            f"max_abs_diff={max_abs_diff:.8f}"
+        )
+
+    rlds_joint_state = np.asarray(rlds_record["joint_state"], dtype=np.float32)
+    rlds_eef_gripper_state = np.asarray(rlds_record["eef_gripper_state"], dtype=np.float32)
+
+    sidecar_step0_joint = np.asarray(sidecar_episode["joint_states"][0], dtype=np.float32)
+    sidecar_step0_eef = np.asarray(sidecar_episode["eef_states"][0], dtype=np.float32)
+    sidecar_step0_gripper = np.asarray(sidecar_episode["gripper_states"][0], dtype=np.float32)
+
+    rlds_step0_joint = np.asarray(rlds_joint_state[0], dtype=np.float32)
+    rlds_step0_eef = np.asarray(rlds_eef_gripper_state[0, :6], dtype=np.float32)
+    rlds_step0_gripper = np.asarray(rlds_eef_gripper_state[0, -2:], dtype=np.float32)
+
+    checks = (
+        ("joint_state", sidecar_step0_joint, rlds_step0_joint),
+        ("eef_state", sidecar_step0_eef, rlds_step0_eef),
+        ("gripper_state", sidecar_step0_gripper, rlds_step0_gripper),
+    )
+    for field_name, sidecar_value, rlds_value in checks:
+        if sidecar_value.shape != rlds_value.shape:
+            raise RuntimeError(
+                f"Sidecar / RLDS step-0 `{field_name}` shape mismatch for `{source_episode_key}`: "
+                f"{sidecar_value.shape} vs {rlds_value.shape}"
+            )
+        if not np.allclose(sidecar_value, rlds_value):
+            max_abs_diff = float(np.max(np.abs(sidecar_value - rlds_value)))
+            raise RuntimeError(
+                f"Sidecar / RLDS step-0 `{field_name}` differs for `{source_episode_key}`; "
+                f"max_abs_diff={max_abs_diff:.8f}"
+            )
+
+
 def _collect_object_specs(env: object) -> tuple[list[dict[str, Any]], str | None]:
     import robosuite.utils.transform_utils as T
 
@@ -968,11 +1017,11 @@ def build_single_state_recovery_asset(
             source_episode_key=source_episode_key,
         )
         sidecar_episode = _load_sidecar_episode(steps_df=steps_df, source_episode_key=source_episode_key)
-        if int(sidecar_episode["raw_actions"].shape[0]) != int(selected_rlds_record["actions"].shape[0]):
-            raise RuntimeError(
-                f"Sidecar / RLDS length mismatch for `{source_episode_key}`: "
-                f"{sidecar_episode['raw_actions'].shape[0]} vs {selected_rlds_record['actions'].shape[0]}"
-            )
+        _validate_sidecar_rlds_episode_pair(
+            sidecar_episode=sidecar_episode,
+            rlds_record=selected_rlds_record,
+            source_episode_key=source_episode_key,
+        )
 
         matched_episode_cache = {
             "raw_actions": sidecar_episode["raw_actions"],

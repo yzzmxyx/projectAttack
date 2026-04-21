@@ -74,6 +74,12 @@ class GenerateConfig:
     # Utils
     #################################################################################################################
     save_data: bool = False                                     # Whether to save rollout data (images, actions, etc.)
+    risk_window_enable: bool = False                            # Enable independent risk-window detector
+    risk_window_config: str = ""                                # Optional JSON/YAML config path
+    risk_window_asset_root: str = ""                            # Existing vulnerability-window asset root
+    risk_window_log_dir: str = ""                               # Optional detector log root
+    risk_window_action: str = "log_only"                        # log_only | hold_last_action | dummy_wait | abort_episode
+    risk_window_overlay: bool = False                           # Reserved for future visualization overlay support
 
     # fmt: on
 
@@ -100,6 +106,20 @@ def eval_model_in_bridge_env(cfg: GenerateConfig) -> None:
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
 
+    risk_window_adapter = None
+    if getattr(cfg, "risk_window_enable", False):
+        if str(getattr(cfg, "risk_window_asset_root", "")).strip() == "":
+            raise ValueError("risk_window_enable=True requires a non-empty `risk_window_asset_root`.")
+        from risk_window.adapters.bridge import BridgeRiskWindowAdapter
+
+        risk_window_adapter = BridgeRiskWindowAdapter.from_runtime_args(
+            config_path=str(getattr(cfg, "risk_window_config", "")),
+            asset_root=str(cfg.risk_window_asset_root),
+            log_dir=str(getattr(cfg, "risk_window_log_dir", "")),
+            action_policy=str(getattr(cfg, "risk_window_action", "log_only")),
+            overlay=bool(getattr(cfg, "risk_window_overlay", False)),
+        )
+
     # Start evaluation
     task_label = ""
     episode_idx = 0
@@ -109,6 +129,8 @@ def eval_model_in_bridge_env(cfg: GenerateConfig) -> None:
 
         # Reset environment
         obs, _ = env.reset()
+        if risk_window_adapter is not None:
+            risk_window_adapter.reset(task_id=task_label, episode_id=episode_idx)
 
         # Setup
         t = 0
@@ -137,6 +159,9 @@ def eval_model_in_bridge_env(cfg: GenerateConfig) -> None:
                     # Save full (not preprocessed) image for replay video
                     replay_images.append(obs["full_image"])
 
+                    if risk_window_adapter is not None:
+                        risk_window_adapter.inspect(frame=obs["full_image"], timestamp=curr_tstamp)
+
                     # Get preprocessed image
                     obs["full_image"] = get_preprocessed_image(obs, resize_size)
 
@@ -154,6 +179,13 @@ def eval_model_in_bridge_env(cfg: GenerateConfig) -> None:
                         rollout_images.append(obs["full_image"])
                         rollout_states.append(obs["proprio"])
                         rollout_actions.append(action)
+
+                    if risk_window_adapter is not None:
+                        policy_result = risk_window_adapter.apply_action_policy(action)
+                        if policy_result["abort_episode"]:
+                            print("[risk_window] abort_episode triggered; ending current episode early.")
+                            break
+                        action = policy_result["action"]
 
                     # Execute action
                     print("action:", action)
@@ -173,6 +205,10 @@ def eval_model_in_bridge_env(cfg: GenerateConfig) -> None:
         # [If saving rollout data] Save rollout data
         if cfg.save_data:
             save_rollout_data(replay_images, rollout_images, rollout_states, rollout_actions, idx=episode_idx)
+
+        if risk_window_adapter is not None:
+            summary = risk_window_adapter.flush()
+            print(f"[risk_window] episode summary: {summary}")
 
         # Redo episode or continue
         if input("Enter 'r' if you want to redo the episode, or press Enter to continue: ") != "r":

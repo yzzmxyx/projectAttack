@@ -10,8 +10,13 @@ from torchvision.transforms import functional as TVF
 
 try:
     from white_patch.appply_random_transform import RandomPatchTransform
+    from white_patch.projector_photometric_params import (
+        projector_channel_gain_to_tensor,
+        projector_gain_to_tensor,
+    )
 except Exception:
     from appply_random_transform import RandomPatchTransform
+    from projector_photometric_params import projector_channel_gain_to_tensor, projector_gain_to_tensor
 
 
 class ProjectorAttackTransform:
@@ -207,16 +212,7 @@ class ProjectorAttackTransform:
             return image
 
     def _parse_channel_gain(self, channel_gain):
-        if channel_gain is None:
-            values = [1.0, 1.0, 1.0]
-        elif isinstance(channel_gain, str):
-            values = [float(v.strip()) for v in channel_gain.split(",") if v.strip() != ""]
-        else:
-            values = [float(v) for v in channel_gain]
-        if len(values) != 3:
-            values = (values + [1.0, 1.0, 1.0])[:3]
-        tensor = torch.tensor(values, device=self.device, dtype=torch.float32).view(3, 1, 1)
-        return torch.clamp(tensor, min=0.0)
+        return projector_channel_gain_to_tensor(channel_gain, device=self.device, dtype=torch.float32)
 
     def _build_physical_map(self, img_h, img_w, ambient, vignetting, distance_falloff):
         yy = torch.linspace(0.0, 1.0, steps=img_h, device=self.device, dtype=torch.float32).view(img_h, 1)
@@ -240,8 +236,13 @@ class ProjectorAttackTransform:
 
     def _projector_response(self, texture, gamma, gain, psf, channel_gain):
         out = torch.clamp(texture, 0.0, 1.0)
-        out = torch.pow(out, gamma)
-        out = torch.clamp(out * gain, 0.0, 1.0)
+        if torch.is_tensor(gamma):
+            gamma_value = gamma.to(device=self.device, dtype=out.dtype).reshape(())
+        else:
+            gamma_value = float(gamma)
+        gain_value = projector_gain_to_tensor(gain, device=self.device, dtype=out.dtype)
+        out = torch.pow(out, gamma_value)
+        out = torch.clamp(out * gain_value, 0.0, 1.0)
         out = torch.clamp(out * channel_gain.to(out.dtype), 0.0, 1.0)
         if psf:
             kernel = torch.ones((3, 1, 5, 5), device=self.device, dtype=out.dtype) / 25.0
@@ -293,8 +294,8 @@ class ProjectorAttackTransform:
         channel_gain_tensor = self._parse_channel_gain(projector_channel_gain)
         base_texture = self._projector_response(
             projection_texture,
-            gamma=float(projector_gamma),
-            gain=float(projector_gain),
+            gamma=projector_gamma,
+            gain=projector_gain,
             psf=bool(projector_psf),
             channel_gain=channel_gain_tensor,
         )

@@ -3,8 +3,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 current_dir="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 
-PROBE_ID="$(python3.10 - <<'PY'
+if ! "${PYTHON_BIN}" -V >/dev/null 2>&1; then
+    echo "Python interpreter not runnable: ${PYTHON_BIN}" >&2
+    exit 1
+fi
+
+PROBE_ID="$("${PYTHON_BIN}" - <<'PY'
 import uuid
 print(uuid.uuid4())
 PY
@@ -27,7 +33,7 @@ ONLINE_TRAIN_TASKS_PER_ITER_VALUE="${ONLINE_TRAIN_TASKS_PER_ITER:-1}"
 ONLINE_TRAIN_EPISODES_PER_TASK_VALUE="${ONLINE_TRAIN_EPISODES_PER_TASK:-10}"
 ONLINE_VAL_EPISODES_VALUE="${ONLINE_VAL_EPISODES:-8}"
 MAX_ENV_STEPS_VALUE="${MAX_ENV_STEPS:-auto_by_suite}"
-VAL_MAX_ENV_STEPS_VALUE="${VAL_MAX_ENV_STEPS:-120}"
+VAL_MAX_ENV_STEPS_VALUE="${VAL_MAX_ENV_STEPS:-180}"
 SAVE_INTERVAL_VALUE="${SAVE_INTERVAL:-5}"
 VAL_DETERMINISTIC_VALUE="${VAL_DETERMINISTIC:-true}"
 VAL_SEED_VALUE="${VAL_SEED:-42}"
@@ -46,6 +52,11 @@ LEARN_PROJECTOR_GAIN_VALUE="false"
 LEARN_PROJECTOR_CHANNEL_GAIN_VALUE="false"
 
 echo "Probe root: ${PROBE_ROOT}"
+echo "  python_bin=$("${PYTHON_BIN}" - <<'PY'
+import sys
+print(sys.executable)
+PY
+)"
 echo "Alignment snapshot:"
 echo "  dataset=${DATASET_NAME}"
 echo "  task_suite_name=${TASK_SUITE_NAME_VALUE}"
@@ -95,7 +106,7 @@ run_variant() {
     safe_variant="$(echo "${variant}" | tr '+/' '__')"
     local log_path="${LOG_DIR}/${order_idx}_${safe_variant}.log"
 
-    python3.10 "${current_dir}/VLAAttacker/UADA_rollout_online_env_wrapper.py" \
+    "${PYTHON_BIN}" "${current_dir}/VLAAttacker/UADA_rollout_online_env_wrapper.py" \
         --maskidx 0,1,2 \
         --use_all_joints false \
         --gripper_weight 0.5 \
@@ -225,7 +236,7 @@ run_variant() {
         exit 1
     fi
 
-    python3.10 - "${SUMMARY_CSV}" "${final_json}" "${exp_id}" "${order_idx}" "${loss_family}" "${form_name}" "${phase_state_mode}" "${window_rollout_phase_scope}" <<'PY'
+    "${PYTHON_BIN}" - "${SUMMARY_CSV}" "${final_json}" "${exp_id}" "${order_idx}" "${loss_family}" "${form_name}" "${phase_state_mode}" "${window_rollout_phase_scope}" <<'PY'
 import csv
 import json
 import sys
@@ -342,14 +353,14 @@ with open(summary_csv, "a", newline="", encoding="utf-8") as file:
 PY
 }
 
-run_variant 1 "rollout+siglip" "phase-cycle" "phase_cycle" "all" "rollout+siglip__phase-cycle" 0 1 0 "off" "clean_adv" 1
-run_variant 2 "rollout+siglip" "only-initial" "initial_only" "initial" "rollout+siglip__only-initial" 0 1 0 "off" "clean_adv" 1
-run_variant 3 "rollout+siglip" "only-contact-manipulate" "phase_cycle" "contact_manipulate" "rollout+siglip__only-contact-manipulate" 0 1 0 "off" "clean_adv" 1
-run_variant 4 "gt+siglip" "phase-cycle" "phase_cycle" "all" "gt+siglip__phase-cycle" 1 1 0 "off" "gt_farthest" 0
-run_variant 5 "gt+siglip" "only-initial" "initial_only" "initial" "gt+siglip__only-initial" 1 1 0 "off" "gt_farthest" 0
-run_variant 6 "gt+siglip" "only-contact-manipulate" "phase_cycle" "contact_manipulate" "gt+siglip__only-contact-manipulate" 1 1 0 "off" "gt_farthest" 0
+# run_variant 1 "rollout+siglip" "phase-cycle" "phase_cycle" "initial" "rollout+siglip__phase-cycle" 0 1 0 "off" "clean_adv" 1
+# run_variant 2 "rollout+siglip" "only-initial" "initial_only" "initial" "rollout+siglip__only-initial" 0 1 0 "off" "clean_adv" 1
+# run_variant 3 "rollout+siglip" "only-contact-manipulate" "contact_manipulate_only" "initial" "rollout+siglip__only-contact-manipulate" 0 1 0 "off" "clean_adv" 1
+# run_variant 4 "gt+siglip" "phase-cycle" "phase_cycle" "initial" "gt+siglip__phase-cycle" 1 1 0 "off" "gt_farthest" 0
+# run_variant 5 "gt+siglip" "only-initial" "initial_only" "initial" "gt+siglip__only-initial" 1 1 0 "off" "gt_farthest" 0
+run_variant 6 "gt+siglip" "only-contact-manipulate" "contact_manipulate_only" "initial" "gt+siglip__only-contact-manipulate" 1 1 0 "off" "gt_farthest" 0
 
-python3.10 - "${SUMMARY_CSV}" "${SUMMARY_JSON}" "${BEST_JSON}" "${BEST_BY_LOSS_FAMILY_JSON}" <<'PY'
+"${PYTHON_BIN}" - "${SUMMARY_CSV}" "${SUMMARY_JSON}" "${BEST_JSON}" "${BEST_BY_LOSS_FAMILY_JSON}" <<'PY'
 import csv
 import json
 import sys

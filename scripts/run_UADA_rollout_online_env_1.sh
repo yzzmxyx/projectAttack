@@ -125,7 +125,7 @@ python3.10 VLAAttacker/UADA_rollout_online_env_wrapper.py \
     --lr 2e-3 \
     --server "$current_dir" \
     --device "${DEVICE_ID}" \
-    --iter 1000 \
+    --iter 5000 \
     --accumulate "${ACCUMULATE_STEPS}" \
     --bs 1 \
     --warmup "${WARMUP_STEPS}" \
@@ -235,6 +235,6 @@ python3.10 VLAAttacker/UADA_rollout_online_env_wrapper.py \
     --gt_dataset_root "${GT_DATASET_ROOT:-/home/yxx/roboticAttack/openvla-main/dataset}" \
     --gt_action_bank_path "${GT_ACTION_BANK_PATH:-}" \
     --gt_softmin_tau "${GT_SOFTMIN_TAU:-0.05}" \
-    --phase_state_mode "${PHASE_STATE_MODE:-contact_manipulate_only}" \
+    --phase_state_mode "${PHASE_STATE_MODE:-phase_cycle}" \
     --phase_state_cache_path "${PHASE_STATE_CACHE_PATH:-}" \
     --auto_gpu_tune false

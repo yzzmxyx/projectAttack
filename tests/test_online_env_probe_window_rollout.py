@@ -5,6 +5,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "run_UADA_rollout_online_env_probe_window_rollout.sh"
 ADV_GT_SCRIPT_PATH = REPO_ROOT / "scripts" / "run_UADA_rollout_online_env_probe_window_rollout_adv_gt.sh"
+ADV_GT_DEATTACK_SCRIPT_PATH = (
+    REPO_ROOT / "scripts" / "run_UADA_rollout_online_env_probe_window_rollout_adv_gt_deattack.sh"
+)
 SIGLIP_GT_PHASE_FORMS_SCRIPT_PATH = (
     REPO_ROOT / "scripts" / "run_UADA_rollout_online_env_probe_window_rollout_siglip_gt_phase_forms.sh"
 )
@@ -65,15 +68,34 @@ def test_window_rollout_probe_script_lists_all_probe_variants():
 def test_window_rollout_adv_gt_probe_script_includes_metric_mode_and_summary_fields():
     contents = ADV_GT_SCRIPT_PATH.read_text(encoding="utf-8")
     expected_snippets = (
-        'PROBE_ROOT="${current_dir}/run/UADA_rollout_online_env_probe_window_rollout_adv_gt/${PROBE_ID}"',
+        'PROBE_ROOT_NAME="${PROBE_ROOT_NAME:-UADA_rollout_online_env_probe_window_rollout_adv_gt}"',
+        'PROBE_RUN_TAG="${PROBE_RUN_TAG:-UADA_rollout_online_env_probe_window_rollout_adv_gt}"',
+        'PROBE_ROOT="${current_dir}/run/${PROBE_ROOT_NAME}/${PROBE_ID}"',
         'WINDOW_ROLLOUT_METRIC_MODE_VALUE="adv_gt"',
+        'WINDOW_ROLLOUT_FUTURE_MODE="${WINDOW_ROLLOUT_FUTURE_MODE:-keep_adv}"',
         '--window_rollout_metric_mode "${WINDOW_ROLLOUT_METRIC_MODE_VALUE}"',
+        '--window_rollout_future_mode "${WINDOW_ROLLOUT_FUTURE_MODE}"',
         'window_rollout_metric_mode',
+        'window_rollout_future_mode',
         'final_val_window_rollout_metric_value',
+        'final_val_window_rollout_deattack_gt_action_gap',
+        'final_val_window_rollout_selected_gt_action_gap',
         '"gt+siglip+rollout+ce" 1 1 0.1',
     )
     for snippet in expected_snippets:
         assert snippet in contents, f"Missing `{snippet}` in {ADV_GT_SCRIPT_PATH}"
+
+
+def test_window_rollout_adv_gt_deattack_wrapper_sets_new_future_mode_and_root():
+    contents = ADV_GT_DEATTACK_SCRIPT_PATH.read_text(encoding="utf-8")
+    expected_snippets = (
+        'export PROBE_ROOT_NAME="${PROBE_ROOT_NAME:-UADA_rollout_online_env_probe_window_rollout_adv_gt_deattack}"',
+        'export PROBE_RUN_TAG="${PROBE_RUN_TAG:-UADA_rollout_online_env_probe_window_rollout_adv_gt_deattack}"',
+        'export WINDOW_ROLLOUT_FUTURE_MODE="${WINDOW_ROLLOUT_FUTURE_MODE:-drop_attack_after_window}"',
+        'exec "${SCRIPT_DIR}/run_UADA_rollout_online_env_probe_window_rollout_adv_gt.sh"',
+    )
+    for snippet in expected_snippets:
+        assert snippet in contents, f"Missing `{snippet}` in {ADV_GT_DEATTACK_SCRIPT_PATH}"
 
 
 def test_window_rollout_siglip_gt_phase_forms_script_has_expected_defaults_and_outputs():
@@ -96,12 +118,12 @@ def test_window_rollout_siglip_gt_phase_forms_script_has_expected_defaults_and_o
 def test_window_rollout_siglip_gt_phase_forms_script_lists_all_six_variants():
     contents = SIGLIP_GT_PHASE_FORMS_SCRIPT_PATH.read_text(encoding="utf-8")
     expected_variants = (
-        'run_variant 1 "rollout+siglip" "phase-cycle" "phase_cycle" "all" "rollout+siglip__phase-cycle" 0 1 0 "off" "clean_adv" 1',
+        'run_variant 1 "rollout+siglip" "phase-cycle" "phase_cycle" "initial" "rollout+siglip__phase-cycle" 0 1 0 "off" "clean_adv" 1',
         'run_variant 2 "rollout+siglip" "only-initial" "initial_only" "initial" "rollout+siglip__only-initial" 0 1 0 "off" "clean_adv" 1',
-        'run_variant 3 "rollout+siglip" "only-contact-manipulate" "phase_cycle" "contact_manipulate" "rollout+siglip__only-contact-manipulate" 0 1 0 "off" "clean_adv" 1',
-        'run_variant 4 "gt+siglip" "phase-cycle" "phase_cycle" "all" "gt+siglip__phase-cycle" 1 1 0 "off" "gt_farthest" 0',
+        'run_variant 3 "rollout+siglip" "only-contact-manipulate" "contact_manipulate_only" "initial" "rollout+siglip__only-contact-manipulate" 0 1 0 "off" "clean_adv" 1',
+        'run_variant 4 "gt+siglip" "phase-cycle" "phase_cycle" "initial" "gt+siglip__phase-cycle" 1 1 0 "off" "gt_farthest" 0',
         'run_variant 5 "gt+siglip" "only-initial" "initial_only" "initial" "gt+siglip__only-initial" 1 1 0 "off" "gt_farthest" 0',
-        'run_variant 6 "gt+siglip" "only-contact-manipulate" "phase_cycle" "contact_manipulate" "gt+siglip__only-contact-manipulate" 1 1 0 "off" "gt_farthest" 0',
+        'run_variant 6 "gt+siglip" "only-contact-manipulate" "contact_manipulate_only" "initial" "gt+siglip__only-contact-manipulate" 1 1 0 "off" "gt_farthest" 0',
     )
     for snippet in expected_variants:
         assert snippet in contents, f"Missing variant snippet `{snippet}` in {SIGLIP_GT_PHASE_FORMS_SCRIPT_PATH}"
@@ -115,6 +137,8 @@ def test_window_rollout_helper_resolves_windows_and_metric_selection():
     assert module.normalize_window_rollout_phase_scope("contact") == "contact_manipulate"
     assert module.normalize_window_rollout_metric_mode("adv") == "adv_gt"
     assert module.normalize_window_rollout_metric_mode("delta") == "delta_weighted"
+    assert module.normalize_window_rollout_future_mode("deattack") == "drop_attack_after_window"
+    assert module.normalize_window_rollout_future_mode("keep_adv") == "keep_adv"
     initial_window = module.resolve_phase_window(
         source_T=100,
         contact_step=30,

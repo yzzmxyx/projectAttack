@@ -33,6 +33,7 @@ try:
     from white_patch.window_rollout_probe_utils import (
         compute_window_rollout_weight,
         infer_phase_name_from_boundaries,
+        normalize_window_rollout_future_mode,
         normalize_window_rollout_metric_mode,
         normalize_window_rollout_phase_scope,
         resolve_phase_window,
@@ -42,6 +43,7 @@ except Exception:
     from window_rollout_probe_utils import (
         compute_window_rollout_weight,
         infer_phase_name_from_boundaries,
+        normalize_window_rollout_future_mode,
         normalize_window_rollout_metric_mode,
         normalize_window_rollout_phase_scope,
         resolve_phase_window,
@@ -71,6 +73,8 @@ DEFAULT_SIGLIP_MODEL_NAME = "google/siglip-so400m-patch14-384"
 
 
 class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
+    RESUME_STATE_FILENAME = "resume_state.pt"
+
     def _reset_metric_buffers(self):
         super()._reset_metric_buffers()
         self.train_rollout_history_div_legacy = []
@@ -86,6 +90,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         self.train_impulse_rollout_area = []
         self.train_window_rollout_clean_gt_action_gap = []
         self.train_window_rollout_adv_gt_action_gap = []
+        self.train_window_rollout_deattack_gt_action_gap = []
+        self.train_window_rollout_selected_gt_action_gap = []
         self.train_window_rollout_delta_weighted = []
         self.train_window_rollout_delta_weighted_loss = []
         self.train_total_rollout_score = []
@@ -105,6 +111,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         self.val_impulse_rollout_area = []
         self.val_window_rollout_clean_gt_action_gap = []
         self.val_window_rollout_adv_gt_action_gap = []
+        self.val_window_rollout_deattack_gt_action_gap = []
+        self.val_window_rollout_selected_gt_action_gap = []
         self.val_window_rollout_delta_weighted = []
         self.val_window_rollout_delta_weighted_loss = []
         self.val_total_rollout_score = []
@@ -133,6 +141,216 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         self._init_projection_texture_path = ""
         self._initial_projection_texture_snapshot_path = ""
         self._initial_patch_snapshot_path = ""
+        self._resume_capable = False
+        self._latest_resume_checkpoint = ""
+        self._last_completed_iter = -1
+        self._wandb_run_id = ""
+
+    def _history_metric_file_map(self):
+        return [
+            ("loss_buffer", "loss"),
+            ("train_rollout_action_gap", "train_online_rollout_action_gap.pkl"),
+            ("train_rollout_action_gap_joints", "train_online_rollout_action_gap_joints.pkl"),
+            ("train_gt_rollout_action_gap", "train_online_gt_rollout_action_gap.pkl"),
+            ("train_gt_rollout_action_gap_joints", "train_online_gt_rollout_action_gap_joints.pkl"),
+            ("train_rollout_history_div", "train_online_rollout_history_div.pkl"),
+            ("train_rollout_history_div_legacy", "train_online_rollout_history_div_legacy.pkl"),
+            ("train_rollout_siglip_distance", "train_online_siglip_distance.pkl"),
+            ("train_rollout_score", "train_online_rollout_score.pkl"),
+            ("train_rollout_objective_score", "train_online_objective_score.pkl"),
+            ("train_gt_rollout_score", "train_online_gt_rollout_score.pkl"),
+            ("train_gt_rollout_objective_score", "train_online_gt_objective_score.pkl"),
+            ("train_continuous_clean_gt_action_gap", "train_online_continuous_clean_gt_action_gap.pkl"),
+            ("train_continuous_adv_gt_action_gap", "train_online_continuous_adv_gt_action_gap.pkl"),
+            ("train_continuous_rollout_delta", "train_online_continuous_rollout_delta.pkl"),
+            ("train_impulse_rollout_area", "train_online_impulse_rollout_area.pkl"),
+            ("train_window_rollout_clean_gt_action_gap", "train_online_window_rollout_clean_gt_action_gap.pkl"),
+            ("train_window_rollout_adv_gt_action_gap", "train_online_window_rollout_adv_gt_action_gap.pkl"),
+            ("train_window_rollout_deattack_gt_action_gap", "train_online_window_rollout_deattack_gt_action_gap.pkl"),
+            ("train_window_rollout_selected_gt_action_gap", "train_online_window_rollout_selected_gt_action_gap.pkl"),
+            ("train_window_rollout_delta_weighted", "train_online_window_rollout_delta_weighted.pkl"),
+            ("train_window_rollout_delta_weighted_loss", "train_online_window_rollout_delta_weighted_loss.pkl"),
+            ("train_total_rollout_score", "train_online_total_rollout_score.pkl"),
+            ("train_total_objective_score", "train_online_total_objective_score.pkl"),
+            ("train_active_rollout_action_gap", "train_online_active_rollout_action_gap.pkl"),
+            ("train_active_rollout_score", "train_online_active_rollout_score.pkl"),
+            ("train_active_rollout_objective_score", "train_online_active_objective_score.pkl"),
+            ("train_phase_id", "train_online_phase_id.pkl"),
+            ("train_online_done_rate", "train_online_done_rate.pkl"),
+            ("train_online_episode_len", "train_online_episode_len.pkl"),
+            ("val_rollout_action_gap", "val_online_rollout_action_gap.pkl"),
+            ("val_rollout_action_gap_joints", "val_online_rollout_action_gap_joints.pkl"),
+            ("val_gt_rollout_action_gap", "val_online_gt_rollout_action_gap.pkl"),
+            ("val_gt_rollout_action_gap_joints", "val_online_gt_rollout_action_gap_joints.pkl"),
+            ("val_rollout_history_div", "val_online_rollout_history_div.pkl"),
+            ("val_rollout_history_div_legacy", "val_online_rollout_history_div_legacy.pkl"),
+            ("val_rollout_siglip_distance", "val_online_siglip_distance.pkl"),
+            ("val_rollout_score", "val_online_rollout_score.pkl"),
+            ("val_rollout_objective_score", "val_online_objective_score.pkl"),
+            ("val_gt_rollout_score", "val_online_gt_rollout_score.pkl"),
+            ("val_gt_rollout_objective_score", "val_online_gt_objective_score.pkl"),
+            ("val_continuous_clean_gt_action_gap", "val_online_continuous_clean_gt_action_gap.pkl"),
+            ("val_continuous_adv_gt_action_gap", "val_online_continuous_adv_gt_action_gap.pkl"),
+            ("val_continuous_rollout_delta", "val_online_continuous_rollout_delta.pkl"),
+            ("val_impulse_rollout_area", "val_online_impulse_rollout_area.pkl"),
+            ("val_window_rollout_clean_gt_action_gap", "val_online_window_rollout_clean_gt_action_gap.pkl"),
+            ("val_window_rollout_adv_gt_action_gap", "val_online_window_rollout_adv_gt_action_gap.pkl"),
+            ("val_window_rollout_deattack_gt_action_gap", "val_online_window_rollout_deattack_gt_action_gap.pkl"),
+            ("val_window_rollout_selected_gt_action_gap", "val_online_window_rollout_selected_gt_action_gap.pkl"),
+            ("val_window_rollout_delta_weighted", "val_online_window_rollout_delta_weighted.pkl"),
+            ("val_window_rollout_delta_weighted_loss", "val_online_window_rollout_delta_weighted_loss.pkl"),
+            ("val_total_rollout_score", "val_online_total_rollout_score.pkl"),
+            ("val_total_objective_score", "val_online_total_objective_score.pkl"),
+            ("val_active_rollout_action_gap", "val_online_active_rollout_action_gap.pkl"),
+            ("val_active_rollout_score", "val_online_active_rollout_score.pkl"),
+            ("val_active_rollout_objective_score", "val_online_active_objective_score.pkl"),
+            ("val_rollout_score_legacy", "val_online_rollout_score_legacy.pkl"),
+            ("val_online_done_rate", "val_online_done_rate.pkl"),
+            ("val_online_episode_len", "val_online_episode_len.pkl"),
+        ]
+
+    def _load_history_metrics(self, path):
+        for attr_name, filename in self._history_metric_file_map():
+            filepath = os.path.join(path, filename)
+            if not os.path.exists(filepath):
+                continue
+            with open(filepath, "rb") as file:
+                if filename == "loss":
+                    loaded = torch.load(file, map_location="cpu")
+                else:
+                    loaded = pickle.load(file)
+            setattr(self, attr_name, loaded)
+
+    def _capture_rng_state(self):
+        return {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        }
+
+    def _restore_rng_state(self, rng_state):
+        if not isinstance(rng_state, dict):
+            return
+        if "python" in rng_state:
+            random.setstate(rng_state["python"])
+        if "numpy" in rng_state:
+            np.random.set_state(rng_state["numpy"])
+        if "torch" in rng_state:
+            torch.set_rng_state(rng_state["torch"].cpu())
+        torch_cuda_state = rng_state.get("torch_cuda")
+        if torch_cuda_state is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all([state.cpu() for state in torch_cuda_state])
+
+    def _build_resume_state(
+        self,
+        projection_texture,
+        photometric_params,
+        optimizer,
+        scheduler,
+        global_iter_completed,
+        config,
+        train_phase_start_counter,
+        gpu_tuner_state=None,
+    ):
+        return {
+            "schema_version": 1,
+            "projection_texture": projection_texture.detach().cpu(),
+            "photometric_params_state_dict": photometric_params.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "global_iter_completed": int(global_iter_completed),
+            "next_iter_idx": int(global_iter_completed) + 1,
+            "config": dict(config),
+            "rng_state": self._capture_rng_state(),
+            "train_phase_start_counter": int(train_phase_start_counter),
+            "best_rollout_score": float(self.best_rollout_score),
+            "gpu_tuner_state": gpu_tuner_state,
+            "wandb_run_id": str(self._wandb_run_id),
+        }
+
+    def _save_resume_checkpoint(
+        self,
+        output_dir,
+        projection_texture,
+        photometric_params,
+        optimizer,
+        scheduler,
+        global_iter_completed,
+        config,
+        train_phase_start_counter,
+        gpu_tuner_state=None,
+    ):
+        os.makedirs(output_dir, exist_ok=True)
+        checkpoint_path = os.path.join(output_dir, self.RESUME_STATE_FILENAME)
+        payload = self._build_resume_state(
+            projection_texture=projection_texture,
+            photometric_params=photometric_params,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            global_iter_completed=global_iter_completed,
+            config=config,
+            train_phase_start_counter=train_phase_start_counter,
+            gpu_tuner_state=gpu_tuner_state,
+        )
+        torch.save(payload, checkpoint_path)
+        self._resume_capable = True
+        self._latest_resume_checkpoint = str(checkpoint_path)
+        self._last_completed_iter = int(global_iter_completed)
+        return checkpoint_path
+
+    def _load_resume_checkpoint(self, resume_run_dir):
+        checkpoint_path = os.path.join(resume_run_dir, "last", self.RESUME_STATE_FILENAME)
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(
+                f"resume checkpoint not found: `{checkpoint_path}`. "
+                "This run does not appear to support full resume."
+            )
+        state = torch.load(checkpoint_path, map_location=self.vla.device)
+        if not isinstance(state, dict):
+            raise TypeError(f"Resume checkpoint `{checkpoint_path}` must contain a dict payload.")
+
+        metadata_path = os.path.join(resume_run_dir, "run_metadata.json")
+        metadata = {}
+        if os.path.exists(metadata_path):
+            with open(metadata_path, "r", encoding="utf-8") as file:
+                metadata = json.load(file)
+
+        self._init_projection_texture_path = str(metadata.get("init_projection_texture_path", ""))
+        self._initial_projection_texture_snapshot_path = str(
+            metadata.get("initial_projection_texture_snapshot_path", "")
+        )
+        self._initial_patch_snapshot_path = str(metadata.get("initial_patch_snapshot_path", ""))
+        self._wandb_run_id = str(state.get("wandb_run_id", metadata.get("wandb_run_id", self._wandb_run_id or "")))
+        self._resume_capable = True
+        self._latest_resume_checkpoint = str(checkpoint_path)
+        self._last_completed_iter = int(state.get("global_iter_completed", -1))
+        return state
+
+    def _validate_resume_compatibility(self, current_config, resume_config):
+        incompatible_keys = [
+            "num_iter",
+            "patch_size",
+            "projection_size",
+            "accumulate_steps",
+            "warmup",
+            "phase1_ratio",
+            "phase1_rollout",
+            "phase2_rollout",
+            "learn_projector_gain",
+            "learn_projector_channel_gain",
+        ]
+        mismatches = []
+        for key in incompatible_keys:
+            current_value = current_config.get(key)
+            resume_value = resume_config.get(key)
+            if current_value != resume_value:
+                mismatches.append(f"{key}: current={current_value!r}, checkpoint={resume_value!r}")
+        if mismatches:
+            raise ValueError(
+                "Resume configuration mismatch detected:\n" + "\n".join(mismatches)
+            )
+
 
     def _probe_metrics_path(self):
         return os.path.join(self.save_dir, "probe_metrics.csv")
@@ -160,6 +378,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             "impulse_rollout_area",
             "window_rollout_clean_gt_action_gap",
             "window_rollout_adv_gt_action_gap",
+            "window_rollout_deattack_gt_action_gap",
+            "window_rollout_selected_gt_action_gap",
             "window_rollout_delta_weighted",
             "window_rollout_delta_weighted_loss",
             "window_rollout_future_steps",
@@ -168,6 +388,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             "window_end_step",
             "lambda_window_rollout_loss",
             "window_rollout_metric_mode",
+            "window_rollout_future_mode",
             "window_rollout_metric_value",
             "rollout_score",
             "gt_rollout_score",
@@ -207,6 +428,23 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         os.makedirs(video_root, exist_ok=True)
         return video_root
 
+    def _sanitize_online_video_component(self, value):
+        text = str(value).lower().strip()
+        sanitized = "".join(ch if ch.isalnum() else "_" for ch in text)
+        sanitized = sanitized.strip("_")
+        while "__" in sanitized:
+            sanitized = sanitized.replace("__", "_")
+        return sanitized or "unknown"
+
+    def _format_online_video_index(self, value, width):
+        try:
+            numeric_value = int(value)
+        except Exception:
+            return "na"
+        if numeric_value < 0:
+            return "na"
+        return f"{numeric_value:0{int(width)}d}"
+
     def _append_online_video_manifest(self, row):
         video_root = self._online_video_root()
         manifest_path = os.path.join(video_root, "video_manifest.csv")
@@ -215,6 +453,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             "iter_idx",
             "phase_id",
             "split",
+            "episode_idx",
+            "init_state_idx",
+            "phase_start_name",
             "frame_source",
             "lighting_backend",
             "task_id",
@@ -264,7 +505,15 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         os.makedirs(split_dir, exist_ok=True)
 
         frame_source_name = str(frame_source).lower().strip()
-        video_path = os.path.join(split_dir, f"{frame_source_name}.mp4")
+        episode_idx_text = self._format_online_video_index(episode.get("episode_idx", None), width=3)
+        task_id_text = self._format_online_video_index(episode.get("task_id", None), width=2)
+        init_state_idx_text = self._format_online_video_index(episode.get("init_state_idx", None), width=3)
+        phase_start_name = self._sanitize_online_video_component(episode.get("phase_start_name", "unknown"))
+        video_filename = (
+            f"ep_{episode_idx_text}_task_{task_id_text}_init_{init_state_idx_text}"
+            f"_phase_{phase_start_name}_{frame_source_name}.mp4"
+        )
+        video_path = os.path.join(split_dir, video_filename)
         wrote_video = self._write_mp4(
             video_path=video_path,
             frames=episode.get("video_frames", []),
@@ -278,6 +527,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 "iter_idx": int(iter_idx),
                 "phase_id": int(phase_id),
                 "split": split_name,
+                "episode_idx": int(episode.get("episode_idx", -1)),
+                "init_state_idx": int(episode.get("init_state_idx", -1)),
+                "phase_start_name": str(episode.get("phase_start_name", "")),
                 "frame_source": frame_source_name,
                 "lighting_backend": str(episode.get("lighting_backend", "unknown")),
                 "task_id": int(episode.get("task_id", -1)),
@@ -344,12 +596,35 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             return "pre_contact"
         return name
 
-    def _phase_start_for_counter(self, phase_state_mode, counter):
+    def _normalize_phase_state_mode(self, phase_state_mode):
         mode = str(phase_state_mode).lower().strip()
+        aliases = {
+            "initial_only": "initial_only",
+            "initial": "initial_only",
+            "contact_manipulate_only": "contact_manipulate_only",
+            "contact_only": "contact_manipulate_only",
+            "contact_manipulate": "contact_manipulate_only",
+            "post_contact_only": "post_contact_only",
+            "post_only": "post_contact_only",
+            "post_contact": "post_contact_only",
+            "phase_cycle": "phase_cycle",
+            "cycle": "phase_cycle",
+        }
+        if mode not in aliases:
+            raise ValueError(
+                "--phase_state_mode must be one of "
+                "{initial_only, contact_manipulate_only, post_contact_only, phase_cycle}"
+            )
+        return aliases[mode]
+
+    def _phase_start_for_counter(self, phase_state_mode, counter):
+        mode = self._normalize_phase_state_mode(phase_state_mode)
         if mode == "initial_only":
             return "initial"
-        if mode != "phase_cycle":
-            raise ValueError("--phase_state_mode must be one of {initial_only, phase_cycle}")
+        if mode == "contact_manipulate_only":
+            return "contact_manipulate"
+        if mode == "post_contact_only":
+            return "post_contact"
         phases = ("initial", "contact_manipulate", "post_contact")
         return phases[int(counter) % len(phases)]
 
@@ -804,6 +1079,10 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
     def _write_run_metadata(self):
         metadata = {
             "run_dir": str(self.save_dir),
+            "resume_capable": bool(self._resume_capable),
+            "latest_resume_checkpoint": str(self._latest_resume_checkpoint),
+            "last_completed_iter": int(self._last_completed_iter),
+            "wandb_run_id": str(self._wandb_run_id),
         }
         metadata.update(self._gt_cache_log_fields())
         with open(os.path.join(self.save_dir, "run_metadata.json"), "w") as file:
@@ -1015,6 +1294,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         num_iter=5000,
         patch_size=[3, 50, 50],
         init_projection_texture_path="",
+        resume_run_dir="",
         lr=1 / 255,
         accumulate_steps=1,
         maskidx=[],
@@ -1036,6 +1316,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         impulse_rollout_metric_enabled=False,
         window_rollout_probe_enabled=False,
         window_rollout_metric_mode="delta_weighted",
+        window_rollout_future_mode="keep_adv",
         window_rollout_exp_base=0.9,
         window_rollout_future_horizon=8,
         window_rollout_phase_scope="all",
@@ -1139,17 +1420,60 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         del env_action_source  # current implementation uses adv action for stepping by default
         self._reset_metric_buffers()
         self._set_online_env_seed(env_seed)
+        self._wandb_run_id = str(getattr(args, "wandb_run_id", "") or "")
 
         attack_mode = str(attack_mode).lower()
         if projection_size is None:
             projection_size = patch_size
         projection_size = [int(x) for x in projection_size]
+        resume_run_dir_value = "" if resume_run_dir is None else str(resume_run_dir).strip()
+        if resume_run_dir_value.lower() in ("none", "null"):
+            resume_run_dir_value = ""
+        if resume_run_dir_value != "":
+            resume_run_dir_value = os.path.abspath(os.path.expanduser(resume_run_dir_value))
 
         projection_texture = torch.rand(projection_size, device=self.vla.device)
         projection_texture.requires_grad_(True)
         projection_texture.retain_grad()
         init_projection_path_value = "" if init_projection_texture_path is None else str(init_projection_texture_path).strip()
-        if init_projection_path_value.lower() not in ("", "none", "null"):
+        if init_projection_path_value.lower() in ("none", "null"):
+            init_projection_path_value = ""
+        if resume_run_dir_value != "" and init_projection_path_value != "":
+            raise ValueError("--resume_run_dir and --init_projection_texture_path are mutually exclusive.")
+
+        current_resume_config = {
+            "num_iter": int(num_iter),
+            "patch_size": [int(x) for x in patch_size],
+            "projection_size": [int(x) for x in projection_size],
+            "accumulate_steps": int(accumulate_steps),
+            "warmup": int(warmup),
+            "phase1_ratio": float(phase1_ratio),
+            "phase1_rollout": int(phase1_rollout),
+            "phase2_rollout": int(phase2_rollout),
+            "learn_projector_gain": bool(learn_projector_gain),
+            "learn_projector_channel_gain": bool(learn_projector_channel_gain),
+        }
+        resume_state = None
+        start_iter = 0
+        train_phase_start_counter = 0
+        resumed_gpu_tuner_state = None
+        if resume_run_dir_value != "":
+            resume_state = self._load_resume_checkpoint(resume_run_dir_value)
+            self._validate_resume_compatibility(current_resume_config, resume_state.get("config", {}))
+            with torch.no_grad():
+                projection_texture.copy_(
+                    torch.as_tensor(
+                        resume_state["projection_texture"],
+                        device=self.vla.device,
+                        dtype=projection_texture.dtype,
+                    )
+                )
+            start_iter = int(resume_state.get("next_iter_idx", int(resume_state.get("global_iter_completed", -1)) + 1))
+            train_phase_start_counter = int(resume_state.get("train_phase_start_counter", 0))
+            resumed_gpu_tuner_state = resume_state.get("gpu_tuner_state")
+            self.best_rollout_score = float(resume_state.get("best_rollout_score", self.best_rollout_score))
+            self._load_history_metrics(self.save_dir)
+        elif init_projection_path_value != "":
             init_projection_path = Path(os.path.abspath(os.path.expanduser(init_projection_path_value)))
             if not init_projection_path.exists():
                 raise FileNotFoundError(f"init_projection_texture_path not found: `{init_projection_path}`.")
@@ -1166,7 +1490,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             self._init_projection_texture_path = str(init_projection_path)
         else:
             self._init_projection_texture_path = ""
-        self._save_initial_projection_snapshot(projection_texture)
+        if resume_run_dir_value == "":
+            self._save_initial_projection_snapshot(projection_texture)
 
         phase1_ratio = float(min(max(phase1_ratio, 0.0), 1.0))
         phase1_end_iter = int(num_iter * phase1_ratio)
@@ -1186,6 +1511,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         impulse_rollout_metric_enabled = bool(impulse_rollout_metric_enabled)
         window_rollout_probe_enabled = bool(window_rollout_probe_enabled)
         window_rollout_metric_mode = normalize_window_rollout_metric_mode(window_rollout_metric_mode)
+        window_rollout_future_mode = normalize_window_rollout_future_mode(window_rollout_future_mode)
         window_rollout_exp_base = float(window_rollout_exp_base)
         window_rollout_future_horizon = max(0, int(window_rollout_future_horizon))
         window_rollout_phase_scope = normalize_window_rollout_phase_scope(window_rollout_phase_scope)
@@ -1216,9 +1542,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         gt_dataset_root = os.path.abspath(os.path.expanduser(str(gt_dataset_root)))
         gt_softmin_tau = max(float(gt_softmin_tau), 1e-6)
         self._gt_softmin_tau = gt_softmin_tau
-        phase_state_mode = str(phase_state_mode).lower().strip()
-        if phase_state_mode not in ("initial_only", "phase_cycle"):
-            raise ValueError("--phase_state_mode must be one of {initial_only, phase_cycle}")
+        phase_state_mode = self._normalize_phase_state_mode(phase_state_mode)
         val_deterministic = bool(val_deterministic)
         val_seed = int(val_seed)
         val_disable_lighting = bool(val_disable_lighting)
@@ -1280,6 +1604,11 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             num_cycles=0.5,
             last_epoch=-1,
         )
+        if resume_state is not None:
+            photometric_params.load_state_dict(resume_state["photometric_params_state_dict"])
+            optimizer.load_state_dict(resume_state["optimizer_state_dict"])
+            scheduler.load_state_dict(resume_state["scheduler_state_dict"])
+            self._restore_rng_state(resume_state.get("rng_state"))
 
         siglip_model = None
         if lambda_siglip > 0.0:
@@ -1341,7 +1670,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             self._gt_phase_action_bank_stats = {}
             self._gt_phase_boundary_ratios = {}
             self._gt_action_bank_path = ""
-        if phase_state_mode == "phase_cycle" or window_rollout_probe_enabled or (lambda_window_rollout_loss > 0.0):
+        if phase_state_mode != "initial_only" or window_rollout_probe_enabled or (lambda_window_rollout_loss > 0.0):
             self._load_phase_state_cache(
                 phase_state_cache_path=phase_state_cache_path,
                 dataset_name=dataset_name,
@@ -1362,6 +1691,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             f"init_projection_texture_path={init_projection_path_value}, "
             f"window_rollout_probe_enabled={int(window_rollout_probe_enabled)}, "
             f"window_rollout_metric_mode={window_rollout_metric_mode}, "
+            f"window_rollout_future_mode={window_rollout_future_mode}, "
             f"window_rollout_exp_base={window_rollout_exp_base}, "
             f"window_rollout_future_horizon={window_rollout_future_horizon}, "
             f"window_rollout_phase_scope={window_rollout_phase_scope}, "
@@ -1388,6 +1718,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             base_phase2_rollout=base_phase2_rollout,
             base_train_tasks_per_iter=base_train_tasks_per_iter,
         )
+        if isinstance(resumed_gpu_tuner_state, dict):
+            gpu_tuner_state.update(resumed_gpu_tuner_state)
         if auto_gpu_tune:
             print(
                 "[OnlineEnv] auto_gpu_tune enabled "
@@ -1395,8 +1727,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             )
 
         optimizer.zero_grad()
-        train_phase_start_counter = 0
-        for i in tqdm(range(num_iter)):
+        for i in tqdm(range(start_iter, num_iter)):
             phase_id = 1 if i < phase1_end_iter else 2
             effective_lambda_ce = lambda_ce if phase_id == 1 else lambda_ce_phase2
             base_rollout_steps = base_phase1_rollout if phase_id == 1 else base_phase2_rollout
@@ -1444,6 +1775,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             train_impulse_rollout_area = 0.0
             train_window_rollout_clean_gt_action_gap = 0.0
             train_window_rollout_adv_gt_action_gap = 0.0
+            train_window_rollout_deattack_gt_action_gap = 0.0
+            train_window_rollout_selected_gt_action_gap = 0.0
             train_window_rollout_delta_weighted = 0.0
             train_window_rollout_delta_weighted_loss = 0.0
             train_proj_alpha = 0.0
@@ -1523,6 +1856,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                             impulse_rollout_metric_enabled=impulse_rollout_metric_enabled,
                             window_rollout_probe_enabled=bool(train_window_rollout_spec is not None),
                             window_rollout_metric_mode=window_rollout_metric_mode,
+                            window_rollout_future_mode=window_rollout_future_mode,
                             window_rollout_spec=train_window_rollout_spec,
                             lambda_siglip=lambda_siglip,
                             siglip_model=siglip_model,
@@ -1582,6 +1916,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                         train_impulse_rollout_area += episode["impulse_rollout_area"]
                         train_window_rollout_clean_gt_action_gap += episode["window_rollout_clean_gt_action_gap"]
                         train_window_rollout_adv_gt_action_gap += episode["window_rollout_adv_gt_action_gap"]
+                        train_window_rollout_deattack_gt_action_gap += episode["window_rollout_deattack_gt_action_gap"]
+                        train_window_rollout_selected_gt_action_gap += episode["window_rollout_selected_gt_action_gap"]
                         train_window_rollout_delta_weighted += episode["window_rollout_delta_weighted"]
                         train_window_rollout_delta_weighted_loss += episode["window_rollout_delta_weighted_loss"]
                         train_proj_alpha += episode["projection_alpha"]
@@ -1646,6 +1982,12 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             avg_window_rollout_adv_gt_action_gap = train_window_rollout_adv_gt_action_gap / float(
                 max(1, train_episode_count)
             )
+            avg_window_rollout_deattack_gt_action_gap = train_window_rollout_deattack_gt_action_gap / float(
+                max(1, train_episode_count)
+            )
+            avg_window_rollout_selected_gt_action_gap = train_window_rollout_selected_gt_action_gap / float(
+                max(1, train_episode_count)
+            )
             avg_window_rollout_delta_weighted = train_window_rollout_delta_weighted / float(max(1, train_episode_count))
             avg_window_rollout_delta_weighted_loss = train_window_rollout_delta_weighted_loss / float(
                 max(1, train_episode_count)
@@ -1653,7 +1995,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             avg_window_rollout_metric_value = select_window_rollout_metric_value(
                 metric_mode=window_rollout_metric_mode,
                 delta_weighted=avg_window_rollout_delta_weighted,
-                adv_gt_action_gap=avg_window_rollout_adv_gt_action_gap,
+                adv_gt_action_gap=avg_window_rollout_selected_gt_action_gap,
             )
             avg_proj_alpha = train_proj_alpha / float(max(1, train_episode_count))
             avg_proj_coverage = train_proj_coverage / float(max(1, train_episode_count))
@@ -1714,6 +2056,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             self.train_impulse_rollout_area.append(avg_impulse_rollout_area)
             self.train_window_rollout_clean_gt_action_gap.append(avg_window_rollout_clean_gt_action_gap)
             self.train_window_rollout_adv_gt_action_gap.append(avg_window_rollout_adv_gt_action_gap)
+            self.train_window_rollout_deattack_gt_action_gap.append(avg_window_rollout_deattack_gt_action_gap)
+            self.train_window_rollout_selected_gt_action_gap.append(avg_window_rollout_selected_gt_action_gap)
             self.train_window_rollout_delta_weighted.append(avg_window_rollout_delta_weighted)
             self.train_window_rollout_delta_weighted_loss.append(avg_window_rollout_delta_weighted_loss)
             self.train_total_rollout_score.append(total_rollout_score)
@@ -1754,9 +2098,12 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 "TRAIN_online_impulse_rollout_area": avg_impulse_rollout_area,
                 "TRAIN_online_window_rollout_clean_gt_action_gap": avg_window_rollout_clean_gt_action_gap,
                 "TRAIN_online_window_rollout_adv_gt_action_gap": avg_window_rollout_adv_gt_action_gap,
+                "TRAIN_online_window_rollout_deattack_gt_action_gap": avg_window_rollout_deattack_gt_action_gap,
+                "TRAIN_online_window_rollout_selected_gt_action_gap": avg_window_rollout_selected_gt_action_gap,
                 "TRAIN_online_window_rollout_delta_weighted": avg_window_rollout_delta_weighted,
                 "TRAIN_online_window_rollout_delta_weighted_loss": avg_window_rollout_delta_weighted_loss,
                 "TRAIN_online_window_rollout_metric_mode": str(window_rollout_metric_mode),
+                "TRAIN_online_window_rollout_future_mode": str(window_rollout_future_mode),
                 "TRAIN_online_window_rollout_metric_value": avg_window_rollout_metric_value,
                 "TRAIN_online_total_rollout_score": total_rollout_score,
                 "TRAIN_online_total_objective_score": total_objective_score,
@@ -1824,6 +2171,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                         "impulse_rollout_area": float(avg_impulse_rollout_area),
                         "window_rollout_clean_gt_action_gap": float(avg_window_rollout_clean_gt_action_gap),
                         "window_rollout_adv_gt_action_gap": float(avg_window_rollout_adv_gt_action_gap),
+                        "window_rollout_deattack_gt_action_gap": float(avg_window_rollout_deattack_gt_action_gap),
+                        "window_rollout_selected_gt_action_gap": float(avg_window_rollout_selected_gt_action_gap),
                         "window_rollout_delta_weighted": float(avg_window_rollout_delta_weighted),
                         "window_rollout_delta_weighted_loss": float(avg_window_rollout_delta_weighted_loss),
                         "window_rollout_future_steps": "",
@@ -1832,6 +2181,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                         "window_end_step": "",
                         "lambda_window_rollout_loss": float(lambda_window_rollout_loss),
                         "window_rollout_metric_mode": str(window_rollout_metric_mode),
+                        "window_rollout_future_mode": str(window_rollout_future_mode),
                         "window_rollout_metric_value": float(avg_window_rollout_metric_value),
                         "rollout_score": float(rollout_score),
                         "gt_rollout_score": float(gt_rollout_score),
@@ -1888,7 +2238,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 eval_projection_randomization_enabled = bool(
                     (str(attack_mode).lower() == "projection") and projection_randomization_enabled
                 )
-                val_stats, visual_frames, val_video_episode = self._evaluate_online_rollout(
+                val_stats, visual_frames, val_video_episodes = self._evaluate_online_rollout(
                     task_suite=task_suite,
                     get_libero_env=get_libero_env,
                     get_libero_image=get_libero_image,
@@ -1913,6 +2263,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     impulse_rollout_metric_enabled=impulse_rollout_metric_enabled,
                     window_rollout_probe_enabled=window_rollout_probe_enabled,
                     window_rollout_metric_mode=window_rollout_metric_mode,
+                    window_rollout_future_mode=window_rollout_future_mode,
                     window_rollout_exp_base=window_rollout_exp_base,
                     window_rollout_future_horizon=window_rollout_future_horizon,
                     window_rollout_phase_scope=window_rollout_phase_scope,
@@ -1994,6 +2345,12 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 self.val_window_rollout_adv_gt_action_gap.append(
                     val_stats["VAL_online_window_rollout_adv_gt_action_gap"]
                 )
+                self.val_window_rollout_deattack_gt_action_gap.append(
+                    val_stats["VAL_online_window_rollout_deattack_gt_action_gap"]
+                )
+                self.val_window_rollout_selected_gt_action_gap.append(
+                    val_stats["VAL_online_window_rollout_selected_gt_action_gap"]
+                )
                 self.val_window_rollout_delta_weighted.append(val_stats["VAL_online_window_rollout_delta_weighted"])
                 self.val_window_rollout_delta_weighted_loss.append(
                     val_stats["VAL_online_window_rollout_delta_weighted_loss"]
@@ -2010,15 +2367,16 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 if args is not None and args.wandb_project != "false" and wandb is not None:
                     wandb.log(val_stats, step=i)
 
-                if should_record_val_video and (val_video_episode is not None):
-                    self._dump_online_episode_video(
-                        episode=val_video_episode,
-                        iter_idx=i,
-                        phase_id=phase_id,
-                        split="val",
-                        frame_source=record_online_video_frame_source,
-                        fps=record_online_video_fps,
-                    )
+                if should_record_val_video:
+                    for val_video_episode in val_video_episodes:
+                        self._dump_online_episode_video(
+                            episode=val_video_episode,
+                            iter_idx=i,
+                            phase_id=phase_id,
+                            split="val",
+                            frame_source=record_online_video_frame_source,
+                            fps=record_online_video_fps,
+                        )
                 if probe_mode:
                     self._append_probe_metrics_row(
                         {
@@ -2053,6 +2411,12 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                             "window_rollout_adv_gt_action_gap": float(
                                 val_stats["VAL_online_window_rollout_adv_gt_action_gap"]
                             ),
+                            "window_rollout_deattack_gt_action_gap": float(
+                                val_stats["VAL_online_window_rollout_deattack_gt_action_gap"]
+                            ),
+                            "window_rollout_selected_gt_action_gap": float(
+                                val_stats["VAL_online_window_rollout_selected_gt_action_gap"]
+                            ),
                             "window_rollout_delta_weighted": float(
                                 val_stats["VAL_online_window_rollout_delta_weighted"]
                             ),
@@ -2067,6 +2431,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                             "window_end_step": float(val_stats["VAL_online_window_end_step"]),
                             "lambda_window_rollout_loss": float(lambda_window_rollout_loss),
                             "window_rollout_metric_mode": str(window_rollout_metric_mode),
+                            "window_rollout_future_mode": str(window_rollout_future_mode),
                             "window_rollout_metric_value": float(
                                 val_stats["VAL_online_window_rollout_metric_value"]
                             ),
@@ -2113,6 +2478,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                                 "impulse_rollout_metric_enabled": int(impulse_rollout_metric_enabled),
                                 "window_rollout_probe_enabled": int(window_rollout_probe_enabled),
                                 "window_rollout_metric_mode": str(window_rollout_metric_mode),
+                                "window_rollout_future_mode": str(window_rollout_future_mode),
                                 "window_rollout_exp_base": float(window_rollout_exp_base),
                                 "window_rollout_future_horizon": int(window_rollout_future_horizon),
                                 "window_rollout_phase_scope": str(window_rollout_phase_scope),
@@ -2145,6 +2511,12 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                                 ),
                                 "final_val_window_rollout_adv_gt_action_gap": float(
                                     val_stats["VAL_online_window_rollout_adv_gt_action_gap"]
+                                ),
+                                "final_val_window_rollout_deattack_gt_action_gap": float(
+                                    val_stats["VAL_online_window_rollout_deattack_gt_action_gap"]
+                                ),
+                                "final_val_window_rollout_selected_gt_action_gap": float(
+                                    val_stats["VAL_online_window_rollout_selected_gt_action_gap"]
                                 ),
                                 "final_val_window_rollout_delta_weighted": float(
                                     val_stats["VAL_online_window_rollout_delta_weighted"]
@@ -2185,6 +2557,17 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                         projector_gain=current_projector_gain_value,
                         projector_channel_gain=current_projector_channel_gain_values,
                     )
+                    self._save_resume_checkpoint(
+                        output_dir=temp_save_dir,
+                        projection_texture=projection_texture,
+                        photometric_params=photometric_params,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        global_iter_completed=i,
+                        config=current_resume_config,
+                        train_phase_start_counter=train_phase_start_counter,
+                        gpu_tuner_state=gpu_tuner_state,
+                    )
 
                 temp_save_dir = os.path.join(self.save_dir, "last")
                 os.makedirs(temp_save_dir, exist_ok=True)
@@ -2194,6 +2577,17 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     output_dir=temp_save_dir,
                     projector_gain=current_projector_gain_value,
                     projector_channel_gain=current_projector_channel_gain_values,
+                )
+                self._save_resume_checkpoint(
+                    output_dir=temp_save_dir,
+                    projection_texture=projection_texture,
+                    photometric_params=photometric_params,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    global_iter_completed=i,
+                    config=current_resume_config,
+                    train_phase_start_counter=train_phase_start_counter,
+                    gpu_tuner_state=gpu_tuner_state,
                 )
 
                 if viz_enabled:
@@ -2220,7 +2614,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
 
                 self.save_online_info(self.save_dir)
                 torch.cuda.empty_cache()
-            elif (not eval_enabled) and (i == num_iter - 1):
+            elif (not eval_enabled) and eval_due_to_interval:
                 temp_save_dir = os.path.join(self.save_dir, "last")
                 os.makedirs(temp_save_dir, exist_ok=True)
                 torch.save(projection_texture.detach().cpu(), os.path.join(temp_save_dir, "projection_texture.pt"))
@@ -2230,6 +2624,17 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     output_dir=temp_save_dir,
                     projector_gain=float(final_projector_gain.detach().cpu().item()),
                     projector_channel_gain=[float(v) for v in final_projector_channel_gain.detach().cpu().tolist()],
+                )
+                self._save_resume_checkpoint(
+                    output_dir=temp_save_dir,
+                    projection_texture=projection_texture,
+                    photometric_params=photometric_params,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    global_iter_completed=i,
+                    config=current_resume_config,
+                    train_phase_start_counter=train_phase_start_counter,
+                    gpu_tuner_state=gpu_tuner_state,
                 )
                 self.save_online_info(self.save_dir)
                 torch.cuda.empty_cache()
@@ -2260,6 +2665,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         impulse_rollout_metric_enabled,
         window_rollout_probe_enabled,
         window_rollout_metric_mode,
+        window_rollout_future_mode,
         window_rollout_exp_base,
         window_rollout_future_horizon,
         window_rollout_phase_scope,
@@ -2315,6 +2721,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         total_impulse_rollout_area = 0.0
         total_window_rollout_clean_gt_action_gap = 0.0
         total_window_rollout_adv_gt_action_gap = 0.0
+        total_window_rollout_deattack_gt_action_gap = 0.0
+        total_window_rollout_selected_gt_action_gap = 0.0
         total_window_rollout_delta_weighted = 0.0
         total_window_rollout_delta_weighted_loss = 0.0
         total_window_rollout_future_steps = 0.0
@@ -2331,7 +2739,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         total_per_joint = None
         total_gt_per_joint = None
         visual_frames = []
-        video_episode = None
+        video_episodes = []
         total_eval_cases = 0
         window_phase_name = ""
 
@@ -2406,6 +2814,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                             lambda_window_rollout_loss=lambda_window_rollout_loss,
                             impulse_rollout_metric_enabled=impulse_rollout_metric_enabled,
                             window_rollout_probe_enabled=bool(episode_window_rollout_spec is not None),
+                            window_rollout_metric_mode=window_rollout_metric_mode,
+                            window_rollout_future_mode=window_rollout_future_mode,
                             window_rollout_spec=episode_window_rollout_spec,
                             lambda_siglip=lambda_siglip,
                             siglip_model=siglip_model,
@@ -2441,7 +2851,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                             deterministic_episode_seed=episode_seed,
                             disable_lighting=bool(val_disable_lighting),
                             task_id=task_id,
-                            record_video_frames=bool(record_video_frames and (video_episode is None)),
+                            record_video_frames=bool(record_video_frames),
                             video_frame_source=video_frame_source,
                             action_gap_mode=action_gap_mode,
                             start_phase_name=phase_name if window_rollout_probe_enabled else "initial",
@@ -2450,6 +2860,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                         if episode is None:
                             continue
 
+                        episode["episode_idx"] = int(ep_idx)
+                        episode["init_state_idx"] = int(init_state_idx)
                         total_eval_cases += 1
                         total_action_gap += episode["action_gap"]
                         total_gt_action_gap += episode["gt_action_gap"]
@@ -2464,6 +2876,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                         total_impulse_rollout_area += episode["impulse_rollout_area"]
                         total_window_rollout_clean_gt_action_gap += episode["window_rollout_clean_gt_action_gap"]
                         total_window_rollout_adv_gt_action_gap += episode["window_rollout_adv_gt_action_gap"]
+                        total_window_rollout_deattack_gt_action_gap += episode["window_rollout_deattack_gt_action_gap"]
+                        total_window_rollout_selected_gt_action_gap += episode["window_rollout_selected_gt_action_gap"]
                         total_window_rollout_delta_weighted += episode["window_rollout_delta_weighted"]
                         total_window_rollout_delta_weighted_loss += episode["window_rollout_delta_weighted_loss"]
                         total_window_rollout_future_steps += float(episode["window_rollout_future_steps"])
@@ -2482,8 +2896,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                         window_phase_name = str(episode.get("window_phase_name", window_phase_name or phase_name))
                         if len(visual_frames) == 0 and len(episode["visual_frames"]) > 0:
                             visual_frames = episode["visual_frames"][: max(1, int(viz_samples))]
-                        if bool(record_video_frames) and (video_episode is None) and self._should_dump_online_episode_video(episode):
-                            video_episode = episode
+                        if bool(record_video_frames) and self._should_dump_online_episode_video(episode):
+                            video_episodes.append(episode)
                     finally:
                         if hasattr(env, "close"):
                             env.close()
@@ -2502,12 +2916,14 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         avg_impulse_rollout_area = total_impulse_rollout_area / divisor
         avg_window_rollout_clean_gt_action_gap = total_window_rollout_clean_gt_action_gap / divisor
         avg_window_rollout_adv_gt_action_gap = total_window_rollout_adv_gt_action_gap / divisor
+        avg_window_rollout_deattack_gt_action_gap = total_window_rollout_deattack_gt_action_gap / divisor
+        avg_window_rollout_selected_gt_action_gap = total_window_rollout_selected_gt_action_gap / divisor
         avg_window_rollout_delta_weighted = total_window_rollout_delta_weighted / divisor
         avg_window_rollout_delta_weighted_loss = total_window_rollout_delta_weighted_loss / divisor
         avg_window_rollout_metric_value = select_window_rollout_metric_value(
             metric_mode=window_rollout_metric_mode,
             delta_weighted=avg_window_rollout_delta_weighted,
-            adv_gt_action_gap=avg_window_rollout_adv_gt_action_gap,
+            adv_gt_action_gap=avg_window_rollout_selected_gt_action_gap,
         )
         avg_window_rollout_future_steps = total_window_rollout_future_steps / divisor
         avg_window_start_step = total_window_start_step / divisor
@@ -2593,9 +3009,12 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             "VAL_online_impulse_rollout_area": avg_impulse_rollout_area,
             "VAL_online_window_rollout_clean_gt_action_gap": avg_window_rollout_clean_gt_action_gap,
             "VAL_online_window_rollout_adv_gt_action_gap": avg_window_rollout_adv_gt_action_gap,
+            "VAL_online_window_rollout_deattack_gt_action_gap": avg_window_rollout_deattack_gt_action_gap,
+            "VAL_online_window_rollout_selected_gt_action_gap": avg_window_rollout_selected_gt_action_gap,
             "VAL_online_window_rollout_delta_weighted": avg_window_rollout_delta_weighted,
             "VAL_online_window_rollout_delta_weighted_loss": avg_window_rollout_delta_weighted_loss,
             "VAL_online_window_rollout_metric_mode": str(window_rollout_metric_mode),
+            "VAL_online_window_rollout_future_mode": str(window_rollout_future_mode),
             "VAL_online_window_rollout_metric_value": avg_window_rollout_metric_value,
             "VAL_online_window_rollout_future_steps": avg_window_rollout_future_steps,
             "VAL_online_window_rollout_probe_enabled": int(window_rollout_probe_enabled),
@@ -2626,7 +3045,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             stats[f"VAL_online_rollout_action_gap_joint_{joint_idx}"] = float(joint_gap_value)
         for joint_idx, joint_gap_value in enumerate(avg_gt_per_joint.detach().cpu().tolist()):
             stats[f"VAL_online_gt_action_gap_joint_{joint_idx}"] = float(joint_gap_value)
-        return stats, visual_frames, video_episode
+        return stats, visual_frames, video_episodes
 
     @staticmethod
     def _clone_init_state(init_state):
@@ -2785,6 +3204,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         gt_softmin_tau=0.05,
         window_rollout_probe_enabled=False,
         window_rollout_metric_mode="delta_weighted",
+        window_rollout_future_mode="keep_adv",
         window_rollout_spec=None,
         learnable_projector_params=None,
         init_state_idx=None,
@@ -2799,7 +3219,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         lambda_window_rollout_loss = float(lambda_window_rollout_loss)
         impulse_enabled = bool(impulse_rollout_metric_enabled)
         window_rollout_metric_mode = normalize_window_rollout_metric_mode(window_rollout_metric_mode)
+        window_rollout_future_mode = normalize_window_rollout_future_mode(window_rollout_future_mode)
         window_rollout_enabled = bool(window_rollout_probe_enabled) and isinstance(window_rollout_spec, dict)
+        deattack_future_enabled = window_rollout_enabled and (window_rollout_future_mode == "drop_attack_after_window")
         need_aux_clean_branch = continuous_enabled or impulse_enabled or window_rollout_enabled
         need_any_gt_rollout = (
             (action_gap_mode == "gt_farthest") or continuous_enabled or impulse_enabled or window_rollout_enabled
@@ -2823,6 +3245,11 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         impulse_branch_active = False
         impulse_branch_rollout_input_ids = None
 
+        deattack_branch_env = None
+        deattack_branch_obs = None
+        deattack_branch_active = False
+        deattack_branch_rollout_input_ids = None
+
         try:
             if need_aux_clean_branch:
                 clean_branch_env, _ = get_libero_env(task, "openvla", resolution=max(64, int(env_resolution)))
@@ -2842,6 +3269,15 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     effective_num_steps_wait=effective_num_steps_wait,
                 )
                 impulse_branch_active = True
+            if deattack_future_enabled:
+                deattack_branch_env, _ = get_libero_env(task, "openvla", resolution=max(64, int(env_resolution)))
+                deattack_branch_obs = self._initialize_online_rollout_env(
+                    env=deattack_branch_env,
+                    init_state=init_state,
+                    get_libero_dummy_action=get_libero_dummy_action,
+                    effective_num_steps_wait=effective_num_steps_wait,
+                )
+                deattack_branch_active = True
 
             labels_full, attention_mask, input_ids = self._build_prompt_tensors(
                 task_description=task_description,
@@ -2858,6 +3294,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 clean_branch_rollout_input_ids = input_ids.clone()
             if impulse_enabled:
                 impulse_branch_rollout_input_ids = input_ids.clone()
+            if deattack_future_enabled:
+                deattack_branch_rollout_input_ids = input_ids.clone()
 
             total_loss = torch.zeros((), device=self.vla.device, dtype=torch.float32)
             episode_weight_sum = 0.0
@@ -2911,6 +3349,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             window_exp_base = float(window_rollout_spec.get("exp_base", 0.9)) if window_rollout_enabled else 0.9
             total_window_rollout_clean_gt_gap = 0.0
             total_window_rollout_adv_gt_gap = 0.0
+            total_window_rollout_deattack_gt_gap = 0.0
+            total_window_rollout_selected_gt_gap = 0.0
             total_window_rollout_delta_weighted = 0.0
             total_window_rollout_delta_weighted_loss = 0.0
             total_window_rollout_terms = 0
@@ -3248,6 +3688,53 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                             episode_lighting_map_idx=episode_lighting_map_idx,
                         )
 
+                deattack_branch_pred_tokens = None
+                deattack_branch_gt_loss = zero.detach()
+                deattack_branch_gt_metric = zero.detach()
+                if deattack_branch_active:
+                    if step_idx < window_step_count:
+                        deattack_branch_pred_tokens = adv_pred_tokens.detach()
+                    elif step_idx == 0:
+                        deattack_branch_pred_tokens = clean_pred_tokens.detach()
+                        if gt_candidate_actions is not None:
+                            deattack_branch_gt_loss, deattack_branch_gt_metric, _, _ = self._compute_gt_action_gap_losses(
+                                adv_logits=output_clean.logits,
+                                labels_full=labels_full,
+                                action_mask_full=action_mask_full,
+                                gt_candidate_actions=gt_candidate_actions,
+                                maskidx=maskidx,
+                                use_all_joints=use_all_joints,
+                                gripper_weight=gripper_weight,
+                                gt_softmin_tau=gt_softmin_tau,
+                            )
+                            deattack_branch_gt_loss = deattack_branch_gt_loss.detach()
+                    else:
+                        (
+                            deattack_branch_pred_tokens,
+                            deattack_branch_gt_loss,
+                            deattack_branch_gt_metric,
+                            _,
+                        ) = self._forward_clean_branch_gt_step(
+                            obs=deattack_branch_obs,
+                            rollout_input_ids=deattack_branch_rollout_input_ids,
+                            get_libero_image=get_libero_image,
+                            attention_mask=attention_mask,
+                            labels_full=labels_full,
+                            action_mask_full=action_mask_full,
+                            gt_candidate_actions=gt_candidate_actions,
+                            maskidx=maskidx,
+                            use_all_joints=use_all_joints,
+                            gripper_weight=gripper_weight,
+                            gt_softmin_tau=gt_softmin_tau,
+                            split=split,
+                            global_iter=global_iter,
+                            max_steps=max_steps,
+                            step_idx=step_idx,
+                            step_seed=step_seed,
+                            disable_lighting=disable_lighting,
+                            episode_lighting_map_idx=episode_lighting_map_idx,
+                        )
+
                 active_step_action_gap_loss = (
                     step_gt_action_gap_loss if action_gap_mode == "gt_farthest" else step_action_gap_loss
                 )
@@ -3263,27 +3750,40 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 if window_rollout_enabled and clean_branch_active and (step_idx >= window_step_count):
                     future_step_idx = int(step_idx - window_step_count)
                     if future_step_idx < window_future_steps:
-                        step_window_delta = step_gt_action_gap_metric - clean_branch_gt_metric
-                        step_window_delta_loss = step_gt_action_gap_loss - clean_branch_gt_loss.detach()
+                        selected_gt_metric = step_gt_action_gap_metric
+                        selected_gt_loss = step_gt_action_gap_loss
+                        selected_branch_ready = True
+                        if deattack_future_enabled:
+                            selected_branch_ready = deattack_branch_pred_tokens is not None
+                            selected_gt_metric = deattack_branch_gt_metric
+                            selected_gt_loss = deattack_branch_gt_loss
+                        if not selected_branch_ready:
+                            selected_gt_metric = zero.detach()
+                            selected_gt_loss = zero.detach()
+                        step_window_delta = selected_gt_metric - clean_branch_gt_metric
+                        step_window_delta_loss = selected_gt_loss - clean_branch_gt_loss.detach()
                         if window_rollout_metric_mode == "adv_gt":
-                            step_window_metric_loss = step_gt_action_gap_loss
+                            step_window_metric_loss = selected_gt_loss
                         else:
                             step_window_metric_loss = step_window_delta_loss
                         step_window_weight = compute_window_rollout_weight(
                             future_step_idx=future_step_idx,
                             exp_base=window_exp_base,
                         )
-                        total_window_rollout_adv_gt_gap += float(step_gt_action_gap_metric.item())
-                        total_window_rollout_clean_gt_gap += float(clean_branch_gt_metric.item())
-                        total_window_rollout_delta_weighted += float(step_window_delta.item()) * float(step_window_weight)
-                        total_window_rollout_delta_weighted_loss += float(step_window_delta_loss.detach().item()) * float(
-                            step_window_weight
-                        )
-                        if lambda_window_rollout_loss != 0.0:
-                            step_loss = step_loss - (
-                                float(lambda_window_rollout_loss) * float(step_window_weight) * step_window_metric_loss
-                            )
-                        total_window_rollout_terms += 1
+                        if selected_branch_ready:
+                            total_window_rollout_adv_gt_gap += float(step_gt_action_gap_metric.item())
+                            total_window_rollout_clean_gt_gap += float(clean_branch_gt_metric.item())
+                            total_window_rollout_deattack_gt_gap += float(deattack_branch_gt_metric.item())
+                            total_window_rollout_selected_gt_gap += float(selected_gt_metric.item())
+                            total_window_rollout_delta_weighted += float(step_window_delta.item()) * float(step_window_weight)
+                            total_window_rollout_delta_weighted_loss += float(
+                                step_window_delta_loss.detach().item()
+                            ) * float(step_window_weight)
+                            if lambda_window_rollout_loss != 0.0:
+                                step_loss = step_loss - (
+                                    float(lambda_window_rollout_loss) * float(step_window_weight) * step_window_metric_loss
+                                )
+                            total_window_rollout_terms += 1
                 if need_history:
                     step_loss = step_loss - (lambda_history * step_history_div)
                     step_loss = step_loss - (lambda_history_legacy * step_history_div_legacy)
@@ -3344,6 +3844,16 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                         action_stats=action_stats,
                     )
                     impulse_branch_active = not impulse_branch_done
+                if deattack_branch_active and (deattack_branch_pred_tokens is not None):
+                    deattack_branch_obs, deattack_branch_done, deattack_branch_rollout_input_ids = self._step_rollout_branch_env(
+                        env=deattack_branch_env,
+                        obs=deattack_branch_obs,
+                        rollout_input_ids=deattack_branch_rollout_input_ids,
+                        pred_action_tokens=deattack_branch_pred_tokens,
+                        action_mask_full=action_mask_full,
+                        action_stats=action_stats,
+                    )
+                    deattack_branch_active = not deattack_branch_done
 
                 if impulse_enabled and (step_idx >= 1) and clean_branch_pred_tokens is not None and (impulse_branch_pred_tokens is not None):
                     impulse_step_area = torch.clamp(impulse_branch_gt_metric - clean_branch_gt_metric, min=0.0)
@@ -3451,10 +3961,20 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 if total_window_rollout_terms > 0
                 else 0.0
             )
+            avg_window_rollout_deattack_gt_action_gap = (
+                total_window_rollout_deattack_gt_gap / float(max(1, total_window_rollout_terms))
+                if total_window_rollout_terms > 0
+                else 0.0
+            )
+            avg_window_rollout_selected_gt_action_gap = (
+                total_window_rollout_selected_gt_gap / float(max(1, total_window_rollout_terms))
+                if total_window_rollout_terms > 0
+                else 0.0
+            )
             window_rollout_metric_value = select_window_rollout_metric_value(
                 metric_mode=window_rollout_metric_mode,
                 delta_weighted=float(total_window_rollout_delta_weighted),
-                adv_gt_action_gap=avg_window_rollout_adv_gt_action_gap,
+                adv_gt_action_gap=avg_window_rollout_selected_gt_action_gap,
             )
             return {
                 "loss": total_loss if need_backward else total_loss.detach(),
@@ -3487,9 +4007,16 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 "window_rollout_adv_gt_action_gap": (
                     avg_window_rollout_adv_gt_action_gap
                 ),
+                "window_rollout_deattack_gt_action_gap": (
+                    avg_window_rollout_deattack_gt_action_gap
+                ),
+                "window_rollout_selected_gt_action_gap": (
+                    avg_window_rollout_selected_gt_action_gap
+                ),
                 "window_rollout_delta_weighted": float(total_window_rollout_delta_weighted),
                 "window_rollout_delta_weighted_loss": float(total_window_rollout_delta_weighted_loss),
                 "window_rollout_metric_mode": str(window_rollout_metric_mode),
+                "window_rollout_future_mode": str(window_rollout_future_mode),
                 "window_rollout_metric_value": float(window_rollout_metric_value),
                 "window_rollout_future_steps": int(total_window_rollout_terms),
                 "action_terms": total_action_terms,
@@ -3525,7 +4052,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 else 0.0,
             }
         finally:
-            for branch_env in (clean_branch_env, impulse_branch_env):
+            for branch_env in (clean_branch_env, impulse_branch_env, deattack_branch_env):
                 if (branch_env is not None) and hasattr(branch_env, "close"):
                     branch_env.close()
 
@@ -4016,112 +4543,12 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             )
 
     def save_online_info(self, path):
-        with open(os.path.join(path, "train_online_rollout_action_gap.pkl"), "wb") as file:
-            pickle.dump(self.train_rollout_action_gap, file)
-        with open(os.path.join(path, "train_online_rollout_action_gap_joints.pkl"), "wb") as file:
-            pickle.dump(self.train_rollout_action_gap_joints, file)
-        with open(os.path.join(path, "train_online_gt_rollout_action_gap.pkl"), "wb") as file:
-            pickle.dump(self.train_gt_rollout_action_gap, file)
-        with open(os.path.join(path, "train_online_gt_rollout_action_gap_joints.pkl"), "wb") as file:
-            pickle.dump(self.train_gt_rollout_action_gap_joints, file)
-        with open(os.path.join(path, "train_online_rollout_history_div.pkl"), "wb") as file:
-            pickle.dump(self.train_rollout_history_div, file)
-        with open(os.path.join(path, "train_online_rollout_history_div_legacy.pkl"), "wb") as file:
-            pickle.dump(self.train_rollout_history_div_legacy, file)
-        with open(os.path.join(path, "train_online_siglip_distance.pkl"), "wb") as file:
-            pickle.dump(self.train_rollout_siglip_distance, file)
-        with open(os.path.join(path, "train_online_rollout_score.pkl"), "wb") as file:
-            pickle.dump(self.train_rollout_score, file)
-        with open(os.path.join(path, "train_online_objective_score.pkl"), "wb") as file:
-            pickle.dump(self.train_rollout_objective_score, file)
-        with open(os.path.join(path, "train_online_gt_rollout_score.pkl"), "wb") as file:
-            pickle.dump(self.train_gt_rollout_score, file)
-        with open(os.path.join(path, "train_online_gt_objective_score.pkl"), "wb") as file:
-            pickle.dump(self.train_gt_rollout_objective_score, file)
-        with open(os.path.join(path, "train_online_continuous_clean_gt_action_gap.pkl"), "wb") as file:
-            pickle.dump(self.train_continuous_clean_gt_action_gap, file)
-        with open(os.path.join(path, "train_online_continuous_adv_gt_action_gap.pkl"), "wb") as file:
-            pickle.dump(self.train_continuous_adv_gt_action_gap, file)
-        with open(os.path.join(path, "train_online_continuous_rollout_delta.pkl"), "wb") as file:
-            pickle.dump(self.train_continuous_rollout_delta, file)
-        with open(os.path.join(path, "train_online_impulse_rollout_area.pkl"), "wb") as file:
-            pickle.dump(self.train_impulse_rollout_area, file)
-        with open(os.path.join(path, "train_online_window_rollout_clean_gt_action_gap.pkl"), "wb") as file:
-            pickle.dump(self.train_window_rollout_clean_gt_action_gap, file)
-        with open(os.path.join(path, "train_online_window_rollout_adv_gt_action_gap.pkl"), "wb") as file:
-            pickle.dump(self.train_window_rollout_adv_gt_action_gap, file)
-        with open(os.path.join(path, "train_online_window_rollout_delta_weighted.pkl"), "wb") as file:
-            pickle.dump(self.train_window_rollout_delta_weighted, file)
-        with open(os.path.join(path, "train_online_window_rollout_delta_weighted_loss.pkl"), "wb") as file:
-            pickle.dump(self.train_window_rollout_delta_weighted_loss, file)
-        with open(os.path.join(path, "train_online_total_rollout_score.pkl"), "wb") as file:
-            pickle.dump(self.train_total_rollout_score, file)
-        with open(os.path.join(path, "train_online_total_objective_score.pkl"), "wb") as file:
-            pickle.dump(self.train_total_objective_score, file)
-        with open(os.path.join(path, "train_online_active_rollout_action_gap.pkl"), "wb") as file:
-            pickle.dump(self.train_active_rollout_action_gap, file)
-        with open(os.path.join(path, "train_online_active_rollout_score.pkl"), "wb") as file:
-            pickle.dump(self.train_active_rollout_score, file)
-        with open(os.path.join(path, "train_online_active_objective_score.pkl"), "wb") as file:
-            pickle.dump(self.train_active_rollout_objective_score, file)
-        with open(os.path.join(path, "train_online_phase_id.pkl"), "wb") as file:
-            pickle.dump(self.train_phase_id, file)
-        with open(os.path.join(path, "train_online_done_rate.pkl"), "wb") as file:
-            pickle.dump(self.train_online_done_rate, file)
-        with open(os.path.join(path, "train_online_episode_len.pkl"), "wb") as file:
-            pickle.dump(self.train_online_episode_len, file)
-        with open(os.path.join(path, "val_online_rollout_action_gap.pkl"), "wb") as file:
-            pickle.dump(self.val_rollout_action_gap, file)
-        with open(os.path.join(path, "val_online_rollout_action_gap_joints.pkl"), "wb") as file:
-            pickle.dump(self.val_rollout_action_gap_joints, file)
-        with open(os.path.join(path, "val_online_gt_rollout_action_gap.pkl"), "wb") as file:
-            pickle.dump(self.val_gt_rollout_action_gap, file)
-        with open(os.path.join(path, "val_online_gt_rollout_action_gap_joints.pkl"), "wb") as file:
-            pickle.dump(self.val_gt_rollout_action_gap_joints, file)
-        with open(os.path.join(path, "val_online_rollout_history_div.pkl"), "wb") as file:
-            pickle.dump(self.val_rollout_history_div, file)
-        with open(os.path.join(path, "val_online_rollout_history_div_legacy.pkl"), "wb") as file:
-            pickle.dump(self.val_rollout_history_div_legacy, file)
-        with open(os.path.join(path, "val_online_siglip_distance.pkl"), "wb") as file:
-            pickle.dump(self.val_rollout_siglip_distance, file)
-        with open(os.path.join(path, "val_online_rollout_score.pkl"), "wb") as file:
-            pickle.dump(self.val_rollout_score, file)
-        with open(os.path.join(path, "val_online_objective_score.pkl"), "wb") as file:
-            pickle.dump(self.val_rollout_objective_score, file)
-        with open(os.path.join(path, "val_online_gt_rollout_score.pkl"), "wb") as file:
-            pickle.dump(self.val_gt_rollout_score, file)
-        with open(os.path.join(path, "val_online_gt_objective_score.pkl"), "wb") as file:
-            pickle.dump(self.val_gt_rollout_objective_score, file)
-        with open(os.path.join(path, "val_online_continuous_clean_gt_action_gap.pkl"), "wb") as file:
-            pickle.dump(self.val_continuous_clean_gt_action_gap, file)
-        with open(os.path.join(path, "val_online_continuous_adv_gt_action_gap.pkl"), "wb") as file:
-            pickle.dump(self.val_continuous_adv_gt_action_gap, file)
-        with open(os.path.join(path, "val_online_continuous_rollout_delta.pkl"), "wb") as file:
-            pickle.dump(self.val_continuous_rollout_delta, file)
-        with open(os.path.join(path, "val_online_impulse_rollout_area.pkl"), "wb") as file:
-            pickle.dump(self.val_impulse_rollout_area, file)
-        with open(os.path.join(path, "val_online_window_rollout_clean_gt_action_gap.pkl"), "wb") as file:
-            pickle.dump(self.val_window_rollout_clean_gt_action_gap, file)
-        with open(os.path.join(path, "val_online_window_rollout_adv_gt_action_gap.pkl"), "wb") as file:
-            pickle.dump(self.val_window_rollout_adv_gt_action_gap, file)
-        with open(os.path.join(path, "val_online_window_rollout_delta_weighted.pkl"), "wb") as file:
-            pickle.dump(self.val_window_rollout_delta_weighted, file)
-        with open(os.path.join(path, "val_online_window_rollout_delta_weighted_loss.pkl"), "wb") as file:
-            pickle.dump(self.val_window_rollout_delta_weighted_loss, file)
-        with open(os.path.join(path, "val_online_total_rollout_score.pkl"), "wb") as file:
-            pickle.dump(self.val_total_rollout_score, file)
-        with open(os.path.join(path, "val_online_total_objective_score.pkl"), "wb") as file:
-            pickle.dump(self.val_total_objective_score, file)
-        with open(os.path.join(path, "val_online_active_rollout_action_gap.pkl"), "wb") as file:
-            pickle.dump(self.val_active_rollout_action_gap, file)
-        with open(os.path.join(path, "val_online_active_rollout_score.pkl"), "wb") as file:
-            pickle.dump(self.val_active_rollout_score, file)
-        with open(os.path.join(path, "val_online_active_objective_score.pkl"), "wb") as file:
-            pickle.dump(self.val_active_rollout_objective_score, file)
-        with open(os.path.join(path, "val_online_rollout_score_legacy.pkl"), "wb") as file:
-            pickle.dump(self.val_rollout_score_legacy, file)
-        with open(os.path.join(path, "val_online_done_rate.pkl"), "wb") as file:
-            pickle.dump(self.val_online_done_rate, file)
-        with open(os.path.join(path, "val_online_episode_len.pkl"), "wb") as file:
-            pickle.dump(self.val_online_episode_len, file)
+        for attr_name, filename in self._history_metric_file_map():
+            filepath = os.path.join(path, filename)
+            value = getattr(self, attr_name)
+            with open(filepath, "wb") as file:
+                if filename == "loss":
+                    torch.save(value, file)
+                else:
+                    pickle.dump(value, file)
         self._write_run_metadata()

@@ -47,17 +47,38 @@ def test_wrapper_defaults_enable_gt_farthest_phase_cycle_for_libero_10():
     assert defaults["--dataset"] == "libero_10"
     assert defaults["--action_gap_mode"] == "gt_farthest"
     assert defaults["--phase_state_mode"] == "phase_cycle"
+    assert defaults["--window_rollout_future_mode"] == "keep_adv"
 
 
 def test_launch_scripts_default_to_new_dataset_and_modes():
-    expected_snippets = (
-        '--dataset "${DATASET:-libero_10}"',
-        '--action_gap_mode "${ACTION_GAP_MODE:-gt_farthest}"',
-        '--phase_state_mode "${PHASE_STATE_MODE:-phase_cycle}"',
-    )
+    expected_snippets_by_script = {
+        REPO_ROOT / "scripts" / "run_UADA_rollout_online_env.sh": (
+            'DATASET_NAME="${DATASET:-libero_spatial}"',
+            'ONLINE_CE_MODE_NAME="${ONLINE_CE_MODE:-off}"',
+            'LAMBDA_SIGLIP="${LAMBDA_SIGLIP:-1.0}"',
+            'WINDOW_ROLLOUT_FUTURE_MODE_VALUE="${WINDOW_ROLLOUT_FUTURE_MODE:-drop_attack_after_window}"',
+            '--action_gap_mode "${ACTION_GAP_MODE:-gt_farthest}"',
+            '--phase_state_mode "${PHASE_STATE_MODE:-contact_manipulate_only}"',
+        ),
+        REPO_ROOT / "scripts" / "run_UADA_rollout_online_env_probe.sh": (
+            'DATASET_NAME="${DATASET:-libero_spatial}"',
+            'ACTION_GAP_MODE_NAME="${ACTION_GAP_MODE:-clean_adv}"',
+            'PHASE_STATE_MODE_NAME="${PHASE_STATE_MODE:-initial_only}"',
+        ),
+        REPO_ROOT / "scripts" / "run_UADA_rollout_online_env_probe_round2.sh": (
+            '--dataset "${DATASET:-libero_10}"',
+            '--action_gap_mode "${ACTION_GAP_MODE:-gt_farthest}"',
+            '--phase_state_mode "${PHASE_STATE_MODE:-phase_cycle}"',
+        ),
+        REPO_ROOT / "scripts" / "run_UADA_rollout_online_env_probe_siglip.sh": (
+            'DATASET_NAME="${DATASET:-libero_spatial}"',
+            'ACTION_GAP_MODE_NAME="${ACTION_GAP_MODE:-clean_adv}"',
+            'PHASE_STATE_MODE_NAME="${PHASE_STATE_MODE:-initial_only}"',
+        ),
+    }
     for script_path in SCRIPT_PATHS:
         contents = script_path.read_text(encoding="utf-8")
-        for snippet in expected_snippets:
+        for snippet in expected_snippets_by_script[script_path]:
             assert snippet in contents, f"Missing `{snippet}` in {script_path}"
 
 

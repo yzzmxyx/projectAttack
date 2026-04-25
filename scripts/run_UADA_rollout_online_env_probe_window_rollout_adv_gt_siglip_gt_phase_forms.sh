@@ -3,36 +3,38 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 current_dir="$(cd "${SCRIPT_DIR}/.." && pwd)"
-PROBE_ROOT_NAME="${PROBE_ROOT_NAME:-UADA_rollout_online_env_probe_window_rollout_adv_gt}"
-PROBE_RUN_TAG="${PROBE_RUN_TAG:-UADA_rollout_online_env_probe_window_rollout_adv_gt}"
-PROBE_FINISH_LABEL="${PROBE_FINISH_LABEL:-Window rollout adv-gt probe finished}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 
-PROBE_ID="$(python3.10 - <<'PY'
+if ! "${PYTHON_BIN}" -V >/dev/null 2>&1; then
+    echo "Python interpreter not runnable: ${PYTHON_BIN}" >&2
+    exit 1
+fi
+
+PROBE_ID="$("${PYTHON_BIN}" - <<'PY'
 import uuid
 print(uuid.uuid4())
 PY
 )"
-PROBE_ROOT="${current_dir}/run/${PROBE_ROOT_NAME}/${PROBE_ID}"
+PROBE_ROOT="${current_dir}/run/UADA_rollout_online_env_probe_window_rollout_adv_gt_siglip_gt_phase_forms/${PROBE_ID}"
 LOG_DIR="${PROBE_ROOT}/logs"
 SUMMARY_CSV="${PROBE_ROOT}/probe_summary.csv"
 SUMMARY_JSON="${PROBE_ROOT}/probe_summary.json"
 BEST_JSON="${PROBE_ROOT}/best_by_total_score.json"
+BEST_BY_LOSS_FAMILY_JSON="${PROBE_ROOT}/best_by_loss_family.json"
 mkdir -p "${LOG_DIR}"
 
 DATASET_NAME="${DATASET:-libero_spatial}"
-PHASE_STATE_MODE_NAME="${PHASE_STATE_MODE:-phase_cycle}"
 WINDOW_ROLLOUT_FUTURE_HORIZON="${WINDOW_ROLLOUT_FUTURE_HORIZON:-8}"
 WINDOW_ROLLOUT_EXP_BASE="${WINDOW_ROLLOUT_EXP_BASE:-0.9}"
-WINDOW_ROLLOUT_FUTURE_MODE="${WINDOW_ROLLOUT_FUTURE_MODE:-keep_adv}"
+WINDOW_ROLLOUT_FUTURE_MODE="${WINDOW_ROLLOUT_FUTURE_MODE:-drop_attack_after_window}"
 WINDOW_ROLLOUT_PROBE_ENABLED_VALUE="true"
 WINDOW_ROLLOUT_METRIC_MODE_VALUE="adv_gt"
-WINDOW_ROLLOUT_PHASE_SCOPE_VALUE="${WINDOW_ROLLOUT_PHASE_SCOPE:-initial}"
 TASK_SUITE_NAME_VALUE="${TASK_SUITE_NAME:-auto}"
 ONLINE_TRAIN_TASKS_PER_ITER_VALUE="${ONLINE_TRAIN_TASKS_PER_ITER:-1}"
 ONLINE_TRAIN_EPISODES_PER_TASK_VALUE="${ONLINE_TRAIN_EPISODES_PER_TASK:-10}"
 ONLINE_VAL_EPISODES_VALUE="${ONLINE_VAL_EPISODES:-8}"
 MAX_ENV_STEPS_VALUE="${MAX_ENV_STEPS:-auto_by_suite}"
-VAL_MAX_ENV_STEPS_VALUE="${VAL_MAX_ENV_STEPS:-120}"
+VAL_MAX_ENV_STEPS_VALUE="${VAL_MAX_ENV_STEPS:-180}"
 SAVE_INTERVAL_VALUE="${SAVE_INTERVAL:-5}"
 VAL_DETERMINISTIC_VALUE="${VAL_DETERMINISTIC:-true}"
 VAL_SEED_VALUE="${VAL_SEED:-42}"
@@ -42,8 +44,8 @@ PROJECTION_FIXED_ANGLE_VALUE="${PROJECTION_FIXED_ANGLE:-true}"
 PROJECTION_ANGLE_VALUE="${PROJECTION_ANGLE:-0}"
 PROJECTION_ALPHA_JITTER_VALUE="${PROJECTION_ALPHA_JITTER:-0.0}"
 PROJECTION_KEYSTONE_JITTER_VALUE="${PROJECTION_KEYSTONE_JITTER:-0.0}"
-PROJECTION_SCALE_MIN_VALUE="${PROJECTION_SCALE_MIN:-0.35}"
-PROJECTION_SCALE_MAX_VALUE="${PROJECTION_SCALE_MAX:-0.6}"
+PROJECTION_SCALE_MIN_VALUE="${PROJECTION_SCALE_MIN:-0.5}"
+PROJECTION_SCALE_MAX_VALUE="${PROJECTION_SCALE_MAX:-0.5}"
 PROJECTION_SHEAR_VALUE="${PROJECTION_SHEAR:-0.0}"
 PHASE1_DISABLE_PROJECTION_RANDOMIZATION_VALUE="${PHASE1_DISABLE_PROJECTION_RANDOMIZATION:-true}"
 
@@ -51,6 +53,11 @@ LEARN_PROJECTOR_GAIN_VALUE="false"
 LEARN_PROJECTOR_CHANNEL_GAIN_VALUE="false"
 
 echo "Probe root: ${PROBE_ROOT}"
+echo "  python_bin=$("${PYTHON_BIN}" - <<'PY'
+import sys
+print(sys.executable)
+PY
+)"
 echo "Alignment snapshot:"
 echo "  dataset=${DATASET_NAME}"
 echo "  task_suite_name=${TASK_SUITE_NAME_VALUE}"
@@ -60,7 +67,6 @@ echo "  online_val_episodes=${ONLINE_VAL_EPISODES_VALUE}"
 echo "  max_env_steps=${MAX_ENV_STEPS_VALUE}"
 echo "  val_max_env_steps=${VAL_MAX_ENV_STEPS_VALUE}"
 echo "  save_interval=${SAVE_INTERVAL_VALUE}"
-echo "  phase_state_mode=${PHASE_STATE_MODE_NAME}"
 echo "  val_deterministic=${VAL_DETERMINISTIC_VALUE}"
 echo "  val_seed=${VAL_SEED_VALUE}"
 echo "  env_seed=${ENV_SEED_VALUE}"
@@ -77,29 +83,76 @@ echo "  learn_projector_channel_gain=${LEARN_PROJECTOR_CHANNEL_GAIN_VALUE}"
 echo "  window_rollout_probe_enabled=${WINDOW_ROLLOUT_PROBE_ENABLED_VALUE}"
 echo "  window_rollout_metric_mode=${WINDOW_ROLLOUT_METRIC_MODE_VALUE}"
 echo "  window_rollout_future_mode=${WINDOW_ROLLOUT_FUTURE_MODE}"
-echo "  window_rollout_phase_scope=${WINDOW_ROLLOUT_PHASE_SCOPE_VALUE}"
 echo "  window_rollout_future_horizon=${WINDOW_ROLLOUT_FUTURE_HORIZON}"
 echo "  window_rollout_exp_base=${WINDOW_ROLLOUT_EXP_BASE}"
 
-cat > "${SUMMARY_CSV}" <<'EOF'
-order_idx,variant,exp_id,run_dir,window_rollout_probe_enabled,window_rollout_metric_mode,window_rollout_future_mode,window_phase_name,window_start_step,window_end_step,window_rollout_future_horizon,window_rollout_exp_base,lambda_action_gap,lambda_siglip,lambda_ce,lambda_window_rollout_loss,online_ce_mode,action_gap_mode_active,final_val_gt_action_gap,final_val_siglip_distance,final_val_ce_objective,final_val_window_rollout_metric_value,final_val_window_rollout_delta_weighted,final_val_window_rollout_delta_weighted_loss,final_val_window_rollout_clean_gt_action_gap,final_val_window_rollout_adv_gt_action_gap,final_val_window_rollout_deattack_gt_action_gap,final_val_window_rollout_selected_gt_action_gap,final_val_total_probe_score,final_val_total_rollout_score,final_val_done_rate,final_val_episode_len
-EOF
+"${PYTHON_BIN}" - "${SUMMARY_CSV}" <<'PY'
+import csv
+import sys
+
+summary_csv = sys.argv[1]
+fieldnames = [
+    "order_idx",
+    "loss_family",
+    "form_name",
+    "variant",
+    "phase_state_mode",
+    "window_rollout_phase_scope",
+    "exp_id",
+    "run_dir",
+    "window_rollout_probe_enabled",
+    "window_rollout_metric_mode",
+    "window_rollout_future_mode",
+    "window_phase_name",
+    "window_start_step",
+    "window_end_step",
+    "window_rollout_future_horizon",
+    "window_rollout_exp_base",
+    "lambda_action_gap",
+    "lambda_siglip",
+    "lambda_ce",
+    "lambda_window_rollout_loss",
+    "online_ce_mode",
+    "action_gap_mode_active",
+    "final_val_gt_action_gap",
+    "final_val_siglip_distance",
+    "final_val_ce_objective",
+    "final_val_window_rollout_metric_value",
+    "final_val_window_rollout_delta_weighted",
+    "final_val_window_rollout_delta_weighted_loss",
+    "final_val_window_rollout_clean_gt_action_gap",
+    "final_val_window_rollout_adv_gt_action_gap",
+    "final_val_window_rollout_deattack_gt_action_gap",
+    "final_val_window_rollout_selected_gt_action_gap",
+    "final_val_total_probe_score",
+    "final_val_total_rollout_score",
+    "final_val_done_rate",
+    "final_val_episode_len",
+]
+with open(summary_csv, "w", newline="", encoding="utf-8") as file:
+    writer = csv.DictWriter(file, fieldnames=fieldnames)
+    writer.writeheader()
+PY
 
 run_variant() {
     local order_idx="$1"
-    local variant="$2"
-    local lambda_action_gap="$3"
-    local lambda_siglip="$4"
-    local lambda_ce="$5"
-    local online_ce_mode="$6"
-    local action_gap_mode="$7"
-    local lambda_window_rollout_loss="$8"
+    local loss_family="$2"
+    local form_name="$3"
+    local phase_state_mode="$4"
+    local window_rollout_phase_scope="$5"
+    local variant="$6"
+    local lambda_action_gap="$7"
+    local lambda_siglip="$8"
+    local lambda_ce="$9"
+    local online_ce_mode="${10}"
+    local action_gap_mode="${11}"
+    local lambda_window_rollout_loss="${12}"
 
     local safe_variant
     safe_variant="$(echo "${variant}" | tr '+/' '__')"
     local log_path="${LOG_DIR}/${order_idx}_${safe_variant}.log"
 
-    python3.10 "${current_dir}/VLAAttacker/UADA_rollout_online_env_wrapper.py" \
+    "${PYTHON_BIN}" "${current_dir}/VLAAttacker/UADA_rollout_online_env_wrapper.py" \
         --maskidx 0,1,2 \
         --use_all_joints false \
         --gripper_weight 0.5 \
@@ -110,7 +163,7 @@ run_variant() {
         --accumulate 1 \
         --bs 1 \
         --warmup "${WARMUP:-2}" \
-        --tags "${PROBE_RUN_TAG}" "${variant}" \
+        --tags "UADA_rollout_online_env_probe_window_rollout_adv_gt_siglip_gt_phase_forms" "${loss_family}" "${form_name}" "${variant}" \
         --geometry true \
         --attack_mode "projection" \
         --patch_size "${PATCH_SIZE:-3,50,50}" \
@@ -153,6 +206,7 @@ run_variant() {
         --lambda_continuous_rollout 0.0 \
         --lambda_window_rollout_loss "${lambda_window_rollout_loss}" \
         --impulse_rollout_metric_enabled false \
+        --window_rollout_metric_mode "${WINDOW_ROLLOUT_METRIC_MODE_VALUE}" \
         --lambda_siglip "${lambda_siglip}" \
         --save_interval "${SAVE_INTERVAL_VALUE}" \
         --eval_enabled true \
@@ -201,7 +255,7 @@ run_variant() {
         --gt_dataset_root "${GT_DATASET_ROOT:-/home/yxx/roboticAttack/openvla-main/dataset}" \
         --gt_action_bank_path "${GT_ACTION_BANK_PATH:-}" \
         --gt_softmin_tau "${GT_SOFTMIN_TAU:-0.05}" \
-        --phase_state_mode "${PHASE_STATE_MODE_NAME}" \
+        --phase_state_mode "${phase_state_mode}" \
         --phase_state_cache_path "${PHASE_STATE_CACHE_PATH:-}" \
         --env_action_source "adv" \
         --env_seed "${ENV_SEED_VALUE}" \
@@ -212,7 +266,7 @@ run_variant() {
         --window_rollout_future_mode "${WINDOW_ROLLOUT_FUTURE_MODE}" \
         --window_rollout_exp_base "${WINDOW_ROLLOUT_EXP_BASE}" \
         --window_rollout_future_horizon "${WINDOW_ROLLOUT_FUTURE_HORIZON}" \
-        --window_rollout_phase_scope "${WINDOW_ROLLOUT_PHASE_SCOPE_VALUE}" \
+        --window_rollout_phase_scope "${window_rollout_phase_scope}" \
         --auto_gpu_tune false | tee "${log_path}"
 
     local exp_id
@@ -229,12 +283,21 @@ run_variant() {
         exit 1
     fi
 
-    python3.10 - "${SUMMARY_CSV}" "${final_json}" "${exp_id}" "${order_idx}" <<'PY'
+    "${PYTHON_BIN}" - "${SUMMARY_CSV}" "${final_json}" "${exp_id}" "${order_idx}" "${loss_family}" "${form_name}" "${phase_state_mode}" "${window_rollout_phase_scope}" <<'PY'
 import csv
 import json
 import sys
 
-summary_csv, final_json, exp_id, order_idx = sys.argv[1:5]
+(
+    summary_csv,
+    final_json,
+    exp_id,
+    order_idx,
+    loss_family,
+    form_name,
+    phase_state_mode,
+    window_rollout_phase_scope,
+) = sys.argv[1:9]
 
 with open(final_json, "r", encoding="utf-8") as file:
     data = json.load(file)
@@ -245,9 +308,7 @@ ce_term = float(data.get("final_val_ce_objective", 0.0))
 window_probe_enabled = int(data.get("window_rollout_probe_enabled", 0))
 window_metric_mode = str(data.get("window_rollout_metric_mode", "adv_gt"))
 window_future_mode = str(data.get("window_rollout_future_mode", "keep_adv"))
-window_metric_value = (
-    float(data.get("final_val_window_rollout_metric_value", 0.0)) if window_probe_enabled else 0.0
-)
+window_metric_value = float(data.get("final_val_window_rollout_metric_value", 0.0)) if window_probe_enabled else 0.0
 window_term = float(data.get("final_val_window_rollout_delta_weighted", 0.0)) if window_probe_enabled else 0.0
 window_term_loss = (
     float(data.get("final_val_window_rollout_delta_weighted_loss", 0.0)) if window_probe_enabled else 0.0
@@ -266,7 +327,11 @@ total_probe_score = (
 
 fieldnames = [
     "order_idx",
+    "loss_family",
+    "form_name",
     "variant",
+    "phase_state_mode",
+    "window_rollout_phase_scope",
     "exp_id",
     "run_dir",
     "window_rollout_probe_enabled",
@@ -300,7 +365,11 @@ fieldnames = [
 ]
 row = {
     "order_idx": int(order_idx),
+    "loss_family": loss_family,
+    "form_name": form_name,
     "variant": data.get("variant", ""),
+    "phase_state_mode": phase_state_mode,
+    "window_rollout_phase_scope": window_rollout_phase_scope,
     "exp_id": exp_id,
     "run_dir": data.get("run_dir", ""),
     "window_rollout_probe_enabled": int(window_probe_enabled),
@@ -338,18 +407,18 @@ with open(summary_csv, "a", newline="", encoding="utf-8") as file:
 PY
 }
 
-run_variant 1 "rollout-only" 0 0 0 "off" "clean_adv" 1
-run_variant 2 "gt+rollout" 1 0 0 "off" "gt_farthest" 1
-run_variant 3 "siglip+rollout" 0 1 0 "off" "clean_adv" 1
-# run_variant 4 "gt+siglip+rollout" 1 1 0 "off" "gt_farthest" 1
-# run_variant 5 "gt+siglip+rollout+ce" 1 1 0.1 "pseudo_clean" "gt_farthest" 1
+run_variant 1 "gt+siglip+rollout" "phase-cycle" "phase_cycle" "initial" "gt+siglip+rollout__phase-cycle" 1 1 0 "off" "gt_farthest" 1
+run_variant 2 "gt+siglip+rollout" "only-initial" "initial_only" "initial" "gt+siglip+rollout__only-initial" 1 1 0 "off" "gt_farthest" 1
+run_variant 3 "gt+siglip+rollout" "only-contact-manipulate" "contact_manipulate_only" "initial" "gt+siglip+rollout__only-contact-manipulate" 1 1 0 "off" "gt_farthest" 1
+run_variant 4 "gt+siglip+rollout" "only-post-contact" "post_contact_only" "initial" "gt+siglip+rollout__only-post-contact" 1 1 0 "off" "gt_farthest" 1
 
-python3.10 - "${SUMMARY_CSV}" "${SUMMARY_JSON}" "${BEST_JSON}" <<'PY'
+"${PYTHON_BIN}" - "${SUMMARY_CSV}" "${SUMMARY_JSON}" "${BEST_JSON}" "${BEST_BY_LOSS_FAMILY_JSON}" <<'PY'
 import csv
 import json
 import sys
 
-summary_csv, summary_json, best_json = sys.argv[1:4]
+summary_csv, summary_json, best_json, best_by_loss_family_json = sys.argv[1:5]
+
 
 def coerce(value):
     if value is None:
@@ -366,6 +435,7 @@ def coerce(value):
     except ValueError:
         return text
 
+
 with open(summary_csv, "r", encoding="utf-8") as file:
     rows = [{key: coerce(value) for key, value in row.items()} for row in csv.DictReader(file)]
 
@@ -375,6 +445,20 @@ with open(summary_json, "w", encoding="utf-8") as file:
 best_row = max(rows, key=lambda row: float(row.get("final_val_total_probe_score", float("-inf")))) if rows else {}
 with open(best_json, "w", encoding="utf-8") as file:
     json.dump(best_row, file, indent=2, ensure_ascii=False)
+
+best_by_loss_family = {}
+for row in rows:
+    loss_family = str(row.get("loss_family", "")).strip()
+    if not loss_family:
+        continue
+    current = best_by_loss_family.get(loss_family)
+    if current is None or float(row.get("final_val_total_probe_score", float("-inf"))) > float(
+        current.get("final_val_total_probe_score", float("-inf"))
+    ):
+        best_by_loss_family[loss_family] = row
+
+with open(best_by_loss_family_json, "w", encoding="utf-8") as file:
+    json.dump(best_by_loss_family, file, indent=2, ensure_ascii=False)
 PY
 
-echo "${PROBE_FINISH_LABEL}: ${PROBE_ROOT}"
+echo "Window rollout adv-gt SigLIP/GT phase-form probe finished: ${PROBE_ROOT}"

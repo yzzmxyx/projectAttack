@@ -7,6 +7,7 @@ from typing import Optional
 
 VALID_WINDOW_PHASE_SCOPES = ("all", "initial", "contact_manipulate", "post_contact")
 VALID_WINDOW_ROLLOUT_METRIC_MODES = ("delta_weighted", "adv_gt")
+VALID_WINDOW_ROLLOUT_FUTURE_MODES = ("keep_adv", "drop_attack_after_window")
 
 
 def normalize_window_rollout_phase_scope(phase_scope: str) -> str:
@@ -113,6 +114,25 @@ def normalize_window_rollout_metric_mode(metric_mode: str) -> str:
         raise ValueError(
             f"Unsupported window rollout metric mode: `{metric_mode}`. "
             f"Expected one of {VALID_WINDOW_ROLLOUT_METRIC_MODES}."
+        )
+    return aliases[value]
+
+
+def normalize_window_rollout_future_mode(future_mode: str) -> str:
+    value = str(future_mode).lower().strip()
+    aliases = {
+        "": "keep_adv",
+        "keep_adv": "keep_adv",
+        "adv": "keep_adv",
+        "drop_attack_after_window": "drop_attack_after_window",
+        "drop_attack": "drop_attack_after_window",
+        "deattack": "drop_attack_after_window",
+        "deattack_after_window": "drop_attack_after_window",
+    }
+    if value not in aliases:
+        raise ValueError(
+            f"Unsupported window rollout future mode: `{future_mode}`. "
+            f"Expected one of {VALID_WINDOW_ROLLOUT_FUTURE_MODES}."
         )
     return aliases[value]
 

@@ -1,5 +1,6 @@
 import argparse
 import importlib
+import json
 import os
 import random
 import uuid
@@ -60,8 +61,20 @@ def main(args):
     check_online_env_dependencies()
 
     pwd = os.getcwd()
-    exp_id = str(uuid.uuid4())
     vla_path = resolve_vla_path(args.dataset)
+    resume_run_dir = "" if args.resume_run_dir is None else str(args.resume_run_dir).strip()
+    if resume_run_dir.lower() in ("none", "null"):
+        resume_run_dir = ""
+    if resume_run_dir != "":
+        resume_run_dir = os.path.abspath(os.path.expanduser(resume_run_dir))
+        if not os.path.isdir(resume_run_dir):
+            raise FileNotFoundError(f"resume_run_dir not found: `{resume_run_dir}`.")
+        exp_id = os.path.basename(resume_run_dir.rstrip(os.sep))
+        path = resume_run_dir
+    else:
+        exp_id = str(uuid.uuid4())
+        path = f"{pwd}/run/UADA_rollout_online_env/{exp_id}"
+        os.makedirs(path, exist_ok=True)
 
     set_seed(42)
     target = "all" if args.use_all_joints else "".join(str(i) for i in args.maskidx)
@@ -79,6 +92,7 @@ def main(args):
         f"lamW{args.lambda_window_rollout_loss}_"
         f"winProbe{int(args.window_rollout_probe_enabled)}_"
         f"winMetric{args.window_rollout_metric_mode}_"
+        f"winFuture{args.window_rollout_future_mode}_"
         f"winA{args.window_rollout_exp_base}_winK{args.window_rollout_future_horizon}_winPhase{args.window_rollout_phase_scope}_"
         f"lamS{args.lambda_siglip}_"
         f"impMetric{int(args.impulse_rollout_metric_enabled)}_"
@@ -95,6 +109,8 @@ def main(args):
         f"p1NoLight{int(args.phase1_disable_lighting)}_p1NoProjRand{int(args.phase1_disable_projection_randomization)}_"
         f"target{target}_proj{projection_size}_seed42-{exp_id}"
     )
+    if resume_run_dir != "":
+        name = f"{name}-resume"
     if args.use_all_joints:
         print("[Deprecation] --maskidx is ignored when --use_all_joints=true.")
 
@@ -102,8 +118,26 @@ def main(args):
     if args.wandb_project != "false" and wandb is None:
         print("Warning: wandb is not available, fallback to local logging only.")
 
+    resume_wandb_id = ""
+    if resume_run_dir != "":
+        metadata_path = os.path.join(resume_run_dir, "run_metadata.json")
+        if os.path.exists(metadata_path):
+            with open(metadata_path, "r", encoding="utf-8") as file:
+                metadata = json.load(file)
+            resume_wandb_id = str(metadata.get("wandb_run_id", "") or "")
+
     if use_wandb:
-        wandb.init(entity=args.wandb_entity, project=args.wandb_project, name=name, tags=args.tags)
+        wandb_init_kwargs = {
+            "entity": args.wandb_entity,
+            "project": args.wandb_project,
+            "name": name,
+            "tags": args.tags,
+        }
+        if resume_wandb_id != "":
+            wandb_init_kwargs["id"] = resume_wandb_id
+            wandb_init_kwargs["resume"] = "must"
+        wandb.init(**wandb_init_kwargs)
+        args.wandb_run_id = str(getattr(wandb.run, "id", "") or resume_wandb_id)
         wandb.config = {
             "iteration": args.iter,
             "learning_rate": args.lr,
@@ -129,6 +163,7 @@ def main(args):
             "impulse_rollout_metric_enabled": args.impulse_rollout_metric_enabled,
             "window_rollout_probe_enabled": args.window_rollout_probe_enabled,
             "window_rollout_metric_mode": args.window_rollout_metric_mode,
+            "window_rollout_future_mode": args.window_rollout_future_mode,
             "window_rollout_exp_base": args.window_rollout_exp_base,
             "window_rollout_future_horizon": args.window_rollout_future_horizon,
             "window_rollout_phase_scope": args.window_rollout_phase_scope,
@@ -164,6 +199,7 @@ def main(args):
             "attack_mode": args.attack_mode,
             "projection_size": projection_size,
             "init_projection_texture_path": args.init_projection_texture_path,
+            "resume_run_dir": args.resume_run_dir,
             "projection_alpha": args.projection_alpha,
             "projection_alpha_jitter": args.projection_alpha_jitter,
             "projection_soft_edge": args.projection_soft_edge,
@@ -224,10 +260,10 @@ def main(args):
             "gpu_tune_min_tasks_per_iter": args.gpu_tune_min_tasks_per_iter,
             "gpu_tune_max_tasks_per_iter": args.gpu_tune_max_tasks_per_iter,
         }
+    else:
+        args.wandb_run_id = ""
 
     print(f"exp_id:{exp_id}")
-    path = f"{pwd}/run/UADA_rollout_online_env/{exp_id}"
-    os.makedirs(path, exist_ok=True)
 
     AutoConfig.register("openvla", OpenVLAConfig)
     AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
@@ -250,6 +286,7 @@ def main(args):
         patch_size=args.patch_size,
         projection_size=projection_size,
         init_projection_texture_path=args.init_projection_texture_path,
+        resume_run_dir=args.resume_run_dir,
         lr=args.lr,
         accumulate_steps=args.accumulate,
         maskidx=args.maskidx,
@@ -271,6 +308,7 @@ def main(args):
         impulse_rollout_metric_enabled=args.impulse_rollout_metric_enabled,
         window_rollout_probe_enabled=args.window_rollout_probe_enabled,
         window_rollout_metric_mode=args.window_rollout_metric_mode,
+        window_rollout_future_mode=args.window_rollout_future_mode,
         window_rollout_exp_base=args.window_rollout_exp_base,
         window_rollout_future_horizon=args.window_rollout_future_horizon,
         window_rollout_phase_scope=args.window_rollout_phase_scope,
@@ -390,6 +428,7 @@ def arg_parser():
     parser.add_argument("--attack_mode", default="projection", type=str)
     parser.add_argument("--projection_size", default=None, type=list_of_ints_or_none)
     parser.add_argument("--init_projection_texture_path", default="", type=str)
+    parser.add_argument("--resume_run_dir", default="", type=str)
     parser.add_argument("--projection_alpha", default=0.55, type=float)
     parser.add_argument("--projection_alpha_jitter", default=0.10, type=float)
     parser.add_argument("--projection_soft_edge", default=1.2, type=float)
@@ -439,6 +478,7 @@ def arg_parser():
     parser.add_argument("--impulse_rollout_metric_enabled", type=str2bool, default=False)
     parser.add_argument("--window_rollout_probe_enabled", type=str2bool, default=False)
     parser.add_argument("--window_rollout_metric_mode", default="delta_weighted", type=str)
+    parser.add_argument("--window_rollout_future_mode", default="keep_adv", type=str)
     parser.add_argument("--window_rollout_exp_base", default=0.9, type=float)
     parser.add_argument("--window_rollout_future_horizon", default=8, type=int)
     parser.add_argument("--window_rollout_phase_scope", default="all", type=str)
@@ -581,6 +621,7 @@ if __name__ == "__main__":
         f" impulse_rollout_metric_enabled:{args.impulse_rollout_metric_enabled}\n"
         f" window_rollout_probe_enabled:{args.window_rollout_probe_enabled}\n"
         f" window_rollout_metric_mode:{args.window_rollout_metric_mode}\n"
+        f" window_rollout_future_mode:{args.window_rollout_future_mode}\n"
         f" window_rollout_exp_base:{args.window_rollout_exp_base}\n"
         f" window_rollout_future_horizon:{args.window_rollout_future_horizon}\n"
         f" window_rollout_phase_scope:{args.window_rollout_phase_scope}\n"

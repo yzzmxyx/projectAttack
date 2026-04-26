@@ -167,3 +167,4 @@ adversarial_patches/
 *.ckpt
 *.pkl
 *.mp4
+openvla-oft/

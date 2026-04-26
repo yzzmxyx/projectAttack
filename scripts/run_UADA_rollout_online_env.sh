@@ -56,6 +56,12 @@ RECORD_ONLINE_VIDEOS_LAST_ONLY_VALUE="${RECORD_ONLINE_VIDEOS_LAST_ONLY:-false}"
 RECORD_ONLINE_TRAIN_VIDEO_VALUE="${RECORD_ONLINE_TRAIN_VIDEO:-false}"
 RECORD_ONLINE_VAL_VIDEO_VALUE="${RECORD_ONLINE_VAL_VIDEO:-true}"
 RESUME_RUN_DIR_VALUE="${RESUME_RUN_DIR:-}"
+TEXTURE_PARAM_MODE_VALUE="${TEXTURE_PARAM_MODE:-direct}"
+LATENT_HW_VALUE="${LATENT_HW:-12,12}"
+LAMBDA_TV_VALUE="${LAMBDA_TV:-0.0}"
+TRAIN_ANCHOR_HORIZON_ITERS_VALUE="${TRAIN_ANCHOR_HORIZON_ITERS:-1}"
+DETERMINISTIC_ANCHOR_SAMPLING_VALUE="${DETERMINISTIC_ANCHOR_SAMPLING:-false}"
+PHASE1_ACTION_GAP_MODE_VALUE="${PHASE1_ACTION_GAP_MODE:-gt_farthest}"
 
 if [[ -n "${RESUME_RUN_DIR_VALUE}" && -n "${INIT_PROJECTION_TEXTURE_PATH:-}" ]]; then
     echo "ERROR: RESUME_RUN_DIR and INIT_PROJECTION_TEXTURE_PATH are mutually exclusive."
@@ -232,9 +238,15 @@ python3.10 VLAAttacker/UADA_rollout_online_env_wrapper.py \
     --env_action_source "adv" \
     --env_seed 42 \
     --action_gap_mode "${ACTION_GAP_MODE:-gt_farthest}" \
+    --phase1_action_gap_mode "${PHASE1_ACTION_GAP_MODE_VALUE}" \
     --gt_dataset_root "${GT_DATASET_ROOT:-/home/yxx/roboticAttack/openvla-main/dataset}" \
     --gt_action_bank_path "${GT_ACTION_BANK_PATH:-}" \
     --gt_softmin_tau "${GT_SOFTMIN_TAU:-0.05}" \
     --phase_state_mode "${PHASE_STATE_MODE:-contact_manipulate_only}" \
     --phase_state_cache_path "${PHASE_STATE_CACHE_PATH:-}" \
+    --texture_param_mode "${TEXTURE_PARAM_MODE_VALUE}" \
+    --latent_hw "${LATENT_HW_VALUE}" \
+    --lambda_tv "${LAMBDA_TV_VALUE}" \
+    --train_anchor_horizon_iters "${TRAIN_ANCHOR_HORIZON_ITERS_VALUE}" \
+    --deterministic_anchor_sampling "${DETERMINISTIC_ANCHOR_SAMPLING_VALUE}" \
     --auto_gpu_tune false

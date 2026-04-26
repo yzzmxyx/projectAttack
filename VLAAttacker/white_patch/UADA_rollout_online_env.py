@@ -245,6 +245,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
     def _build_resume_state(
         self,
         projection_texture,
+        texture_param,
         photometric_params,
         optimizer,
         scheduler,
@@ -256,6 +257,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         return {
             "schema_version": 1,
             "projection_texture": projection_texture.detach().cpu(),
+            "texture_param": texture_param.detach().cpu(),
             "photometric_params_state_dict": photometric_params.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
@@ -273,6 +275,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         self,
         output_dir,
         projection_texture,
+        texture_param,
         photometric_params,
         optimizer,
         scheduler,
@@ -285,6 +288,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         checkpoint_path = os.path.join(output_dir, self.RESUME_STATE_FILENAME)
         payload = self._build_resume_state(
             projection_texture=projection_texture,
+            texture_param=texture_param,
             photometric_params=photometric_params,
             optimizer=optimizer,
             scheduler=scheduler,
@@ -339,17 +343,91 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             "phase2_rollout",
             "learn_projector_gain",
             "learn_projector_channel_gain",
+            "phase1_action_gap_mode",
+            "texture_param_mode",
+            "latent_hw",
         ]
         mismatches = []
         for key in incompatible_keys:
             current_value = current_config.get(key)
-            resume_value = resume_config.get(key)
+            resume_value = resume_config.get(key, current_value)
             if current_value != resume_value:
                 mismatches.append(f"{key}: current={current_value!r}, checkpoint={resume_value!r}")
         if mismatches:
             raise ValueError(
                 "Resume configuration mismatch detected:\n" + "\n".join(mismatches)
             )
+
+    def _normalize_texture_param_mode(self, texture_param_mode):
+        mode = str(texture_param_mode or "direct").lower().strip()
+        if mode not in ("direct", "latent_bilinear"):
+            raise ValueError("--texture_param_mode must be one of {direct, latent_bilinear}")
+        return mode
+
+    def _normalize_latent_hw(self, latent_hw):
+        if latent_hw is None:
+            return [12, 12]
+        if not isinstance(latent_hw, (list, tuple)) or len(latent_hw) != 2:
+            raise ValueError("--latent_hw must contain exactly 2 integers like `12,12`.")
+        return [max(1, int(latent_hw[0])), max(1, int(latent_hw[1]))]
+
+    def _normalize_action_gap_mode(self, action_gap_mode, arg_name="--action_gap_mode"):
+        mode = str(action_gap_mode).lower().strip()
+        if mode not in ("clean_adv", "gt_farthest", "inherit"):
+            raise ValueError(f"{arg_name} must be one of {{clean_adv, gt_farthest, inherit}}")
+        return mode
+
+    def _materialize_projection_texture(self, texture_param, texture_param_mode, projection_size):
+        mode = self._normalize_texture_param_mode(texture_param_mode)
+        target_hw = tuple(int(x) for x in projection_size[1:])
+        if mode == "direct":
+            return texture_param
+        materialized = F.interpolate(
+            texture_param.unsqueeze(0),
+            size=target_hw,
+            mode="bicubic",
+            align_corners=False,
+        ).squeeze(0)
+        return torch.sigmoid(materialized)
+
+    def _encode_projection_texture_to_param(self, projection_texture, texture_param_mode, projection_size, latent_hw):
+        mode = self._normalize_texture_param_mode(texture_param_mode)
+        if mode == "direct":
+            return projection_texture.detach().clone()
+        latent_size = tuple(int(x) for x in latent_hw)
+        clamped = projection_texture.detach().clamp(1e-4, 1.0 - 1e-4)
+        downsampled = F.interpolate(
+            clamped.unsqueeze(0),
+            size=latent_size,
+            mode="bicubic",
+            align_corners=False,
+        ).squeeze(0)
+        return torch.logit(downsampled.clamp(1e-4, 1.0 - 1e-4))
+
+    def _project_texture_param_inplace(self, texture_param, texture_param_mode):
+        if self._normalize_texture_param_mode(texture_param_mode) == "direct":
+            texture_param.data.clamp_(0, 1)
+
+    def _compute_texture_tv(self, projection_texture):
+        tv_w = (projection_texture[:, :, 1:] - projection_texture[:, :, :-1]).abs().mean()
+        tv_h = (projection_texture[:, 1:, :] - projection_texture[:, :-1, :]).abs().mean()
+        return tv_w + tv_h
+
+    def _sample_index_from_pool(self, candidate_indices, fallback_size=None, deterministic_seed=None):
+        if candidate_indices is not None:
+            candidate_indices = [int(idx) for idx in candidate_indices]
+        if candidate_indices:
+            if deterministic_seed is not None:
+                return int(candidate_indices[int(deterministic_seed) % len(candidate_indices)])
+            return int(random.choice(candidate_indices))
+        if fallback_size is None or int(fallback_size) <= 0:
+            return None
+        return self._sample_init_state_index(
+            init_states=[None] * int(fallback_size),
+            iter_idx=0,
+            local_idx=0,
+            deterministic_seed=deterministic_seed,
+        )
 
 
     def _probe_metrics_path(self):
@@ -779,6 +857,19 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             )
         return self._phase_state_cache[key].detach().cpu().numpy()
 
+    def _available_phase_init_state_indices(self, task_id, init_states, phase_start_name):
+        phase_name = self._normalize_phase_start_name(phase_start_name)
+        num_states = len(init_states)
+        if num_states <= 0:
+            return []
+        if phase_name == "initial":
+            return list(range(num_states))
+        available = []
+        for init_state_idx in range(num_states):
+            if (int(task_id), int(init_state_idx), phase_name) in self._phase_state_cache:
+                available.append(int(init_state_idx))
+        return available
+
     def _get_gt_phase_boundary_ratio_pair(self, task_description):
         instruction_key = self._normalize_instruction_key(task_description)
         ratios = self._gt_phase_boundary_ratios.get(instruction_key, {})
@@ -1065,7 +1156,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         )
         return fields
 
-    def _save_initial_projection_snapshot(self, projection_texture):
+    def _save_initial_projection_snapshot(self, projection_texture, texture_param=None):
         initial_dir = os.path.join(self.save_dir, "initial")
         os.makedirs(initial_dir, exist_ok=True)
         projection_snapshot_path = os.path.join(initial_dir, "projection_texture.pt")
@@ -1073,6 +1164,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         snapshot_tensor = projection_texture.detach().cpu()
         torch.save(snapshot_tensor, projection_snapshot_path)
         torch.save(snapshot_tensor, patch_snapshot_path)
+        if texture_param is not None:
+            torch.save(texture_param.detach().cpu(), os.path.join(initial_dir, "texture_param.pt"))
         self._initial_projection_texture_snapshot_path = str(projection_snapshot_path)
         self._initial_patch_snapshot_path = str(patch_snapshot_path)
 
@@ -1389,6 +1482,12 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         env_seed=42,
         dataset_name="libero_spatial",
         action_gap_mode="clean_adv",
+        phase1_action_gap_mode="inherit",
+        texture_param_mode="direct",
+        latent_hw=(12, 12),
+        lambda_tv=0.0,
+        train_anchor_horizon_iters=1,
+        deterministic_anchor_sampling=False,
         gt_dataset_root="/home/yxx/roboticAttack/openvla-main/dataset",
         val_deterministic=False,
         val_seed=42,
@@ -1426,15 +1525,30 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         if projection_size is None:
             projection_size = patch_size
         projection_size = [int(x) for x in projection_size]
+        action_gap_mode = self._normalize_action_gap_mode(action_gap_mode, arg_name="--action_gap_mode")
+        phase1_action_gap_mode = self._normalize_action_gap_mode(
+            phase1_action_gap_mode,
+            arg_name="--phase1_action_gap_mode",
+        )
+        texture_param_mode = self._normalize_texture_param_mode(texture_param_mode)
+        latent_hw = self._normalize_latent_hw(latent_hw)
+        lambda_tv = max(0.0, float(lambda_tv))
+        train_anchor_horizon_iters = max(1, int(train_anchor_horizon_iters))
+        deterministic_anchor_sampling = bool(deterministic_anchor_sampling)
         resume_run_dir_value = "" if resume_run_dir is None else str(resume_run_dir).strip()
         if resume_run_dir_value.lower() in ("none", "null"):
             resume_run_dir_value = ""
         if resume_run_dir_value != "":
             resume_run_dir_value = os.path.abspath(os.path.expanduser(resume_run_dir_value))
-
-        projection_texture = torch.rand(projection_size, device=self.vla.device)
-        projection_texture.requires_grad_(True)
-        projection_texture.retain_grad()
+        if texture_param_mode == "direct":
+            texture_param = torch.rand(projection_size, device=self.vla.device)
+        else:
+            texture_param = torch.randn(
+                [int(projection_size[0]), int(latent_hw[0]), int(latent_hw[1])],
+                device=self.vla.device,
+            ) * 0.02
+        texture_param.requires_grad_(True)
+        texture_param.retain_grad()
         init_projection_path_value = "" if init_projection_texture_path is None else str(init_projection_texture_path).strip()
         if init_projection_path_value.lower() in ("none", "null"):
             init_projection_path_value = ""
@@ -1452,6 +1566,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             "phase2_rollout": int(phase2_rollout),
             "learn_projector_gain": bool(learn_projector_gain),
             "learn_projector_channel_gain": bool(learn_projector_channel_gain),
+            "phase1_action_gap_mode": str(phase1_action_gap_mode),
+            "texture_param_mode": str(texture_param_mode),
+            "latent_hw": [int(latent_hw[0]), int(latent_hw[1])],
         }
         resume_state = None
         start_iter = 0
@@ -1461,13 +1578,29 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             resume_state = self._load_resume_checkpoint(resume_run_dir_value)
             self._validate_resume_compatibility(current_resume_config, resume_state.get("config", {}))
             with torch.no_grad():
-                projection_texture.copy_(
-                    torch.as_tensor(
+                resume_texture_param = resume_state.get("texture_param")
+                if resume_texture_param is not None:
+                    texture_param.copy_(
+                        torch.as_tensor(
+                            resume_texture_param,
+                            device=self.vla.device,
+                            dtype=texture_param.dtype,
+                        )
+                    )
+                else:
+                    resumed_projection_texture = torch.as_tensor(
                         resume_state["projection_texture"],
                         device=self.vla.device,
-                        dtype=projection_texture.dtype,
+                        dtype=torch.float32,
                     )
-                )
+                    texture_param.copy_(
+                        self._encode_projection_texture_to_param(
+                            projection_texture=resumed_projection_texture,
+                            texture_param_mode=texture_param_mode,
+                            projection_size=projection_size,
+                            latent_hw=latent_hw,
+                        ).to(device=self.vla.device, dtype=texture_param.dtype)
+                    )
             start_iter = int(resume_state.get("next_iter_idx", int(resume_state.get("global_iter_completed", -1)) + 1))
             train_phase_start_counter = int(resume_state.get("train_phase_start_counter", 0))
             resumed_gpu_tuner_state = resume_state.get("gpu_tuner_state")
@@ -1478,20 +1611,32 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             if not init_projection_path.exists():
                 raise FileNotFoundError(f"init_projection_texture_path not found: `{init_projection_path}`.")
             loaded_projection = torch.load(init_projection_path, map_location=self.vla.device)
-            loaded_projection = torch.as_tensor(loaded_projection, device=self.vla.device, dtype=projection_texture.dtype)
-            if tuple(loaded_projection.shape) != tuple(projection_texture.shape):
+            loaded_projection = torch.as_tensor(loaded_projection, device=self.vla.device, dtype=torch.float32)
+            if tuple(loaded_projection.shape) != tuple(projection_size):
                 raise ValueError(
                     "Loaded projection texture shape mismatch: "
-                    f"expected {tuple(projection_texture.shape)}, got {tuple(loaded_projection.shape)} "
+                    f"expected {tuple(projection_size)}, got {tuple(loaded_projection.shape)} "
                     f"from `{init_projection_path}`."
                 )
             with torch.no_grad():
-                projection_texture.copy_(loaded_projection)
+                texture_param.copy_(
+                    self._encode_projection_texture_to_param(
+                        projection_texture=loaded_projection,
+                        texture_param_mode=texture_param_mode,
+                        projection_size=projection_size,
+                        latent_hw=latent_hw,
+                    ).to(device=self.vla.device, dtype=texture_param.dtype)
+                )
             self._init_projection_texture_path = str(init_projection_path)
         else:
             self._init_projection_texture_path = ""
         if resume_run_dir_value == "":
-            self._save_initial_projection_snapshot(projection_texture)
+            initial_projection_texture = self._materialize_projection_texture(
+                texture_param=texture_param,
+                texture_param_mode=texture_param_mode,
+                projection_size=projection_size,
+            )
+            self._save_initial_projection_snapshot(initial_projection_texture, texture_param=texture_param)
 
         phase1_ratio = float(min(max(phase1_ratio, 0.0), 1.0))
         phase1_end_iter = int(num_iter * phase1_ratio)
@@ -1536,8 +1681,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         env_resolution = max(64, int(env_resolution))
         val_max_env_steps = max(1, int(val_max_env_steps))
         dataset_name = str(dataset_name).strip()
-        action_gap_mode = str(action_gap_mode).lower().strip()
-        if action_gap_mode not in ("clean_adv", "gt_farthest"):
+        if action_gap_mode == "inherit":
             raise ValueError("--action_gap_mode must be one of {clean_adv, gt_farthest}")
         gt_dataset_root = os.path.abspath(os.path.expanduser(str(gt_dataset_root)))
         gt_softmin_tau = max(float(gt_softmin_tau), 1e-6)
@@ -1588,7 +1732,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             learn_projector_channel_gain=learn_projector_channel_gain,
             device=self.vla.device,
         )
-        optimizer_param_groups = [{"params": [projection_texture], "lr": lr}]
+        optimizer_param_groups = [{"params": [texture_param], "lr": lr}]
         if photometric_params.has_trainable_params():
             optimizer_param_groups.append(
                 {
@@ -1650,6 +1794,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         self._gt_dataset_root = gt_dataset_root
         needs_gt_action_bank = (
             (action_gap_mode == "gt_farthest")
+            or (phase1_action_gap_mode == "gt_farthest")
             or (lambda_continuous_rollout > 0.0)
             or (lambda_window_rollout_loss > 0.0)
             or bool(impulse_rollout_metric_enabled)
@@ -1684,7 +1829,11 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             "[OnlineEnv] initialized "
             f"(suite={resolved_suite_name}, action_dim={action_dim}, max_env_steps={max_env_steps}, ce_mode={online_ce_mode}, "
             f"val_max_env_steps={val_max_env_steps}, "
-            f"action_gap_mode={action_gap_mode}, lambda_ce={lambda_ce}, lambda_ce_phase2={lambda_ce_phase2}, "
+            f"action_gap_mode={action_gap_mode}, phase1_action_gap_mode={phase1_action_gap_mode}, "
+            f"texture_param_mode={texture_param_mode}, latent_hw={latent_hw}, lambda_tv={lambda_tv}, "
+            f"train_anchor_horizon_iters={train_anchor_horizon_iters}, "
+            f"deterministic_anchor_sampling={int(deterministic_anchor_sampling)}, "
+            f"lambda_ce={lambda_ce}, lambda_ce_phase2={lambda_ce_phase2}, "
             f"lambda_continuous_rollout={lambda_continuous_rollout}, "
             f"lambda_window_rollout_loss={lambda_window_rollout_loss}, "
             f"impulse_rollout_metric_enabled={int(impulse_rollout_metric_enabled)}, "
@@ -1727,8 +1876,17 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             )
 
         optimizer.zero_grad()
+        train_anchor_block = None
+        train_anchor_phase_id = None
+        train_anchor_task_budget = None
+        train_anchor_cases = []
         for i in tqdm(range(start_iter, num_iter)):
             phase_id = 1 if i < phase1_end_iter else 2
+            train_action_gap_mode = (
+                action_gap_mode
+                if (phase_id != 1 or phase1_action_gap_mode == "inherit")
+                else phase1_action_gap_mode
+            )
             effective_lambda_ce = lambda_ce if phase_id == 1 else lambda_ce_phase2
             base_rollout_steps = base_phase1_rollout if phase_id == 1 else base_phase2_rollout
             tune_level_for_iter = int(gpu_tuner_state["level"]) if auto_gpu_tune else 2
@@ -1754,7 +1912,6 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             train_effective_projection_randomization_enabled = int(
                 (str(attack_mode).lower() == "projection") and train_projection_randomization_enabled
             )
-            train_task_ids = self._sample_task_ids(task_suite=task_suite, num_tasks=eff_train_tasks_per_iter)
             should_record_train_video = bool(
                 record_online_videos
                 and record_online_train_video
@@ -1791,147 +1948,211 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             train_gt_per_joint_gap = None
             train_episode_count = 0
             train_phase_start_counts = {"initial": 0, "contact_manipulate": 0, "post_contact": 0}
-
-            for task_id in train_task_ids:
-                task = task_suite.get_task(task_id)
-                init_states = task_suite.get_task_init_states(task_id)
-                env, task_description = get_libero_env(task, "openvla", resolution=env_resolution)
-                try:
+            current_anchor_block = int(max(0, i) // max(1, train_anchor_horizon_iters))
+            refresh_anchor_cases = (
+                (train_anchor_block is None)
+                or (train_anchor_phase_id != phase_id)
+                or (train_anchor_task_budget != int(eff_train_tasks_per_iter))
+                or (train_anchor_block != current_anchor_block)
+                or (len(train_anchor_cases) <= 0)
+            )
+            if refresh_anchor_cases:
+                train_anchor_cases = []
+                anchor_seed = None
+                if deterministic_anchor_sampling:
+                    anchor_seed = (
+                        int(env_seed)
+                        + (int(phase_id) * 1000003)
+                        + (int(current_anchor_block) * 65537)
+                    )
+                train_task_ids = self._sample_task_ids(
+                    task_suite=task_suite,
+                    num_tasks=eff_train_tasks_per_iter,
+                    deterministic_seed=anchor_seed,
+                )
+                for task_rank, task_id in enumerate(train_task_ids):
+                    init_states = task_suite.get_task_init_states(task_id)
                     for episode_idx in range(online_train_episodes_per_task):
-                        init_state_idx = self._sample_init_state_index(init_states, i, episode_idx)
-                        if init_state_idx is None:
-                            continue
-                        init_state = init_states[init_state_idx]
                         phase_start_name = self._phase_start_for_counter(phase_state_mode, train_phase_start_counter)
                         train_phase_start_counter += 1
-                        train_phase_start_counts[phase_start_name] = train_phase_start_counts.get(phase_start_name, 0) + 1
-                        phase_init_state = self._resolve_phase_start_state(
+                        episode_seed = None
+                        if deterministic_anchor_sampling:
+                            episode_seed = (
+                                int(env_seed)
+                                + (int(phase_id) * 1000003)
+                                + (int(current_anchor_block) * 65537)
+                                + (int(task_id) * 257)
+                                + (int(task_rank) * 31)
+                                + int(episode_idx)
+                            )
+                        candidate_init_state_indices = self._available_phase_init_state_indices(
                             task_id=task_id,
-                            init_state_idx=init_state_idx,
+                            init_states=init_states,
                             phase_start_name=phase_start_name,
-                            default_init_state=init_state,
                         )
-                        train_window_rollout_spec = None
-                        if window_rollout_probe_enabled or (lambda_window_rollout_loss > 0.0):
-                            # Train-time window length follows current phase rollout budget:
-                            # phase1 -> phase1_rollout, phase2 -> phase2_rollout, then append future k steps.
-                            train_window_rollout_spec = self._build_fixed_train_window_spec(
-                                phase_name=phase_start_name,
-                                window_step_count=rollout_steps,
-                                future_horizon=window_rollout_future_horizon,
-                                exp_base=window_rollout_exp_base,
-                                max_env_steps=max_env_steps,
-                            )
-                        episode_rollout_steps = int(rollout_steps)
-                        if isinstance(train_window_rollout_spec, dict):
-                            episode_rollout_steps = int(
-                                train_window_rollout_spec.get("total_rollout_steps", episode_rollout_steps)
-                            )
-                        episode = self._run_online_episode(
-                            env=env,
-                            task=task,
-                            get_libero_env=get_libero_env,
-                            get_libero_image=get_libero_image,
-                            get_libero_dummy_action=get_libero_dummy_action,
-                            init_state=phase_init_state,
-                            init_state_idx=init_state_idx,
-                            task_description=task_description,
-                            projection_texture=projection_texture,
-                            rollout_steps=episode_rollout_steps,
-                            max_env_steps=max_env_steps,
-                            num_steps_wait=num_steps_wait,
-                            split="train",
-                            global_iter=i,
-                            geometry=geometry,
-                            maskidx=maskidx,
-                            use_all_joints=use_all_joints,
-                            gripper_weight=gripper_weight,
-                            action_stats=action_stats,
-                            lambda_action_gap=lambda_action_gap,
-                            lambda_history=lambda_history,
-                            lambda_history_legacy=lambda_history_legacy,
-                            lambda_ce=effective_lambda_ce,
-                            lambda_continuous_rollout=lambda_continuous_rollout,
-                            lambda_window_rollout_loss=lambda_window_rollout_loss,
-                            impulse_rollout_metric_enabled=impulse_rollout_metric_enabled,
-                            window_rollout_probe_enabled=bool(train_window_rollout_spec is not None),
-                            window_rollout_metric_mode=window_rollout_metric_mode,
-                            window_rollout_future_mode=window_rollout_future_mode,
-                            window_rollout_spec=train_window_rollout_spec,
-                            lambda_siglip=lambda_siglip,
-                            siglip_model=siglip_model,
-                            siglip_input_size=siglip_input_size,
-                            online_ce_mode=online_ce_mode,
-                            attack_mode=attack_mode,
-                            projection_alpha=projection_alpha,
-                            projection_alpha_jitter=projection_alpha_jitter,
-                            projection_soft_edge=projection_soft_edge,
-                            projection_angle=projection_angle,
-                            projection_fixed_angle=projection_fixed_angle,
-                            projection_shear=projection_shear,
-                            projection_scale_min=projection_scale_min,
-                            projection_scale_max=projection_scale_max,
-                            projection_region=projection_region,
-                            projection_lower_start=projection_lower_start,
-                            projection_width_ratio=projection_width_ratio,
-                            projection_height_ratio=projection_height_ratio,
-                            projection_margin_x=projection_margin_x,
-                            projection_keystone=projection_keystone,
-                            projection_keystone_jitter=projection_keystone_jitter,
-                            projector_gamma=projector_gamma,
-                            projector_gain=projector_gain,
-                            projector_channel_gain=projector_channel_gain,
-                            learnable_projector_params=photometric_params,
-                            projector_ambient=projector_ambient,
-                            projector_vignetting=projector_vignetting,
-                            projector_distance_falloff=projector_distance_falloff,
-                            projector_psf=projector_psf,
-                            env_resolution=env_resolution,
-                            projection_randomization_enabled=train_projection_randomization_enabled,
-                            need_backward=True,
-                            capture_visual=False,
-                            deterministic_episode_seed=None,
-                            disable_lighting=train_disable_lighting,
-                            task_id=task_id,
-                            record_video_frames=bool(should_record_train_video and (train_video_episode is None)),
-                            video_frame_source=record_online_video_frame_source,
-                            action_gap_mode=action_gap_mode,
-                            start_phase_name=phase_start_name,
-                            gt_softmin_tau=gt_softmin_tau,
+                        init_state_idx = self._sample_index_from_pool(
+                            candidate_indices=candidate_init_state_indices,
+                            fallback_size=(len(init_states) if phase_start_name == "initial" else None),
+                            deterministic_seed=episode_seed,
                         )
-                        if episode is None:
+                        if init_state_idx is None:
                             continue
+                        train_anchor_cases.append(
+                            {
+                                "task_id": int(task_id),
+                                "init_state_idx": int(init_state_idx),
+                                "phase_start_name": str(phase_start_name),
+                                "deterministic_episode_seed": episode_seed,
+                            }
+                        )
+                train_anchor_block = int(current_anchor_block)
+                train_anchor_phase_id = int(phase_id)
+                train_anchor_task_budget = int(eff_train_tasks_per_iter)
 
-                        train_episode_count += 1
-                        train_action_gap += episode["action_gap"]
-                        train_gt_action_gap += episode["gt_action_gap"]
-                        train_history_div += episode["history_div"]
-                        train_history_div_legacy += episode["history_div_legacy"]
-                        train_ce += episode["ce_value"]
-                        train_ce_objective += episode["ce_objective_value"]
-                        train_siglip_distance += episode["siglip_distance"]
-                        train_continuous_clean_gt_action_gap += episode["continuous_clean_gt_action_gap"]
-                        train_continuous_adv_gt_action_gap += episode["continuous_adv_gt_action_gap"]
-                        train_continuous_rollout_delta += episode["continuous_rollout_delta"]
-                        train_impulse_rollout_area += episode["impulse_rollout_area"]
-                        train_window_rollout_clean_gt_action_gap += episode["window_rollout_clean_gt_action_gap"]
-                        train_window_rollout_adv_gt_action_gap += episode["window_rollout_adv_gt_action_gap"]
-                        train_window_rollout_deattack_gt_action_gap += episode["window_rollout_deattack_gt_action_gap"]
-                        train_window_rollout_selected_gt_action_gap += episode["window_rollout_selected_gt_action_gap"]
-                        train_window_rollout_delta_weighted += episode["window_rollout_delta_weighted"]
-                        train_window_rollout_delta_weighted_loss += episode["window_rollout_delta_weighted_loss"]
-                        train_proj_alpha += episode["projection_alpha"]
-                        train_proj_coverage += episode["projection_coverage"]
-                        train_proj_bottom += episode["projection_bottom"]
-                        train_proj_keystone += episode["projection_keystone"]
-                        train_action_terms += max(1, episode["action_terms"])
-                        train_history_terms += max(0, episode["history_terms"])
-                        train_episodes_done += float(episode["done"])
-                        train_episode_len += float(episode["episode_len"])
-                        train_per_joint_gap = self._accumulate_joint_values(train_per_joint_gap, episode["per_joint_gap"])
-                        train_gt_per_joint_gap = self._accumulate_joint_values(train_gt_per_joint_gap, episode["gt_per_joint_gap"])
-                        if should_record_train_video and (train_video_episode is None) and self._should_dump_online_episode_video(episode):
-                            train_video_episode = episode
+            for episode_case in train_anchor_cases:
+                task_id = int(episode_case["task_id"])
+                task = task_suite.get_task(task_id)
+                init_states = task_suite.get_task_init_states(task_id)
+                init_state_idx = int(episode_case["init_state_idx"])
+                if init_state_idx < 0 or init_state_idx >= len(init_states):
+                    continue
+                init_state = init_states[init_state_idx]
+                phase_start_name = str(episode_case["phase_start_name"])
+                train_phase_start_counts[phase_start_name] = train_phase_start_counts.get(phase_start_name, 0) + 1
+                env, task_description = get_libero_env(task, "openvla", resolution=env_resolution)
+                try:
+                    phase_init_state = self._resolve_phase_start_state(
+                        task_id=task_id,
+                        init_state_idx=init_state_idx,
+                        phase_start_name=phase_start_name,
+                        default_init_state=init_state,
+                    )
+                    train_window_rollout_spec = None
+                    if window_rollout_probe_enabled or (lambda_window_rollout_loss > 0.0):
+                        train_window_rollout_spec = self._build_fixed_train_window_spec(
+                            phase_name=phase_start_name,
+                            window_step_count=rollout_steps,
+                            future_horizon=window_rollout_future_horizon,
+                            exp_base=window_rollout_exp_base,
+                            max_env_steps=max_env_steps,
+                        )
+                    episode_rollout_steps = int(rollout_steps)
+                    if isinstance(train_window_rollout_spec, dict):
+                        episode_rollout_steps = int(
+                            train_window_rollout_spec.get("total_rollout_steps", episode_rollout_steps)
+                        )
+                    episode = self._run_online_episode(
+                        env=env,
+                        task=task,
+                        get_libero_env=get_libero_env,
+                        get_libero_image=get_libero_image,
+                        get_libero_dummy_action=get_libero_dummy_action,
+                        init_state=phase_init_state,
+                        init_state_idx=init_state_idx,
+                        task_description=task_description,
+                        texture_param=texture_param,
+                        texture_param_mode=texture_param_mode,
+                        projection_size=projection_size,
+                        rollout_steps=episode_rollout_steps,
+                        max_env_steps=max_env_steps,
+                        num_steps_wait=num_steps_wait,
+                        split="train",
+                        global_iter=i,
+                        geometry=geometry,
+                        maskidx=maskidx,
+                        use_all_joints=use_all_joints,
+                        gripper_weight=gripper_weight,
+                        action_stats=action_stats,
+                        lambda_action_gap=lambda_action_gap,
+                        lambda_history=lambda_history,
+                        lambda_history_legacy=lambda_history_legacy,
+                        lambda_ce=effective_lambda_ce,
+                        lambda_continuous_rollout=lambda_continuous_rollout,
+                        lambda_window_rollout_loss=lambda_window_rollout_loss,
+                        impulse_rollout_metric_enabled=impulse_rollout_metric_enabled,
+                        window_rollout_probe_enabled=bool(train_window_rollout_spec is not None),
+                        window_rollout_metric_mode=window_rollout_metric_mode,
+                        window_rollout_future_mode=window_rollout_future_mode,
+                        window_rollout_spec=train_window_rollout_spec,
+                        lambda_siglip=lambda_siglip,
+                        siglip_model=siglip_model,
+                        siglip_input_size=siglip_input_size,
+                        online_ce_mode=online_ce_mode,
+                        attack_mode=attack_mode,
+                        projection_alpha=projection_alpha,
+                        projection_alpha_jitter=projection_alpha_jitter,
+                        projection_soft_edge=projection_soft_edge,
+                        projection_angle=projection_angle,
+                        projection_fixed_angle=projection_fixed_angle,
+                        projection_shear=projection_shear,
+                        projection_scale_min=projection_scale_min,
+                        projection_scale_max=projection_scale_max,
+                        projection_region=projection_region,
+                        projection_lower_start=projection_lower_start,
+                        projection_width_ratio=projection_width_ratio,
+                        projection_height_ratio=projection_height_ratio,
+                        projection_margin_x=projection_margin_x,
+                        projection_keystone=projection_keystone,
+                        projection_keystone_jitter=projection_keystone_jitter,
+                        projector_gamma=projector_gamma,
+                        projector_gain=projector_gain,
+                        projector_channel_gain=projector_channel_gain,
+                        learnable_projector_params=photometric_params,
+                        projector_ambient=projector_ambient,
+                        projector_vignetting=projector_vignetting,
+                        projector_distance_falloff=projector_distance_falloff,
+                        projector_psf=projector_psf,
+                        env_resolution=env_resolution,
+                        projection_randomization_enabled=train_projection_randomization_enabled,
+                        need_backward=True,
+                        capture_visual=False,
+                        deterministic_episode_seed=episode_case.get("deterministic_episode_seed"),
+                        disable_lighting=train_disable_lighting,
+                        task_id=task_id,
+                        record_video_frames=bool(should_record_train_video and (train_video_episode is None)),
+                        video_frame_source=record_online_video_frame_source,
+                        action_gap_mode=train_action_gap_mode,
+                        start_phase_name=phase_start_name,
+                        lambda_tv=lambda_tv,
+                        gt_softmin_tau=gt_softmin_tau,
+                    )
+                    if episode is None:
+                        continue
+
+                    train_episode_count += 1
+                    train_action_gap += episode["action_gap"]
+                    train_gt_action_gap += episode["gt_action_gap"]
+                    train_history_div += episode["history_div"]
+                    train_history_div_legacy += episode["history_div_legacy"]
+                    train_ce += episode["ce_value"]
+                    train_ce_objective += episode["ce_objective_value"]
+                    train_siglip_distance += episode["siglip_distance"]
+                    train_continuous_clean_gt_action_gap += episode["continuous_clean_gt_action_gap"]
+                    train_continuous_adv_gt_action_gap += episode["continuous_adv_gt_action_gap"]
+                    train_continuous_rollout_delta += episode["continuous_rollout_delta"]
+                    train_impulse_rollout_area += episode["impulse_rollout_area"]
+                    train_window_rollout_clean_gt_action_gap += episode["window_rollout_clean_gt_action_gap"]
+                    train_window_rollout_adv_gt_action_gap += episode["window_rollout_adv_gt_action_gap"]
+                    train_window_rollout_deattack_gt_action_gap += episode["window_rollout_deattack_gt_action_gap"]
+                    train_window_rollout_selected_gt_action_gap += episode["window_rollout_selected_gt_action_gap"]
+                    train_window_rollout_delta_weighted += episode["window_rollout_delta_weighted"]
+                    train_window_rollout_delta_weighted_loss += episode["window_rollout_delta_weighted_loss"]
+                    train_proj_alpha += episode["projection_alpha"]
+                    train_proj_coverage += episode["projection_coverage"]
+                    train_proj_bottom += episode["projection_bottom"]
+                    train_proj_keystone += episode["projection_keystone"]
+                    train_action_terms += max(1, episode["action_terms"])
+                    train_history_terms += max(0, episode["history_terms"])
+                    train_episodes_done += float(episode["done"])
+                    train_episode_len += float(episode["episode_len"])
+                    train_per_joint_gap = self._accumulate_joint_values(train_per_joint_gap, episode["per_joint_gap"])
+                    train_gt_per_joint_gap = self._accumulate_joint_values(train_gt_per_joint_gap, episode["gt_per_joint_gap"])
+                    if (
+                        should_record_train_video
+                        and (train_video_episode is None)
+                        and self._should_dump_online_episode_video(episode)
+                    ):
+                        train_video_episode = episode
                 finally:
                     if hasattr(env, "close"):
                         env.close()
@@ -1941,23 +2162,31 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 continue
 
             grad_scale = float(max(1, train_episode_count * accumulate_steps))
-            if projection_texture.grad is not None:
-                projection_texture.grad.div_(grad_scale)
+            if texture_param.grad is not None:
+                texture_param.grad.div_(grad_scale)
             if photometric_params.has_trainable_params():
                 for param in photometric_params.parameters():
                     if param.grad is not None:
                         param.grad.div_(grad_scale)
 
             log_patch_grad = 0.0
-            if projection_texture.grad is not None:
-                log_patch_grad = projection_texture.grad.detach().abs().mean().item()
+            if texture_param.grad is not None:
+                log_patch_grad = texture_param.grad.detach().abs().mean().item()
 
             optimizer_step = ((i + 1) % accumulate_steps == 0) or ((i + 1) == num_iter)
             if optimizer_step:
                 optimizer.step()
-                projection_texture.data = projection_texture.data.clamp(0, 1)
+                self._project_texture_param_inplace(texture_param, texture_param_mode)
                 optimizer.zero_grad()
                 scheduler.step()
+
+            current_projection_texture = self._materialize_projection_texture(
+                texture_param=texture_param,
+                texture_param_mode=texture_param_mode,
+                projection_size=projection_size,
+            )
+            current_tv_loss = float(self._compute_texture_tv(current_projection_texture.detach()).item())
+            current_tv_penalty = float(lambda_tv) * float(current_tv_loss)
 
             current_projector_gain, current_projector_channel_gain = photometric_params.resolved_values()
             current_projector_gain_value = float(current_projector_gain.detach().cpu().item())
@@ -2019,15 +2248,15 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             )
             objective_score = rollout_score - (effective_lambda_ce * avg_ce_objective)
             gt_objective_score = gt_rollout_score - (effective_lambda_ce * avg_ce_objective)
-            active_action_gap = avg_gt_action_gap if action_gap_mode == "gt_farthest" else avg_action_gap
-            active_rollout_score = gt_rollout_score if action_gap_mode == "gt_farthest" else rollout_score
-            active_objective_score = gt_objective_score if action_gap_mode == "gt_farthest" else objective_score
+            active_action_gap = avg_gt_action_gap if train_action_gap_mode == "gt_farthest" else avg_action_gap
+            active_rollout_score = gt_rollout_score if train_action_gap_mode == "gt_farthest" else rollout_score
+            active_objective_score = gt_objective_score if train_action_gap_mode == "gt_farthest" else objective_score
             total_rollout_score = (
                 active_rollout_score
                 + (lambda_continuous_rollout * avg_continuous_rollout_delta)
                 + (lambda_window_rollout_loss * avg_window_rollout_metric_value)
             )
-            total_objective_score = total_rollout_score - (effective_lambda_ce * avg_ce_objective)
+            total_objective_score = total_rollout_score - (effective_lambda_ce * avg_ce_objective) - current_tv_penalty
             gpu_stats = self._collect_gpu_runtime_stats(device_index=gpu_tuner_state["device_index"])
             autotune_action = "hold(disabled)"
             if auto_gpu_tune:
@@ -2080,7 +2309,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 "TRAIN_online_gt_rollout_score": gt_rollout_score,
                 "TRAIN_online_objective_score": objective_score,
                 "TRAIN_online_gt_objective_score": gt_objective_score,
-                "TRAIN_action_gap_mode_active": str(action_gap_mode),
+                "TRAIN_action_gap_mode_active": str(train_action_gap_mode),
                 "TRAIN_online_active_action_gap": active_action_gap,
                 "TRAIN_online_active_rollout_score": active_rollout_score,
                 "TRAIN_online_active_objective_score": active_objective_score,
@@ -2088,6 +2317,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 "TRAIN_online_episode_len": avg_ep_len,
                 "TRAIN_online_ce": avg_ce,
                 "TRAIN_online_ce_objective": avg_ce_objective,
+                "TRAIN_texture_tv": float(current_tv_loss),
+                "TRAIN_lambda_tv": float(lambda_tv),
+                "TRAIN_texture_tv_penalty": float(current_tv_penalty),
                 "TRAIN_lambda_ce_effective": float(effective_lambda_ce),
                 "TRAIN_lambda_continuous_rollout": float(lambda_continuous_rollout),
                 "TRAIN_lambda_window_rollout_loss": float(lambda_window_rollout_loss),
@@ -2133,6 +2365,10 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 "TRAIN_eff_online_train_tasks_per_iter": int(eff_train_tasks_per_iter),
                 "TRAIN_autotune_action": str(autotune_action),
                 "TRAIN_phase_state_mode": str(phase_state_mode),
+                "TRAIN_phase1_action_gap_mode": str(phase1_action_gap_mode),
+                "TRAIN_anchor_horizon_iters": int(train_anchor_horizon_iters),
+                "TRAIN_anchor_block": int(current_anchor_block),
+                "TRAIN_deterministic_anchor_sampling": int(deterministic_anchor_sampling),
                 "TRAIN_phase_start_initial_count": int(train_phase_start_counts.get("initial", 0)),
                 "TRAIN_phase_start_contact_manipulate_count": int(
                     train_phase_start_counts.get("contact_manipulate", 0)
@@ -2187,7 +2423,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                         "gt_rollout_score": float(gt_rollout_score),
                         "objective_score": float(objective_score),
                         "gt_objective_score": float(gt_objective_score),
-                        "action_gap_mode_active": str(action_gap_mode),
+                        "action_gap_mode_active": str(train_action_gap_mode),
                         "active_action_gap": float(active_action_gap),
                         "active_rollout_score": float(active_rollout_score),
                         "active_objective_score": float(active_objective_score),
@@ -2243,7 +2479,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     get_libero_env=get_libero_env,
                     get_libero_image=get_libero_image,
                     get_libero_dummy_action=get_libero_dummy_action,
-                    projection_texture=projection_texture,
+                    texture_param=texture_param,
+                    texture_param_mode=texture_param_mode,
+                    projection_size=projection_size,
                     rollout_steps=eval_rollout_steps,
                     max_env_steps=eval_max_env_steps,
                     num_steps_wait=num_steps_wait,
@@ -2304,6 +2542,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     record_video_frames=should_record_val_video,
                     video_frame_source=record_online_video_frame_source,
                     action_gap_mode=action_gap_mode,
+                    lambda_tv=lambda_tv,
                     gt_softmin_tau=gt_softmin_tau,
                 )
                 val_stats["VAL_effective_lighting_enabled"] = int(
@@ -2550,8 +2789,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     self.best_rollout_score = val_stats["VAL_online_total_rollout_score"]
                     temp_save_dir = os.path.join(self.save_dir, f"{str(i)}")
                     os.makedirs(temp_save_dir, exist_ok=True)
-                    torch.save(projection_texture.detach().cpu(), os.path.join(temp_save_dir, "projection_texture.pt"))
-                    torch.save(projection_texture.detach().cpu(), os.path.join(temp_save_dir, "patch.pt"))
+                    torch.save(current_projection_texture.detach().cpu(), os.path.join(temp_save_dir, "projection_texture.pt"))
+                    torch.save(current_projection_texture.detach().cpu(), os.path.join(temp_save_dir, "patch.pt"))
+                    torch.save(texture_param.detach().cpu(), os.path.join(temp_save_dir, "texture_param.pt"))
                     save_projector_params(
                         output_dir=temp_save_dir,
                         projector_gain=current_projector_gain_value,
@@ -2559,7 +2799,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     )
                     self._save_resume_checkpoint(
                         output_dir=temp_save_dir,
-                        projection_texture=projection_texture,
+                        projection_texture=current_projection_texture,
+                        texture_param=texture_param,
                         photometric_params=photometric_params,
                         optimizer=optimizer,
                         scheduler=scheduler,
@@ -2571,8 +2812,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
 
                 temp_save_dir = os.path.join(self.save_dir, "last")
                 os.makedirs(temp_save_dir, exist_ok=True)
-                torch.save(projection_texture.detach().cpu(), os.path.join(temp_save_dir, "projection_texture.pt"))
-                torch.save(projection_texture.detach().cpu(), os.path.join(temp_save_dir, "patch.pt"))
+                torch.save(current_projection_texture.detach().cpu(), os.path.join(temp_save_dir, "projection_texture.pt"))
+                torch.save(current_projection_texture.detach().cpu(), os.path.join(temp_save_dir, "patch.pt"))
+                torch.save(texture_param.detach().cpu(), os.path.join(temp_save_dir, "texture_param.pt"))
                 save_projector_params(
                     output_dir=temp_save_dir,
                     projector_gain=current_projector_gain_value,
@@ -2580,7 +2822,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 )
                 self._save_resume_checkpoint(
                     output_dir=temp_save_dir,
-                    projection_texture=projection_texture,
+                    projection_texture=current_projection_texture,
+                    texture_param=texture_param,
                     photometric_params=photometric_params,
                     optimizer=optimizer,
                     scheduler=scheduler,
@@ -2617,8 +2860,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             elif (not eval_enabled) and eval_due_to_interval:
                 temp_save_dir = os.path.join(self.save_dir, "last")
                 os.makedirs(temp_save_dir, exist_ok=True)
-                torch.save(projection_texture.detach().cpu(), os.path.join(temp_save_dir, "projection_texture.pt"))
-                torch.save(projection_texture.detach().cpu(), os.path.join(temp_save_dir, "patch.pt"))
+                torch.save(current_projection_texture.detach().cpu(), os.path.join(temp_save_dir, "projection_texture.pt"))
+                torch.save(current_projection_texture.detach().cpu(), os.path.join(temp_save_dir, "patch.pt"))
+                torch.save(texture_param.detach().cpu(), os.path.join(temp_save_dir, "texture_param.pt"))
                 final_projector_gain, final_projector_channel_gain = photometric_params.resolved_values()
                 save_projector_params(
                     output_dir=temp_save_dir,
@@ -2627,7 +2871,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 )
                 self._save_resume_checkpoint(
                     output_dir=temp_save_dir,
-                    projection_texture=projection_texture,
+                    projection_texture=current_projection_texture,
+                    texture_param=texture_param,
                     photometric_params=photometric_params,
                     optimizer=optimizer,
                     scheduler=scheduler,
@@ -2645,7 +2890,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         get_libero_env,
         get_libero_image,
         get_libero_dummy_action,
-        projection_texture,
+        texture_param,
+        texture_param_mode,
+        projection_size,
         rollout_steps,
         max_env_steps,
         num_steps_wait,
@@ -2706,8 +2953,16 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         record_video_frames,
         video_frame_source,
         action_gap_mode,
+        lambda_tv=0.0,
         gt_softmin_tau=0.05,
     ):
+        current_projection_texture = self._materialize_projection_texture(
+            texture_param=texture_param,
+            texture_param_mode=texture_param_mode,
+            projection_size=projection_size,
+        )
+        current_tv_loss = float(self._compute_texture_tv(current_projection_texture.detach()).item())
+        current_tv_penalty = float(lambda_tv) * float(current_tv_loss)
         total_action_gap = 0.0
         total_gt_action_gap = 0.0
         total_history_div = 0.0
@@ -2795,7 +3050,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                             init_state=phase_init_state,
                             init_state_idx=init_state_idx,
                             task_description=task_description,
-                            projection_texture=projection_texture,
+                            texture_param=texture_param,
+                            texture_param_mode=texture_param_mode,
+                            projection_size=projection_size,
                             rollout_steps=episode_rollout_steps,
                             max_env_steps=max_env_steps,
                             num_steps_wait=num_steps_wait,
@@ -2855,6 +3112,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                             video_frame_source=video_frame_source,
                             action_gap_mode=action_gap_mode,
                             start_phase_name=phase_name if window_rollout_probe_enabled else "initial",
+                            lambda_tv=lambda_tv,
                             gt_softmin_tau=gt_softmin_tau,
                         )
                         if episode is None:
@@ -2975,7 +3233,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             + (lambda_continuous_rollout * avg_continuous_rollout_delta)
             + (lambda_window_rollout_loss * avg_window_rollout_metric_value)
         )
-        avg_total_objective_score = avg_total_rollout_score - (lambda_ce * avg_ce_objective)
+        avg_total_objective_score = avg_total_rollout_score - (lambda_ce * avg_ce_objective) - current_tv_penalty
         current_projector_gain = float(
             projector_gain.detach().cpu().item() if torch.is_tensor(projector_gain) else projector_gain
         )
@@ -3000,6 +3258,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             "VAL_online_episode_len": avg_ep_len,
             "VAL_online_ce": avg_ce,
             "VAL_online_ce_objective": avg_ce_objective,
+            "VAL_texture_tv": float(current_tv_loss),
+            "VAL_lambda_tv": float(lambda_tv),
+            "VAL_texture_tv_penalty": float(current_tv_penalty),
             "VAL_lambda_continuous_rollout": float(lambda_continuous_rollout),
             "VAL_lambda_window_rollout_loss": float(lambda_window_rollout_loss),
             "VAL_impulse_rollout_metric_enabled": int(impulse_rollout_metric_enabled),
@@ -3145,7 +3406,9 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         get_libero_dummy_action,
         init_state,
         task_description,
-        projection_texture,
+        texture_param,
+        texture_param_mode,
+        projection_size,
         rollout_steps,
         max_env_steps,
         num_steps_wait,
@@ -3201,6 +3464,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         video_frame_source="projected_input",
         action_gap_mode="clean_adv",
         start_phase_name="initial",
+        lambda_tv=0.0,
         gt_softmin_tau=0.05,
         window_rollout_probe_enabled=False,
         window_rollout_metric_mode="delta_weighted",
@@ -3214,6 +3478,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         video_frame_source = str(video_frame_source).lower().strip()
         if video_frame_source not in ("next_obs", "orig", "projected_input", "adv"):
             video_frame_source = "projected_input"
+        lambda_tv = max(0.0, float(lambda_tv))
 
         continuous_enabled = float(lambda_continuous_rollout) > 0.0
         lambda_window_rollout_loss = float(lambda_window_rollout_loss)
@@ -3300,8 +3565,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             total_loss = torch.zeros((), device=self.vla.device, dtype=torch.float32)
             episode_weight_sum = 0.0
             grad_before_episode = None
-            if need_backward and (projection_texture.grad is not None):
-                grad_before_episode = projection_texture.grad.detach().clone()
+            if need_backward and (texture_param.grad is not None):
+                grad_before_episode = texture_param.grad.detach().clone()
             photometric_grads_before_episode = None
             if need_backward and (learnable_projector_params is not None) and learnable_projector_params.has_trainable_params():
                 photometric_grads_before_episode = []
@@ -3388,6 +3653,11 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                         current_projector_gain, current_projector_channel_gain = (
                             learnable_projector_params.resolved_values()
                         )
+                    current_projection_texture = self._materialize_projection_texture(
+                        texture_param=texture_param,
+                        texture_param_mode=texture_param_mode,
+                        projection_size=projection_size,
+                    )
                     with self._temporary_rng_seed(step_seed):
                         if not bool(disable_lighting):
                             pixel_values = self._apply_lighting_augmentation(
@@ -3402,7 +3672,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     with self._temporary_rng_seed(episode_projection_seed):
                         adv_images, attack_aux = self.randomPatchTransform.apply_attack_batch(
                             images=pixel_values,
-                            attack_texture=projection_texture,
+                            attack_texture=current_projection_texture,
                             mean=self.mean,
                             std=self.std,
                             attack_mode=attack_mode,
@@ -3446,12 +3716,17 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                         current_projector_gain, current_projector_channel_gain = (
                             learnable_projector_params.resolved_values()
                         )
+                    current_projection_texture = self._materialize_projection_texture(
+                        texture_param=texture_param,
+                        texture_param_mode=texture_param_mode,
+                        projection_size=projection_size,
+                    )
                     with self._temporary_rng_seed(step_seed):
                         clean_images = self.randomPatchTransform.im_process(pixel_values, mean=self.mean, std=self.std)
                     with self._temporary_rng_seed(episode_projection_seed):
                         adv_images, attack_aux = self.randomPatchTransform.apply_attack_batch(
                             images=pixel_values,
-                            attack_texture=projection_texture,
+                            attack_texture=current_projection_texture,
                             mean=self.mean,
                             std=self.std,
                             attack_mode=attack_mode,
@@ -3803,6 +4078,11 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     else:
                         step_ce_objective = self._compute_uada_inverse_ce_objective(step_ce)
                     step_loss = step_loss + (lambda_ce * step_ce_objective)
+                if lambda_tv > 0.0:
+                    step_loss = step_loss + (
+                        (float(lambda_tv) / float(max(1, max_steps)))
+                        * self._compute_texture_tv(current_projection_texture)
+                    )
                 weighted_step_loss = step_loss * step_weight
                 total_ce += step_ce.detach().item()
                 total_ce_objective += step_ce_objective.detach().item()
@@ -3927,13 +4207,13 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
 
             weight_denom = float(max(episode_weight_sum, 1e-8))
             total_loss = total_loss / weight_denom
-            if need_backward and (projection_texture.grad is not None):
+            if need_backward and (texture_param.grad is not None):
                 inv_weight_denom = 1.0 / weight_denom
                 if grad_before_episode is None:
-                    projection_texture.grad.mul_(inv_weight_denom)
+                    texture_param.grad.mul_(inv_weight_denom)
                 else:
-                    episode_delta_grad = projection_texture.grad - grad_before_episode
-                    projection_texture.grad.copy_(grad_before_episode + (episode_delta_grad * inv_weight_denom))
+                    episode_delta_grad = texture_param.grad - grad_before_episode
+                    texture_param.grad.copy_(grad_before_episode + (episode_delta_grad * inv_weight_denom))
             if (
                 need_backward
                 and (learnable_projector_params is not None)
@@ -4409,13 +4689,16 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
 
         return "hold"
 
-    def _sample_task_ids(self, task_suite, num_tasks):
+    def _sample_task_ids(self, task_suite, num_tasks, deterministic_seed=None):
         n_tasks = int(task_suite.n_tasks)
         if n_tasks <= 0:
             return [0]
         candidate_ids = list(range(n_tasks))
         if num_tasks >= n_tasks:
             return candidate_ids
+        if deterministic_seed is not None:
+            seeded_random = random.Random(int(deterministic_seed))
+            return seeded_random.sample(candidate_ids, k=int(num_tasks))
         return random.sample(candidate_ids, k=int(num_tasks))
 
     def _sample_init_state_index(self, init_states, iter_idx, local_idx, deterministic_seed=None):

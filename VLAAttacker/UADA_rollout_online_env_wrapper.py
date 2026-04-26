@@ -96,7 +96,9 @@ def main(args):
         f"winA{args.window_rollout_exp_base}_winK{args.window_rollout_future_horizon}_winPhase{args.window_rollout_phase_scope}_"
         f"lamS{args.lambda_siglip}_"
         f"impMetric{int(args.impulse_rollout_metric_enabled)}_"
-        f"agMode{args.action_gap_mode}_"
+        f"agMode{args.action_gap_mode}_p1Ag{args.phase1_action_gap_mode}_"
+        f"texMode{args.texture_param_mode}_lat{args.latent_hw}_tv{args.lambda_tv}_"
+        f"anchorH{args.train_anchor_horizon_iters}_anchorDet{int(args.deterministic_anchor_sampling)}_"
         f"phaseState{args.phase_state_mode}_tau{args.gt_softmin_tau}_"
         f"ceMode{args.online_ce_mode}_probe{int(args.probe_mode)}_{args.probe_variant}_"
         f"autoTune{int(args.auto_gpu_tune)}_{args.gpu_tune_mode}_"
@@ -150,10 +152,16 @@ def main(args):
             "phase2_rollout": args.phase2_rollout,
             "lambda_action_gap": args.lambda_action_gap,
             "action_gap_mode": args.action_gap_mode,
+            "phase1_action_gap_mode": args.phase1_action_gap_mode,
             "gt_action_bank_path": args.gt_action_bank_path,
             "gt_softmin_tau": args.gt_softmin_tau,
             "phase_state_mode": args.phase_state_mode,
             "phase_state_cache_path": args.phase_state_cache_path,
+            "texture_param_mode": args.texture_param_mode,
+            "latent_hw": args.latent_hw,
+            "lambda_tv": args.lambda_tv,
+            "train_anchor_horizon_iters": args.train_anchor_horizon_iters,
+            "deterministic_anchor_sampling": args.deterministic_anchor_sampling,
             "lambda_history": args.lambda_history,
             "lambda_history_legacy": args.lambda_history_legacy,
             "lambda_ce": args.lambda_ce,
@@ -386,6 +394,12 @@ def main(args):
         env_seed=args.env_seed,
         dataset_name=args.dataset,
         action_gap_mode=args.action_gap_mode,
+        phase1_action_gap_mode=args.phase1_action_gap_mode,
+        texture_param_mode=args.texture_param_mode,
+        latent_hw=args.latent_hw,
+        lambda_tv=args.lambda_tv,
+        train_anchor_horizon_iters=args.train_anchor_horizon_iters,
+        deterministic_anchor_sampling=args.deterministic_anchor_sampling,
         gt_dataset_root=args.gt_dataset_root,
         gt_action_bank_path=args.gt_action_bank_path,
         gt_softmin_tau=args.gt_softmin_tau,
@@ -465,10 +479,16 @@ def arg_parser():
     parser.add_argument("--phase2_rollout", default=24, type=int)
     parser.add_argument("--lambda_action_gap", default=1.0, type=float)
     parser.add_argument("--action_gap_mode", default="gt_farthest", type=str)
+    parser.add_argument("--phase1_action_gap_mode", default="inherit", type=str)
     parser.add_argument("--gt_action_bank_path", default="", type=str)
     parser.add_argument("--gt_softmin_tau", default=0.05, type=float)
     parser.add_argument("--phase_state_mode", default="phase_cycle", type=str)
     parser.add_argument("--phase_state_cache_path", default="", type=str)
+    parser.add_argument("--texture_param_mode", default="direct", type=str)
+    parser.add_argument("--latent_hw", default="12,12", type=list_of_ints)
+    parser.add_argument("--lambda_tv", default=0.0, type=float)
+    parser.add_argument("--train_anchor_horizon_iters", default=1, type=int)
+    parser.add_argument("--deterministic_anchor_sampling", type=str2bool, default=False)
     parser.add_argument("--lambda_history", default=0.0, type=float)
     parser.add_argument("--lambda_history_legacy", default=0.0, type=float)
     parser.add_argument("--lambda_ce", default=0.02, type=float)
@@ -611,7 +631,11 @@ if __name__ == "__main__":
         f" photometric_lr_ratio:{args.photometric_lr_ratio}\n"
         f" phase1_ratio:{args.phase1_ratio}\n phase1_rollout:{args.phase1_rollout}\n"
         f" phase2_rollout:{args.phase2_rollout}\n lambda_action_gap:{args.lambda_action_gap}\n"
-        f" action_gap_mode:{args.action_gap_mode}\n gt_dataset_root:{args.gt_dataset_root}\n"
+        f" action_gap_mode:{args.action_gap_mode}\n phase1_action_gap_mode:{args.phase1_action_gap_mode}\n"
+        f" texture_param_mode:{args.texture_param_mode}\n latent_hw:{args.latent_hw}\n"
+        f" lambda_tv:{args.lambda_tv}\n train_anchor_horizon_iters:{args.train_anchor_horizon_iters}\n"
+        f" deterministic_anchor_sampling:{args.deterministic_anchor_sampling}\n"
+        f" gt_dataset_root:{args.gt_dataset_root}\n"
         f" gt_action_bank_path:{args.gt_action_bank_path}\n gt_softmin_tau:{args.gt_softmin_tau}\n"
         f" phase_state_mode:{args.phase_state_mode}\n phase_state_cache_path:{args.phase_state_cache_path}\n"
         f" lambda_history:{args.lambda_history}\n lambda_history_legacy:{args.lambda_history_legacy}\n"

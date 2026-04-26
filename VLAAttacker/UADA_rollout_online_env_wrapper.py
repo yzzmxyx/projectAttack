@@ -87,7 +87,8 @@ def main(args):
     name = (
         f"{args.dataset}_UADA_rollout_onlineEnv_atk{args.attack_mode}_lr{format(args.lr, '.0e')}_iter{args.iter}_"
         f"phase1R{args.phase1_rollout}_phase2R{args.phase2_rollout}_"
-        f"lamA{args.lambda_action_gap}_lamH{args.lambda_history}_lamHL{args.lambda_history_legacy}_"
+        f"lamA{args.lambda_action_gap}_lamAG{args.lambda_anti_gt}_lamLM{args.lambda_logit_margin}_"
+        f"lamH{args.lambda_history}_lamHL{args.lambda_history_legacy}_"
         f"lamC{args.lambda_continuous_rollout}_"
         f"lamW{args.lambda_window_rollout_loss}_"
         f"winProbe{int(args.window_rollout_probe_enabled)}_"
@@ -151,6 +152,8 @@ def main(args):
             "phase1_rollout": args.phase1_rollout,
             "phase2_rollout": args.phase2_rollout,
             "lambda_action_gap": args.lambda_action_gap,
+            "lambda_anti_gt": args.lambda_anti_gt,
+            "lambda_logit_margin": args.lambda_logit_margin,
             "action_gap_mode": args.action_gap_mode,
             "phase1_action_gap_mode": args.phase1_action_gap_mode,
             "gt_action_bank_path": args.gt_action_bank_path,
@@ -307,6 +310,8 @@ def main(args):
         phase1_rollout=args.phase1_rollout,
         phase2_rollout=args.phase2_rollout,
         lambda_action_gap=args.lambda_action_gap,
+        lambda_anti_gt=args.lambda_anti_gt,
+        lambda_logit_margin=args.lambda_logit_margin,
         lambda_history=args.lambda_history,
         lambda_history_legacy=args.lambda_history_legacy,
         lambda_ce=args.lambda_ce,
@@ -478,6 +483,8 @@ def arg_parser():
     parser.add_argument("--phase1_rollout", default=8, type=int)
     parser.add_argument("--phase2_rollout", default=24, type=int)
     parser.add_argument("--lambda_action_gap", default=1.0, type=float)
+    parser.add_argument("--lambda_anti_gt", default=0.0, type=float)
+    parser.add_argument("--lambda_logit_margin", default=0.0, type=float)
     parser.add_argument("--action_gap_mode", default="gt_farthest", type=str)
     parser.add_argument("--phase1_action_gap_mode", default="inherit", type=str)
     parser.add_argument("--gt_action_bank_path", default="", type=str)
@@ -631,6 +638,7 @@ if __name__ == "__main__":
         f" photometric_lr_ratio:{args.photometric_lr_ratio}\n"
         f" phase1_ratio:{args.phase1_ratio}\n phase1_rollout:{args.phase1_rollout}\n"
         f" phase2_rollout:{args.phase2_rollout}\n lambda_action_gap:{args.lambda_action_gap}\n"
+        f" lambda_anti_gt:{args.lambda_anti_gt}\n lambda_logit_margin:{args.lambda_logit_margin}\n"
         f" action_gap_mode:{args.action_gap_mode}\n phase1_action_gap_mode:{args.phase1_action_gap_mode}\n"
         f" texture_param_mode:{args.texture_param_mode}\n latent_hw:{args.latent_hw}\n"
         f" lambda_tv:{args.lambda_tv}\n train_anchor_horizon_iters:{args.train_anchor_horizon_iters}\n"

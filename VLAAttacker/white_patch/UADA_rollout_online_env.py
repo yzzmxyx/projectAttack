@@ -84,6 +84,10 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         self.train_gt_rollout_action_gap_joints = []
         self.train_gt_rollout_score = []
         self.train_gt_rollout_objective_score = []
+        self.train_anti_gt_loss = []
+        self.train_logit_margin_loss = []
+        self.train_soft_hard_gap = []
+        self.train_token_flip_rate = []
         self.train_continuous_clean_gt_action_gap = []
         self.train_continuous_adv_gt_action_gap = []
         self.train_continuous_rollout_delta = []
@@ -105,6 +109,10 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         self.val_gt_rollout_action_gap_joints = []
         self.val_gt_rollout_score = []
         self.val_gt_rollout_objective_score = []
+        self.val_anti_gt_loss = []
+        self.val_logit_margin_loss = []
+        self.val_soft_hard_gap = []
+        self.val_token_flip_rate = []
         self.val_continuous_clean_gt_action_gap = []
         self.val_continuous_adv_gt_action_gap = []
         self.val_continuous_rollout_delta = []
@@ -160,6 +168,10 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             ("train_rollout_objective_score", "train_online_objective_score.pkl"),
             ("train_gt_rollout_score", "train_online_gt_rollout_score.pkl"),
             ("train_gt_rollout_objective_score", "train_online_gt_objective_score.pkl"),
+            ("train_anti_gt_loss", "train_online_anti_gt_loss.pkl"),
+            ("train_logit_margin_loss", "train_online_logit_margin_loss.pkl"),
+            ("train_soft_hard_gap", "train_online_soft_hard_gap.pkl"),
+            ("train_token_flip_rate", "train_online_token_flip_rate.pkl"),
             ("train_continuous_clean_gt_action_gap", "train_online_continuous_clean_gt_action_gap.pkl"),
             ("train_continuous_adv_gt_action_gap", "train_online_continuous_adv_gt_action_gap.pkl"),
             ("train_continuous_rollout_delta", "train_online_continuous_rollout_delta.pkl"),
@@ -189,6 +201,10 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             ("val_rollout_objective_score", "val_online_objective_score.pkl"),
             ("val_gt_rollout_score", "val_online_gt_rollout_score.pkl"),
             ("val_gt_rollout_objective_score", "val_online_gt_objective_score.pkl"),
+            ("val_anti_gt_loss", "val_online_anti_gt_loss.pkl"),
+            ("val_logit_margin_loss", "val_online_logit_margin_loss.pkl"),
+            ("val_soft_hard_gap", "val_online_soft_hard_gap.pkl"),
+            ("val_token_flip_rate", "val_online_token_flip_rate.pkl"),
             ("val_continuous_clean_gt_action_gap", "val_online_continuous_clean_gt_action_gap.pkl"),
             ("val_continuous_adv_gt_action_gap", "val_online_continuous_adv_gt_action_gap.pkl"),
             ("val_continuous_rollout_delta", "val_online_continuous_rollout_delta.pkl"),
@@ -450,6 +466,10 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             "ce",
             "ce_objective",
             "siglip_distance",
+            "anti_gt_loss",
+            "logit_margin_loss",
+            "soft_hard_gap",
+            "token_flip_rate",
             "continuous_clean_gt_action_gap",
             "continuous_adv_gt_action_gap",
             "continuous_rollout_delta",
@@ -1235,6 +1255,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         use_all_joints,
         gripper_weight,
         gt_softmin_tau=0.05,
+        clean_logits=None,
     ):
         batch_size = labels_full.shape[0]
         adv_action_logits = self._extract_action_logits(adv_logits, labels_full)
@@ -1247,18 +1268,26 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         if masked_adv_logits.numel() == 0 or gt_candidate_actions is None or gt_candidate_actions.numel() == 0:
             zero = torch.zeros((), device=self.vla.device, dtype=torch.float32)
             per_joint_zero = torch.zeros((self.default_action_dim,), device=self.vla.device, dtype=torch.float32)
-            return zero, zero.detach(), per_joint_zero, adv_pred_tokens.detach()
+            return zero, zero.detach(), per_joint_zero, adv_pred_tokens.detach(), zero, zero, zero.detach(), zero.detach()
 
         num_actions = int(masked_adv_logits.shape[0] // max(1, batch_size))
         if num_actions <= 0:
             zero = torch.zeros((), device=self.vla.device, dtype=torch.float32)
             per_joint_zero = torch.zeros((self.default_action_dim,), device=self.vla.device, dtype=torch.float32)
-            return zero, zero.detach(), per_joint_zero, adv_pred_tokens.detach()
+            return zero, zero.detach(), per_joint_zero, adv_pred_tokens.detach(), zero, zero, zero.detach(), zero.detach()
 
         adv_probs = F.softmax(masked_adv_logits, dim=-1)
         adv_soft_actions = (adv_probs * self.action_bin_centers).sum(dim=-1).view(batch_size, num_actions)
-        adv_hard_tokens = masked_adv_logits.argmax(dim=-1) + 31744
+        adv_hard_token_ids = masked_adv_logits.argmax(dim=-1)
+        adv_hard_tokens = adv_hard_token_ids + 31744
         adv_hard_actions = self._decode_action_tokens(adv_hard_tokens, batch_size, num_actions)
+        clean_hard_tokens = adv_hard_tokens.detach()
+        if clean_logits is not None:
+            clean_action_logits = self._extract_action_logits(clean_logits, labels_full)
+            if clean_action_logits.shape[1] >= seq_len:
+                clean_selected_logits = clean_action_logits[:, :seq_len, :][action_mask]
+                if clean_selected_logits.shape[0] == masked_adv_logits.shape[0]:
+                    clean_hard_tokens = clean_selected_logits.argmax(dim=-1).detach() + 31744
 
         gt_candidate_actions = gt_candidate_actions.to(self.vla.device, dtype=torch.float32)
         if gt_candidate_actions.ndim != 2:
@@ -1278,17 +1307,70 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         if idx_tensor.numel() == 0:
             zero = torch.zeros((), device=self.vla.device, dtype=torch.float32)
             per_joint_zero = torch.zeros((self.default_action_dim,), device=self.vla.device, dtype=torch.float32)
-            return zero, zero.detach(), per_joint_zero, adv_pred_tokens.detach()
+            return zero, zero.detach(), per_joint_zero, adv_pred_tokens.detach(), zero, zero, zero.detach(), zero.detach()
 
-        loss_action_gap, metric_action_gap, per_joint_l1 = self._compute_weighted_action_set_objective(
-            adv_soft_actions=adv_soft_actions,
-            adv_hard_actions=adv_hard_actions,
-            gt_candidate_actions=gt_candidate_actions,
-            idx_tensor=idx_tensor,
-            joint_weights=joint_weights,
-            tau=gt_softmin_tau,
+        selected_adv_soft = adv_soft_actions.index_select(1, idx_tensor)
+        selected_adv_hard = adv_hard_actions.index_select(1, idx_tensor)
+        selected_gt_candidates = gt_candidate_actions.index_select(1, idx_tensor)
+        weight_denom = joint_weights.sum().clamp(min=1e-6)
+
+        soft_squared = torch.square(selected_adv_soft[:, None, :] - selected_gt_candidates[None, :, :])
+        weighted_soft_squared = (soft_squared * joint_weights.view(1, 1, -1)).sum(dim=-1) / weight_denom
+        tau = max(float(gt_softmin_tau), 1e-6)
+        num_candidates = max(1, int(selected_gt_candidates.shape[0]))
+        soft_min_distance = -tau * (
+            torch.logsumexp(-weighted_soft_squared / tau, dim=1) - math.log(float(num_candidates))
         )
-        return loss_action_gap, metric_action_gap.detach(), per_joint_l1.detach(), adv_pred_tokens.detach()
+        loss_action_gap = soft_min_distance.mean()
+
+        hard_squared = torch.square(selected_adv_hard[:, None, :] - selected_gt_candidates[None, :, :])
+        weighted_hard_squared = (hard_squared * joint_weights.view(1, 1, -1)).sum(dim=-1) / weight_denom
+        nearest_idx = weighted_hard_squared.argmin(dim=1)
+        nearest_actions = gt_candidate_actions.index_select(0, nearest_idx)
+        per_joint_l1 = torch.abs(adv_hard_actions - nearest_actions).mean(dim=0)
+        metric_action_gap = weighted_hard_squared.min(dim=1).values.mean()
+
+        # Use the current nearest GT candidate to define token-level suppression targets.
+        soft_nearest_idx = weighted_soft_squared.argmin(dim=1)
+        reference_gt_actions = gt_candidate_actions.index_select(0, soft_nearest_idx)
+        gt_bins = self._continuous_actions_to_action_bins(reference_gt_actions)
+        reshaped_adv_logits = masked_adv_logits.view(batch_size, num_actions, -1)
+        log_probs = F.log_softmax(reshaped_adv_logits, dim=-1)
+        gt_log_prob = log_probs.gather(-1, gt_bins[..., None]).squeeze(-1)
+        anti_gt_loss = gt_log_prob.mean()
+
+        gt_logit = reshaped_adv_logits.gather(-1, gt_bins[..., None]).squeeze(-1)
+        masked_wrong_logits = reshaped_adv_logits.clone()
+        masked_wrong_logits.scatter_(
+            -1,
+            gt_bins[..., None],
+            torch.full_like(gt_bins[..., None], torch.finfo(reshaped_adv_logits.dtype).min, dtype=reshaped_adv_logits.dtype),
+        )
+        max_wrong_logit = masked_wrong_logits.max(dim=-1).values
+        logit_margin_loss = -(max_wrong_logit - gt_logit).mean()
+
+        adv_hard_actions_view = adv_hard_actions.view(batch_size, num_actions)
+        soft_hard_gap = torch.abs(adv_soft_actions.detach() - adv_hard_actions_view.detach()).mean()
+        clean_hard_tokens_view = clean_hard_tokens.view(batch_size, num_actions)
+        adv_hard_tokens_view = adv_hard_tokens.view(batch_size, num_actions)
+        token_flip_rate = (adv_hard_tokens_view != clean_hard_tokens_view).float().mean()
+        return (
+            loss_action_gap,
+            metric_action_gap.detach(),
+            per_joint_l1.detach(),
+            adv_pred_tokens.detach(),
+            anti_gt_loss,
+            logit_margin_loss,
+            soft_hard_gap.detach(),
+            token_flip_rate.detach(),
+        )
+
+    def _continuous_actions_to_action_bins(self, actions):
+        action_values = actions.to(self.vla.device, dtype=torch.float32)
+        bin_centers = self.action_bin_centers.to(action_values.device, dtype=action_values.dtype)
+        view_shape = [1] * action_values.ndim + [int(bin_centers.shape[0])]
+        bin_dist = torch.abs(action_values.unsqueeze(-1) - bin_centers.view(*view_shape))
+        return bin_dist.argmin(dim=-1).long()
 
     @staticmethod
     def _compute_weighted_action_set_objective(
@@ -1400,6 +1482,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         phase1_rollout=8,
         phase2_rollout=24,
         lambda_action_gap=1.0,
+        lambda_anti_gt=0.0,
+        lambda_logit_margin=0.0,
         lambda_history=0.0,
         lambda_history_legacy=0.0,
         lambda_ce=0.02,
@@ -1564,6 +1648,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             "phase1_ratio": float(phase1_ratio),
             "phase1_rollout": int(phase1_rollout),
             "phase2_rollout": int(phase2_rollout),
+            "lambda_anti_gt": float(lambda_anti_gt),
+            "lambda_logit_margin": float(lambda_logit_margin),
             "learn_projector_gain": bool(learn_projector_gain),
             "learn_projector_channel_gain": bool(learn_projector_channel_gain),
             "phase1_action_gap_mode": str(phase1_action_gap_mode),
@@ -1647,6 +1733,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         use_all_joints = bool(use_all_joints)
         gripper_weight = float(gripper_weight)
         lambda_action_gap = float(lambda_action_gap)
+        lambda_anti_gt = float(lambda_anti_gt)
+        lambda_logit_margin = float(lambda_logit_margin)
         lambda_history = float(lambda_history)
         lambda_history_legacy = float(lambda_history_legacy)
         lambda_ce = float(lambda_ce)
@@ -1834,6 +1922,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             f"train_anchor_horizon_iters={train_anchor_horizon_iters}, "
             f"deterministic_anchor_sampling={int(deterministic_anchor_sampling)}, "
             f"lambda_ce={lambda_ce}, lambda_ce_phase2={lambda_ce_phase2}, "
+            f"lambda_anti_gt={lambda_anti_gt}, lambda_logit_margin={lambda_logit_margin}, "
             f"lambda_continuous_rollout={lambda_continuous_rollout}, "
             f"lambda_window_rollout_loss={lambda_window_rollout_loss}, "
             f"impulse_rollout_metric_enabled={int(impulse_rollout_metric_enabled)}, "
@@ -1926,6 +2015,10 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             train_ce = 0.0
             train_ce_objective = 0.0
             train_siglip_distance = 0.0
+            train_anti_gt_loss = 0.0
+            train_logit_margin_loss = 0.0
+            train_soft_hard_gap = 0.0
+            train_token_flip_rate = 0.0
             train_continuous_clean_gt_action_gap = 0.0
             train_continuous_adv_gt_action_gap = 0.0
             train_continuous_rollout_delta = 0.0
@@ -2064,6 +2157,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                         gripper_weight=gripper_weight,
                         action_stats=action_stats,
                         lambda_action_gap=lambda_action_gap,
+                        lambda_anti_gt=lambda_anti_gt,
+                        lambda_logit_margin=lambda_logit_margin,
                         lambda_history=lambda_history,
                         lambda_history_legacy=lambda_history_legacy,
                         lambda_ce=effective_lambda_ce,
@@ -2127,6 +2222,10 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     train_ce += episode["ce_value"]
                     train_ce_objective += episode["ce_objective_value"]
                     train_siglip_distance += episode["siglip_distance"]
+                    train_anti_gt_loss += episode["anti_gt_loss"]
+                    train_logit_margin_loss += episode["logit_margin_loss"]
+                    train_soft_hard_gap += episode["soft_hard_gap"]
+                    train_token_flip_rate += episode["token_flip_rate"]
                     train_continuous_clean_gt_action_gap += episode["continuous_clean_gt_action_gap"]
                     train_continuous_adv_gt_action_gap += episode["continuous_adv_gt_action_gap"]
                     train_continuous_rollout_delta += episode["continuous_rollout_delta"]
@@ -2201,6 +2300,10 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             avg_ce = train_ce / float(max(1, train_episode_count))
             avg_ce_objective = train_ce_objective / float(max(1, train_episode_count))
             avg_siglip_distance = train_siglip_distance / float(max(1, train_episode_count))
+            avg_anti_gt_loss = train_anti_gt_loss / float(max(1, train_episode_count))
+            avg_logit_margin_loss = train_logit_margin_loss / float(max(1, train_episode_count))
+            avg_soft_hard_gap = train_soft_hard_gap / float(max(1, train_episode_count))
+            avg_token_flip_rate = train_token_flip_rate / float(max(1, train_episode_count))
             avg_continuous_clean_gt_action_gap = train_continuous_clean_gt_action_gap / float(max(1, train_episode_count))
             avg_continuous_adv_gt_action_gap = train_continuous_adv_gt_action_gap / float(max(1, train_episode_count))
             avg_continuous_rollout_delta = train_continuous_rollout_delta / float(max(1, train_episode_count))
@@ -2255,6 +2358,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 active_rollout_score
                 + (lambda_continuous_rollout * avg_continuous_rollout_delta)
                 + (lambda_window_rollout_loss * avg_window_rollout_metric_value)
+                - (lambda_anti_gt * avg_anti_gt_loss)
+                - (lambda_logit_margin * avg_logit_margin_loss)
             )
             total_objective_score = total_rollout_score - (effective_lambda_ce * avg_ce_objective) - current_tv_penalty
             gpu_stats = self._collect_gpu_runtime_stats(device_index=gpu_tuner_state["device_index"])
@@ -2279,6 +2384,10 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             self.train_gt_rollout_action_gap_joints.append(avg_gt_per_joint_gap.detach().cpu().tolist())
             self.train_gt_rollout_score.append(gt_rollout_score)
             self.train_gt_rollout_objective_score.append(gt_objective_score)
+            self.train_anti_gt_loss.append(avg_anti_gt_loss)
+            self.train_logit_margin_loss.append(avg_logit_margin_loss)
+            self.train_soft_hard_gap.append(avg_soft_hard_gap)
+            self.train_token_flip_rate.append(avg_token_flip_rate)
             self.train_continuous_clean_gt_action_gap.append(avg_continuous_clean_gt_action_gap)
             self.train_continuous_adv_gt_action_gap.append(avg_continuous_adv_gt_action_gap)
             self.train_continuous_rollout_delta.append(avg_continuous_rollout_delta)
@@ -2320,10 +2429,16 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 "TRAIN_texture_tv": float(current_tv_loss),
                 "TRAIN_lambda_tv": float(lambda_tv),
                 "TRAIN_texture_tv_penalty": float(current_tv_penalty),
+                "TRAIN_lambda_anti_gt": float(lambda_anti_gt),
+                "TRAIN_lambda_logit_margin": float(lambda_logit_margin),
                 "TRAIN_lambda_ce_effective": float(effective_lambda_ce),
                 "TRAIN_lambda_continuous_rollout": float(lambda_continuous_rollout),
                 "TRAIN_lambda_window_rollout_loss": float(lambda_window_rollout_loss),
                 "TRAIN_impulse_rollout_metric_enabled": int(impulse_rollout_metric_enabled),
+                "TRAIN_online_anti_gt_loss": avg_anti_gt_loss,
+                "TRAIN_online_logit_margin_loss": avg_logit_margin_loss,
+                "TRAIN_online_soft_hard_gap": avg_soft_hard_gap,
+                "TRAIN_online_token_flip_rate": avg_token_flip_rate,
                 "TRAIN_online_continuous_clean_gt_action_gap": avg_continuous_clean_gt_action_gap,
                 "TRAIN_online_continuous_adv_gt_action_gap": avg_continuous_adv_gt_action_gap,
                 "TRAIN_online_continuous_rollout_delta": avg_continuous_rollout_delta,
@@ -2401,6 +2516,10 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                         "ce": float(avg_ce),
                         "ce_objective": float(avg_ce_objective),
                         "siglip_distance": float(avg_siglip_distance),
+                        "anti_gt_loss": float(avg_anti_gt_loss),
+                        "logit_margin_loss": float(avg_logit_margin_loss),
+                        "soft_hard_gap": float(avg_soft_hard_gap),
+                        "token_flip_rate": float(avg_token_flip_rate),
                         "continuous_clean_gt_action_gap": float(avg_continuous_clean_gt_action_gap),
                         "continuous_adv_gt_action_gap": float(avg_continuous_adv_gt_action_gap),
                         "continuous_rollout_delta": float(avg_continuous_rollout_delta),
@@ -2493,6 +2612,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     gripper_weight=gripper_weight,
                     action_stats=action_stats,
                     lambda_action_gap=lambda_action_gap,
+                    lambda_anti_gt=lambda_anti_gt,
+                    lambda_logit_margin=lambda_logit_margin,
                     lambda_history=lambda_history,
                     lambda_history_legacy=lambda_history_legacy,
                     lambda_ce=effective_lambda_ce,
@@ -2570,6 +2691,10 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 self.val_rollout_objective_score.append(val_stats["VAL_online_objective_score"])
                 self.val_gt_rollout_score.append(val_stats["VAL_online_gt_rollout_score"])
                 self.val_gt_rollout_objective_score.append(val_stats["VAL_online_gt_objective_score"])
+                self.val_anti_gt_loss.append(val_stats["VAL_online_anti_gt_loss"])
+                self.val_logit_margin_loss.append(val_stats["VAL_online_logit_margin_loss"])
+                self.val_soft_hard_gap.append(val_stats["VAL_online_soft_hard_gap"])
+                self.val_token_flip_rate.append(val_stats["VAL_online_token_flip_rate"])
                 self.val_continuous_clean_gt_action_gap.append(
                     val_stats["VAL_online_continuous_clean_gt_action_gap"]
                 )
@@ -2636,6 +2761,10 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                             "ce": float(val_stats["VAL_online_ce"]),
                             "ce_objective": float(val_stats["VAL_online_ce_objective"]),
                             "siglip_distance": float(val_stats["VAL_online_siglip_distance"]),
+                            "anti_gt_loss": float(val_stats["VAL_online_anti_gt_loss"]),
+                            "logit_margin_loss": float(val_stats["VAL_online_logit_margin_loss"]),
+                            "soft_hard_gap": float(val_stats["VAL_online_soft_hard_gap"]),
+                            "token_flip_rate": float(val_stats["VAL_online_token_flip_rate"]),
                             "continuous_clean_gt_action_gap": float(
                                 val_stats["VAL_online_continuous_clean_gt_action_gap"]
                             ),
@@ -2714,6 +2843,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                                 "lambda_ce_phase2": float(lambda_ce_phase2),
                                 "lambda_continuous_rollout": float(lambda_continuous_rollout),
                                 "lambda_window_rollout_loss": float(lambda_window_rollout_loss),
+                                "lambda_anti_gt": float(lambda_anti_gt),
+                                "lambda_logit_margin": float(lambda_logit_margin),
                                 "impulse_rollout_metric_enabled": int(impulse_rollout_metric_enabled),
                                 "window_rollout_probe_enabled": int(window_rollout_probe_enabled),
                                 "window_rollout_metric_mode": str(window_rollout_metric_mode),
@@ -2733,6 +2864,10 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                                 "final_val_ce": float(val_stats["VAL_online_ce"]),
                                 "final_val_ce_objective": float(val_stats["VAL_online_ce_objective"]),
                                 "final_val_siglip_distance": float(val_stats["VAL_online_siglip_distance"]),
+                                "final_val_anti_gt_loss": float(val_stats["VAL_online_anti_gt_loss"]),
+                                "final_val_logit_margin_loss": float(val_stats["VAL_online_logit_margin_loss"]),
+                                "final_val_soft_hard_gap": float(val_stats["VAL_online_soft_hard_gap"]),
+                                "final_val_token_flip_rate": float(val_stats["VAL_online_token_flip_rate"]),
                                 "final_val_continuous_clean_gt_action_gap": float(
                                     val_stats["VAL_online_continuous_clean_gt_action_gap"]
                                 ),
@@ -2904,6 +3039,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         gripper_weight,
         action_stats,
         lambda_action_gap,
+        lambda_anti_gt,
+        lambda_logit_margin,
         lambda_history,
         lambda_history_legacy,
         lambda_ce,
@@ -2970,6 +3107,10 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         total_ce = 0.0
         total_ce_objective = 0.0
         total_siglip_distance = 0.0
+        total_anti_gt_loss = 0.0
+        total_logit_margin_loss = 0.0
+        total_soft_hard_gap = 0.0
+        total_token_flip_rate = 0.0
         total_continuous_clean_gt_action_gap = 0.0
         total_continuous_adv_gt_action_gap = 0.0
         total_continuous_rollout_delta = 0.0
@@ -3064,6 +3205,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                             gripper_weight=gripper_weight,
                             action_stats=action_stats,
                             lambda_action_gap=lambda_action_gap,
+                            lambda_anti_gt=lambda_anti_gt,
+                            lambda_logit_margin=lambda_logit_margin,
                             lambda_history=lambda_history,
                             lambda_history_legacy=lambda_history_legacy,
                             lambda_ce=lambda_ce,
@@ -3128,6 +3271,10 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                         total_ce += episode["ce_value"]
                         total_ce_objective += episode["ce_objective_value"]
                         total_siglip_distance += episode["siglip_distance"]
+                        total_anti_gt_loss += episode["anti_gt_loss"]
+                        total_logit_margin_loss += episode["logit_margin_loss"]
+                        total_soft_hard_gap += episode["soft_hard_gap"]
+                        total_token_flip_rate += episode["token_flip_rate"]
                         total_continuous_clean_gt_action_gap += episode["continuous_clean_gt_action_gap"]
                         total_continuous_adv_gt_action_gap += episode["continuous_adv_gt_action_gap"]
                         total_continuous_rollout_delta += episode["continuous_rollout_delta"]
@@ -3168,6 +3315,10 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         avg_ce = total_ce / divisor
         avg_ce_objective = total_ce_objective / divisor
         avg_siglip_distance = total_siglip_distance / divisor
+        avg_anti_gt_loss = total_anti_gt_loss / divisor
+        avg_logit_margin_loss = total_logit_margin_loss / divisor
+        avg_soft_hard_gap = total_soft_hard_gap / divisor
+        avg_token_flip_rate = total_token_flip_rate / divisor
         avg_continuous_clean_gt_action_gap = total_continuous_clean_gt_action_gap / divisor
         avg_continuous_adv_gt_action_gap = total_continuous_adv_gt_action_gap / divisor
         avg_continuous_rollout_delta = total_continuous_rollout_delta / divisor
@@ -3232,6 +3383,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             avg_active_rollout_score
             + (lambda_continuous_rollout * avg_continuous_rollout_delta)
             + (lambda_window_rollout_loss * avg_window_rollout_metric_value)
+            - (lambda_anti_gt * avg_anti_gt_loss)
+            - (lambda_logit_margin * avg_logit_margin_loss)
         )
         avg_total_objective_score = avg_total_rollout_score - (lambda_ce * avg_ce_objective) - current_tv_penalty
         current_projector_gain = float(
@@ -3261,9 +3414,15 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             "VAL_texture_tv": float(current_tv_loss),
             "VAL_lambda_tv": float(lambda_tv),
             "VAL_texture_tv_penalty": float(current_tv_penalty),
+            "VAL_lambda_anti_gt": float(lambda_anti_gt),
+            "VAL_lambda_logit_margin": float(lambda_logit_margin),
             "VAL_lambda_continuous_rollout": float(lambda_continuous_rollout),
             "VAL_lambda_window_rollout_loss": float(lambda_window_rollout_loss),
             "VAL_impulse_rollout_metric_enabled": int(impulse_rollout_metric_enabled),
+            "VAL_online_anti_gt_loss": avg_anti_gt_loss,
+            "VAL_online_logit_margin_loss": avg_logit_margin_loss,
+            "VAL_online_soft_hard_gap": avg_soft_hard_gap,
+            "VAL_online_token_flip_rate": avg_token_flip_rate,
             "VAL_online_continuous_clean_gt_action_gap": avg_continuous_clean_gt_action_gap,
             "VAL_online_continuous_adv_gt_action_gap": avg_continuous_adv_gt_action_gap,
             "VAL_online_continuous_rollout_delta": avg_continuous_rollout_delta,
@@ -3370,7 +3529,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             per_joint_zero = torch.zeros((self.default_action_dim,), device=self.vla.device, dtype=torch.float32)
             return branch_pred_tokens.detach(), zero, zero.detach(), per_joint_zero
 
-        branch_gt_loss, branch_gt_metric, branch_gt_per_joint, _ = self._compute_gt_action_gap_losses(
+        branch_gt_loss, branch_gt_metric, branch_gt_per_joint, _, _, _, _, _ = self._compute_gt_action_gap_losses(
             adv_logits=output_branch.logits,
             labels_full=labels_full,
             action_mask_full=action_mask_full,
@@ -3420,6 +3579,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         gripper_weight,
         action_stats,
         lambda_action_gap,
+        lambda_anti_gt,
+        lambda_logit_margin,
         lambda_history,
         lambda_history_legacy,
         lambda_ce,
@@ -3482,6 +3643,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
 
         continuous_enabled = float(lambda_continuous_rollout) > 0.0
         lambda_window_rollout_loss = float(lambda_window_rollout_loss)
+        lambda_anti_gt = float(lambda_anti_gt)
+        lambda_logit_margin = float(lambda_logit_margin)
         impulse_enabled = bool(impulse_rollout_metric_enabled)
         window_rollout_metric_mode = normalize_window_rollout_metric_mode(window_rollout_metric_mode)
         window_rollout_future_mode = normalize_window_rollout_future_mode(window_rollout_future_mode)
@@ -3489,7 +3652,12 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         deattack_future_enabled = window_rollout_enabled and (window_rollout_future_mode == "drop_attack_after_window")
         need_aux_clean_branch = continuous_enabled or impulse_enabled or window_rollout_enabled
         need_any_gt_rollout = (
-            (action_gap_mode == "gt_farthest") or continuous_enabled or impulse_enabled or window_rollout_enabled
+            (action_gap_mode == "gt_farthest")
+            or continuous_enabled
+            or impulse_enabled
+            or window_rollout_enabled
+            or (lambda_anti_gt > 0.0)
+            or (lambda_logit_margin > 0.0)
         )
 
         effective_num_steps_wait = 0 if start_phase_name != "initial" else max(0, int(num_steps_wait))
@@ -3582,6 +3750,10 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
             total_ce = 0.0
             total_ce_objective = 0.0
             total_siglip_distance = 0.0
+            total_anti_gt_loss = 0.0
+            total_logit_margin_loss = 0.0
+            total_soft_hard_gap = 0.0
+            total_token_flip_rate = 0.0
             total_continuous_clean_gt_gap = 0.0
             total_continuous_adv_gt_gap = 0.0
             total_continuous_rollout_delta = 0.0
@@ -3819,15 +3991,29 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 zero = torch.zeros((), device=self.vla.device, dtype=torch.float32)
                 step_gt_action_gap_loss = zero
                 step_gt_action_gap_metric = zero.detach()
+                step_anti_gt_loss = zero
+                step_logit_margin_loss = zero
+                step_soft_hard_gap = zero.detach()
+                step_token_flip_rate = zero.detach()
                 step_gt_per_joint_gap = torch.zeros(
                     (self.default_action_dim,),
                     device=self.vla.device,
                     dtype=torch.float32,
                 )
                 if action_gap_mode == "gt_farthest":
-                    step_gt_action_gap_loss, step_gt_action_gap_metric, step_gt_per_joint_gap, _ = (
+                    (
+                        step_gt_action_gap_loss,
+                        step_gt_action_gap_metric,
+                        step_gt_per_joint_gap,
+                        _,
+                        step_anti_gt_loss,
+                        step_logit_margin_loss,
+                        step_soft_hard_gap,
+                        step_token_flip_rate,
+                    ) = (
                         self._compute_gt_action_gap_losses(
                             adv_logits=output_adv.logits,
+                            clean_logits=output_clean.logits,
                             labels_full=labels_full,
                             action_mask_full=action_mask_full,
                             gt_candidate_actions=gt_candidate_actions,
@@ -3837,10 +4023,20 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                             gt_softmin_tau=gt_softmin_tau,
                         )
                     )
-                elif continuous_enabled or impulse_enabled or window_rollout_enabled:
-                    step_gt_action_gap_loss, step_gt_action_gap_metric, step_gt_per_joint_gap, _ = (
+                elif continuous_enabled or impulse_enabled or window_rollout_enabled or (lambda_anti_gt > 0.0) or (lambda_logit_margin > 0.0):
+                    (
+                        step_gt_action_gap_loss,
+                        step_gt_action_gap_metric,
+                        step_gt_per_joint_gap,
+                        _,
+                        step_anti_gt_loss,
+                        step_logit_margin_loss,
+                        step_soft_hard_gap,
+                        step_token_flip_rate,
+                    ) = (
                         self._compute_gt_action_gap_losses(
                             adv_logits=output_adv.logits,
+                            clean_logits=output_clean.logits,
                             labels_full=labels_full,
                             action_mask_full=action_mask_full,
                             gt_candidate_actions=gt_candidate_actions,
@@ -3853,6 +4049,10 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 if action_gap_mode == "gt_farthest":
                     total_gt_action_gap += step_gt_action_gap_metric.item()
                     total_gt_per_joint = self._accumulate_joint_values(total_gt_per_joint, step_gt_per_joint_gap)
+                total_anti_gt_loss += float(step_anti_gt_loss.detach().item())
+                total_logit_margin_loss += float(step_logit_margin_loss.detach().item())
+                total_soft_hard_gap += float(step_soft_hard_gap.detach().item())
+                total_token_flip_rate += float(step_token_flip_rate.detach().item())
 
                 clean_pred_tokens = self._extract_pred_action_tokens_from_logits(output_clean.logits, labels_full)
                 step_history_div = torch.zeros((), device=self.vla.device, dtype=torch.float32)
@@ -4014,6 +4214,8 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     step_gt_action_gap_loss if action_gap_mode == "gt_farthest" else step_action_gap_loss
                 )
                 step_loss = -(lambda_action_gap * active_step_action_gap_loss)
+                step_loss = step_loss + (lambda_anti_gt * step_anti_gt_loss)
+                step_loss = step_loss + (lambda_logit_margin * step_logit_margin_loss)
                 if continuous_enabled and clean_branch_active:
                     continuous_step_delta_loss = step_gt_action_gap_loss - clean_branch_gt_loss.detach()
                     continuous_step_delta_metric = step_gt_action_gap_metric - clean_branch_gt_metric
@@ -4265,6 +4467,10 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 "ce_value": total_ce / float(ep_steps),
                 "ce_objective_value": total_ce_objective / float(ep_steps),
                 "siglip_distance": total_siglip_distance / float(ep_steps),
+                "anti_gt_loss": total_anti_gt_loss / float(ep_steps),
+                "logit_margin_loss": total_logit_margin_loss / float(ep_steps),
+                "soft_hard_gap": total_soft_hard_gap / float(ep_steps),
+                "token_flip_rate": total_token_flip_rate / float(ep_steps),
                 "continuous_clean_gt_action_gap": (
                     total_continuous_clean_gt_gap / float(max(1, total_continuous_terms))
                     if total_continuous_terms > 0

@@ -6,9 +6,27 @@ current_dir="$(cd "${SCRIPT_DIR}/.." && pwd)"
 echo "${current_dir}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.8}"
 
+PYTHON_BIN_VALUE="${PYTHON_BIN:-}"
+if [[ -z "${PYTHON_BIN_VALUE}" ]]; then
+    if [[ -n "${CONDA_PREFIX:-}" && "${CONDA_DEFAULT_ENV:-}" != "base" && -x "${CONDA_PREFIX}/bin/python" ]]; then
+        PYTHON_BIN_VALUE="${CONDA_PREFIX}/bin/python"
+    elif [[ -x "/home/ubuntu/anaconda3/envs/roboticAttack/bin/python" ]]; then
+        PYTHON_BIN_VALUE="/home/ubuntu/anaconda3/envs/roboticAttack/bin/python"
+    elif [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
+        PYTHON_BIN_VALUE="${CONDA_PREFIX}/bin/python"
+    else
+        PYTHON_BIN_VALUE="python3.10"
+    fi
+fi
+
+LIBERO_ROOT_VALUE="${LIBERO_ROOT:-/home/ubuntu/libero_pipeline/LIBERO}"
+if [[ -d "${LIBERO_ROOT_VALUE}" ]]; then
+    export PYTHONPATH="${LIBERO_ROOT_VALUE}${PYTHONPATH:+:${PYTHONPATH}}"
+fi
+
 # Match the historical probe budget/task-suite defaults so GT runs stay directly comparable.
 DATASET_NAME="${DATASET:-libero_spatial}"
-DEVICE_ID="${DEVICE:-7}"
+DEVICE_ID="${DEVICE_ID:-${DEVICE:-7}}"
 ACCUMULATE_STEPS="${ACCUMULATE:-1}"
 WARMUP_STEPS="${WARMUP:-2}"
 PHASE2_ROLLOUT_STEPS="${PHASE2_ROLLOUT:-24}"
@@ -16,6 +34,8 @@ SAVE_INTERVAL_STEPS="${SAVE_INTERVAL:-50}"
 WANDB_PROJECT_NAME="${WANDB_PROJECT:-projectAttack}"
 WANDB_ENTITY_NAME="${WANDB_ENTITY:-1473195970-beihang-university}"
 LAMBDA_ACTION_GAP="${LAMBDA_ACTION_GAP:-1.0}"
+LAMBDA_ANTI_GT="${LAMBDA_ANTI_GT:-0.0}"
+LAMBDA_LOGIT_MARGIN="${LAMBDA_LOGIT_MARGIN:-0.0}"
 LAMBDA_HISTORY="${LAMBDA_HISTORY:-0.0}"
 LAMBDA_HISTORY_LEGACY="${LAMBDA_HISTORY_LEGACY:-0.0}"
 LAMBDA_CE="${LAMBDA_CE:-0.0}"
@@ -109,7 +129,7 @@ if [[ "${ULTRA_LOW_MEM_PRESET}" == "true" ]]; then
     RECORD_ONLINE_VAL_VIDEO_VALUE="${RECORD_ONLINE_VAL_VIDEO:-false}"
 fi
 
-python3.10 - <<'PY'
+"${PYTHON_BIN_VALUE}" - <<'PY'
 import importlib.util
 import sys
 
@@ -124,7 +144,7 @@ except Exception as exc:
 print("LIBERO dependency check passed.")
 PY
 
-python3.10 VLAAttacker/UADA_rollout_online_env_wrapper.py \
+"${PYTHON_BIN_VALUE}" VLAAttacker/UADA_rollout_online_env_wrapper.py \
     --maskidx 0,1,2 \
     --use_all_joints false \
     --gripper_weight 0.5 \
@@ -176,6 +196,8 @@ python3.10 VLAAttacker/UADA_rollout_online_env_wrapper.py \
     --phase1_rollout 8 \
     --phase2_rollout "${PHASE2_ROLLOUT_STEPS}" \
     --lambda_action_gap "${LAMBDA_ACTION_GAP}" \
+    --lambda_anti_gt "${LAMBDA_ANTI_GT}" \
+    --lambda_logit_margin "${LAMBDA_LOGIT_MARGIN}" \
     --lambda_history "${LAMBDA_HISTORY}" \
     --lambda_history_legacy "${LAMBDA_HISTORY_LEGACY}" \
     --lambda_ce "${LAMBDA_CE}" \

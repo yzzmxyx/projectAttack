@@ -63,8 +63,11 @@ def main(args):
     pwd = os.getcwd()
     vla_path = resolve_vla_path(args.dataset)
     resume_run_dir = "" if args.resume_run_dir is None else str(args.resume_run_dir).strip()
+    output_dir = "" if args.output_dir is None else str(args.output_dir).strip()
     if resume_run_dir.lower() in ("none", "null"):
         resume_run_dir = ""
+    if output_dir.lower() in ("none", "null"):
+        output_dir = ""
     if resume_run_dir != "":
         resume_run_dir = os.path.abspath(os.path.expanduser(resume_run_dir))
         if not os.path.isdir(resume_run_dir):
@@ -72,8 +75,12 @@ def main(args):
         exp_id = os.path.basename(resume_run_dir.rstrip(os.sep))
         path = resume_run_dir
     else:
-        exp_id = str(uuid.uuid4())
-        path = f"{pwd}/run/UADA_rollout_online_env/{exp_id}"
+        if output_dir != "":
+            path = os.path.abspath(os.path.expanduser(output_dir))
+            exp_id = os.path.basename(path.rstrip(os.sep))
+        else:
+            exp_id = str(uuid.uuid4())
+            path = f"{pwd}/run/UADA_rollout_online_env/{exp_id}"
         os.makedirs(path, exist_ok=True)
 
     set_seed(42)
@@ -448,6 +455,7 @@ def arg_parser():
     parser.add_argument("--projection_size", default=None, type=list_of_ints_or_none)
     parser.add_argument("--init_projection_texture_path", default="", type=str)
     parser.add_argument("--resume_run_dir", default="", type=str)
+    parser.add_argument("--output_dir", default="", type=str)
     parser.add_argument("--projection_alpha", default=0.55, type=float)
     parser.add_argument("--projection_alpha_jitter", default=0.10, type=float)
     parser.add_argument("--projection_soft_edge", default=1.2, type=float)

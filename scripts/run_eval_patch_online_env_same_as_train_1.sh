@@ -2,10 +2,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-current_dir="$(cd "${SCRIPT_DIR}/.." && pwd)"
-echo "${current_dir}"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${PROJECT_ROOT}"
+echo "${PROJECT_ROOT}"
+
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.8}"
-ISOLATED_PYDEPS_DIR="${current_dir}/.isolated_pydeps/run_uada_online_env_1"
+ISOLATED_PYDEPS_DIR="${PROJECT_ROOT}/.isolated_pydeps/run_uada_online_env_1"
 
 PYTHON_BIN_VALUE="${PYTHON_BIN:-}"
 if [[ -z "${PYTHON_BIN_VALUE}" ]]; then
@@ -58,17 +60,124 @@ if [[ -d "${LIBERO_ROOT_VALUE}" ]]; then
 fi
 export PYTHONPATH="${EXTRA_PYTHONPATH}${PYTHONPATH:+:${PYTHONPATH}}"
 
-# Match the historical probe budget/task-suite defaults so GT runs stay directly comparable.
+INPUT_REF="${1:-}"
+PATCH_PATH_VALUE="${PATCH_PATH:-}"
+PATCH_DIR_VALUE="${PATCH_DIR:-}"
+SOURCE_RUN_DIR_VALUE="${SOURCE_RUN_DIR:-}"
+SOURCE_EXP_ID_VALUE="${SOURCE_EXP_ID:-}"
+
+if [[ -n "${INPUT_REF}" && -z "${PATCH_PATH_VALUE}" && -z "${PATCH_DIR_VALUE}" && -z "${SOURCE_RUN_DIR_VALUE}" && -z "${SOURCE_EXP_ID_VALUE}" ]]; then
+    if [[ -f "${INPUT_REF}" ]]; then
+        PATCH_PATH_VALUE="${INPUT_REF}"
+    elif [[ -d "${INPUT_REF}" ]]; then
+        PATCH_DIR_VALUE="${INPUT_REF}"
+    else
+        SOURCE_EXP_ID_VALUE="${INPUT_REF}"
+    fi
+fi
+
+mapfile -t PATCH_INFO < <(
+    PROJECT_ROOT="${PROJECT_ROOT}" \
+    PATCH_PATH="${PATCH_PATH_VALUE}" \
+    PATCH_DIR="${PATCH_DIR_VALUE}" \
+    SOURCE_RUN_DIR="${SOURCE_RUN_DIR_VALUE}" \
+    SOURCE_EXP_ID="${SOURCE_EXP_ID_VALUE}" \
+    "${PYTHON_BIN_VALUE}" - <<'PY'
+import os
+from pathlib import Path
+
+import torch
+
+project_root = Path(os.environ["PROJECT_ROOT"]).resolve()
+patch_path_arg = os.environ.get("PATCH_PATH", "").strip()
+patch_dir_arg = os.environ.get("PATCH_DIR", "").strip()
+source_run_dir_arg = os.environ.get("SOURCE_RUN_DIR", "").strip()
+source_exp_id_arg = os.environ.get("SOURCE_EXP_ID", "").strip()
+run_base = project_root / "run" / "UADA_rollout_online_env"
+
+sources = [bool(patch_path_arg), bool(patch_dir_arg), bool(source_run_dir_arg), bool(source_exp_id_arg)]
+if sum(sources) > 1:
+    raise ValueError("Only one of PATCH_PATH, PATCH_DIR, SOURCE_RUN_DIR, SOURCE_EXP_ID may be set.")
+
+def candidate_paths(root: Path):
+    return [
+        root / "last" / "projection_texture.pt",
+        root / "last" / "patch.pt",
+        root / "projection_texture.pt",
+        root / "patch.pt",
+        root / "initial" / "projection_texture.pt",
+        root / "initial" / "patch.pt",
+    ]
+
+def resolve_from_dir(root_str: str):
+    root = Path(os.path.abspath(os.path.expanduser(root_str)))
+    for candidate in candidate_paths(root):
+        if candidate.is_file():
+            return root, candidate
+    raise FileNotFoundError(
+        f"No patch found under {root}. Checked: "
+        "last/projection_texture.pt, last/patch.pt, projection_texture.pt, patch.pt, "
+        "initial/projection_texture.pt, initial/patch.pt"
+    )
+
+resolved_run_dir = None
+resolved_patch_path = None
+
+if patch_path_arg:
+    resolved_patch_path = Path(os.path.abspath(os.path.expanduser(patch_path_arg)))
+    if not resolved_patch_path.is_file():
+        raise FileNotFoundError(f"PATCH_PATH not found: {resolved_patch_path}")
+    if resolved_patch_path.parent.name == "last":
+        resolved_run_dir = resolved_patch_path.parent.parent
+    else:
+        resolved_run_dir = resolved_patch_path.parent
+elif patch_dir_arg:
+    resolved_run_dir, resolved_patch_path = resolve_from_dir(patch_dir_arg)
+elif source_run_dir_arg:
+    resolved_run_dir, resolved_patch_path = resolve_from_dir(source_run_dir_arg)
+elif source_exp_id_arg:
+    resolved_run_dir, resolved_patch_path = resolve_from_dir(str(run_base / source_exp_id_arg))
+else:
+    raise FileNotFoundError(
+        "No patch source provided. Pass a patch file or run dir as argv[1], "
+        "or set PATCH_PATH / PATCH_DIR / SOURCE_RUN_DIR / SOURCE_EXP_ID."
+    )
+
+loaded = torch.as_tensor(torch.load(resolved_patch_path, map_location="cpu"))
+shape_csv = ",".join(str(int(x)) for x in loaded.shape)
+print(str(resolved_run_dir))
+print(str(resolved_patch_path))
+print(shape_csv)
+PY
+)
+
+if [[ "${#PATCH_INFO[@]}" -lt 3 ]]; then
+    echo "Failed to resolve patch source." >&2
+    exit 1
+fi
+
+RESOLVED_SOURCE_RUN_DIR="${PATCH_INFO[0]}"
+RESOLVED_PATCH_PATH="${PATCH_INFO[1]}"
+INFERRED_PATCH_SHAPE="${PATCH_INFO[2]}"
+
+EVAL_RUN_UUID="$("${PYTHON_BIN_VALUE}" - <<'PY'
+import uuid
+print(uuid.uuid4())
+PY
+)"
+EVAL_OUTPUT_ROOT="${EVAL_OUTPUT_ROOT:-${PROJECT_ROOT}/run/UADA_eval_patch_online_env_same_as_train_1}"
+OUTPUT_DIR_VALUE="${OUTPUT_DIR:-${EVAL_OUTPUT_ROOT}/${EVAL_RUN_UUID}}"
+mkdir -p "${OUTPUT_DIR_VALUE}"
+
+PATCH_SIZE_VALUE="${PATCH_SIZE:-${INFERRED_PATCH_SHAPE}}"
+PROJECTION_SIZE_VALUE="${PROJECTION_SIZE:-${INFERRED_PATCH_SHAPE}}"
+
 DATASET_NAME="${DATASET:-libero_spatial}"
 DEVICE_ID="${DEVICE_ID:-${DEVICE:-7}}"
 GPU_HEALTHCHECK_ENABLED="${GPU_HEALTHCHECK_ENABLED:-true}"
-ACCUMULATE_STEPS="${ACCUMULATE:-2}"
-WARMUP_STEPS="${WARMUP:-2}"
-PHASE2_ROLLOUT_STEPS="${PHASE2_ROLLOUT:-24}"
-SAVE_INTERVAL_STEPS="${SAVE_INTERVAL:-2}"
-WANDB_PROJECT_NAME="${WANDB_PROJECT:-projectAttack}"
+WANDB_PROJECT_NAME="${WANDB_PROJECT:-false}"
 WANDB_ENTITY_NAME="${WANDB_ENTITY:-1473195970-beihang-university}"
-LAMBDA_ACTION_GAP="${LAMBDA_ACTION_GAP:-1.0}"
+LAMBDA_ACTION_GAP="${LAMBDA_ACTION_GAP:-1.5}"
 LAMBDA_ANTI_GT="${LAMBDA_ANTI_GT:-0.02}"
 LAMBDA_LOGIT_MARGIN="${LAMBDA_LOGIT_MARGIN:-0.02}"
 LAMBDA_HISTORY="${LAMBDA_HISTORY:-0.0}"
@@ -76,7 +185,7 @@ LAMBDA_HISTORY_LEGACY="${LAMBDA_HISTORY_LEGACY:-0.0}"
 LAMBDA_CE="${LAMBDA_CE:-0.0}"
 LAMBDA_CE_PHASE2="${LAMBDA_CE_PHASE2:-0.0}"
 LAMBDA_CONTINUOUS_ROLLOUT="${LAMBDA_CONTINUOUS_ROLLOUT:-0.0}"
-LAMBDA_WINDOW_ROLLOUT_LOSS="${LAMBDA_WINDOW_ROLLOUT_LOSS:-1.0}"
+LAMBDA_WINDOW_ROLLOUT_LOSS="${LAMBDA_WINDOW_ROLLOUT_LOSS:-0.2}"
 IMPULSE_ROLLOUT_METRIC_ENABLED="${IMPULSE_ROLLOUT_METRIC_ENABLED:-false}"
 WINDOW_ROLLOUT_PROBE_ENABLED_VALUE="${WINDOW_ROLLOUT_PROBE_ENABLED:-true}"
 WINDOW_ROLLOUT_METRIC_MODE_VALUE="${WINDOW_ROLLOUT_METRIC_MODE:-adv_gt}"
@@ -84,36 +193,25 @@ WINDOW_ROLLOUT_FUTURE_MODE_VALUE="${WINDOW_ROLLOUT_FUTURE_MODE:-drop_attack_afte
 WINDOW_ROLLOUT_EXP_BASE_VALUE="${WINDOW_ROLLOUT_EXP_BASE:-0.9}"
 WINDOW_ROLLOUT_FUTURE_HORIZON_VALUE="${WINDOW_ROLLOUT_FUTURE_HORIZON:-8}"
 WINDOW_ROLLOUT_PHASE_SCOPE_VALUE="${WINDOW_ROLLOUT_PHASE_SCOPE:-initial}"
-LAMBDA_SIGLIP="${LAMBDA_SIGLIP:-0.15}"
+LAMBDA_SIGLIP="${LAMBDA_SIGLIP:-0.5}"
 ONLINE_CE_MODE_NAME="${ONLINE_CE_MODE:-off}"
 SIGLIP_MODEL_NAME_VALUE="${SIGLIP_MODEL_NAME:-google/siglip-so400m-patch14-384}"
 SIGLIP_INPUT_SIZE_VALUE="${SIGLIP_INPUT_SIZE:-384}"
-PATCH_SIZE_VALUE="${PATCH_SIZE:-3,50,50}"
-PROJECTION_SIZE_VALUE="${PROJECTION_SIZE:-${PATCH_SIZE_VALUE}}"
 ENV_RESOLUTION_VALUE="${ENV_RESOLUTION:-256}"
-TRAIN_TASKS_PER_ITER="${ONLINE_TRAIN_TASKS_PER_ITER:-1}"
-TRAIN_EPISODES_PER_TASK="${ONLINE_TRAIN_EPISODES_PER_TASK:-4}"
 VAL_EPISODES="${ONLINE_VAL_EPISODES:-8}"
 VAL_MAX_ENV_STEPS="${VAL_MAX_ENV_STEPS:-180}"
 TASK_SUITE_NAME="${TASK_SUITE_NAME:-auto}"
-VIZ_ENABLED_VALUE="${VIZ_ENABLED:-false}"
-VIZ_SAVE_BEST_VALUE="${VIZ_SAVE_BEST:-false}"
-VIZ_SAVE_LAST_VALUE="${VIZ_SAVE_LAST:-false}"
 PHASE1_DISABLE_PROJ_RAND="${PHASE1_DISABLE_PROJECTION_RANDOMIZATION:-true}"
 LEARN_PROJECTOR_GAIN="${LEARN_PROJECTOR_GAIN:-false}"
 LEARN_PROJECTOR_CHANNEL_GAIN="${LEARN_PROJECTOR_CHANNEL_GAIN:-false}"
 PHOTOMETRIC_LR_RATIO="${PHOTOMETRIC_LR_RATIO:-0.1}"
-LOW_MEM_PRESET="${LOW_MEM_PRESET:-false}"
-ULTRA_LOW_MEM_PRESET="${ULTRA_LOW_MEM_PRESET:-false}"
-EVAL_ENABLED_VALUE="${EVAL_ENABLED:-true}"
 RECORD_ONLINE_VIDEOS_VALUE="${RECORD_ONLINE_VIDEOS:-true}"
 RECORD_ONLINE_VIDEOS_LAST_ONLY_VALUE="${RECORD_ONLINE_VIDEOS_LAST_ONLY:-false}"
 RECORD_ONLINE_TRAIN_VIDEO_VALUE="${RECORD_ONLINE_TRAIN_VIDEO:-false}"
 RECORD_ONLINE_VAL_VIDEO_VALUE="${RECORD_ONLINE_VAL_VIDEO:-true}"
-RESUME_RUN_DIR_VALUE="${RESUME_RUN_DIR:-}"
 TEXTURE_PARAM_MODE_VALUE="${TEXTURE_PARAM_MODE:-direct}"
 LATENT_HW_VALUE="${LATENT_HW:-12,12}"
-LAMBDA_TV_VALUE="${LAMBDA_TV:-0}"
+LAMBDA_TV_VALUE="${LAMBDA_TV:-0.001}"
 TRAIN_ANCHOR_HORIZON_ITERS_VALUE="${TRAIN_ANCHOR_HORIZON_ITERS:-1}"
 DETERMINISTIC_ANCHOR_SAMPLING_VALUE="${DETERMINISTIC_ANCHOR_SAMPLING:-false}"
 PHASE1_ACTION_GAP_MODE_VALUE="${PHASE1_ACTION_GAP_MODE:-gt_farthest}"
@@ -174,63 +272,25 @@ PY
 )"
 
     if [[ "${resolved_device}" != "${DEVICE_ID}" ]]; then
-        echo "Selected GPU ${DEVICE_ID} has uncorrectable ECC errors; switching run_UADA_rollout_online_env_1.sh to healthy GPU ${resolved_device}."
+        echo "Selected GPU ${DEVICE_ID} has uncorrectable ECC errors; switching eval script to healthy GPU ${resolved_device}."
         DEVICE_ID="${resolved_device}"
     fi
 fi
 
-if [[ -n "${RESUME_RUN_DIR_VALUE}" && -n "${INIT_PROJECTION_TEXTURE_PATH:-}" ]]; then
-    echo "ERROR: RESUME_RUN_DIR and INIT_PROJECTION_TEXTURE_PATH are mutually exclusive."
-    exit 1
-fi
-
-resume_args=()
-if [[ -n "${RESUME_RUN_DIR_VALUE}" ]]; then
-    resume_args+=(--resume_run_dir "${RESUME_RUN_DIR_VALUE}")
-fi
-
-if [[ "${LOW_MEM_PRESET}" == "true" ]]; then
-    PATCH_SIZE_VALUE="${PATCH_SIZE:-3,22,22}"
-    PROJECTION_SIZE_VALUE="${PROJECTION_SIZE:-${PATCH_SIZE_VALUE}}"
-    # Keep SigLIP input size aligned with model positional embeddings.
-    # For the default `...patch14-384` model, forcing 224 triggers shape mismatch
-    # like: tensor a (256) vs tensor b (729).
-    if [[ -n "${SIGLIP_INPUT_SIZE:-}" ]]; then
-        SIGLIP_INPUT_SIZE_VALUE="${SIGLIP_INPUT_SIZE}"
-    elif [[ "${SIGLIP_MODEL_NAME_VALUE}" == *"384"* ]]; then
-        SIGLIP_INPUT_SIZE_VALUE="384"
-    else
-        SIGLIP_INPUT_SIZE_VALUE="224"
-    fi
-    TRAIN_EPISODES_PER_TASK="${ONLINE_TRAIN_EPISODES_PER_TASK:-2}"
-    VAL_EPISODES="${ONLINE_VAL_EPISODES:-2}"
-    PHASE2_ROLLOUT_STEPS="${PHASE2_ROLLOUT:-8}"
-    VAL_MAX_ENV_STEPS="${VAL_MAX_ENV_STEPS:-80}"
-    ENV_RESOLUTION_VALUE="${ENV_RESOLUTION:-224}"
-fi
-
-if [[ "${ULTRA_LOW_MEM_PRESET}" == "true" ]]; then
-    PATCH_SIZE_VALUE="${PATCH_SIZE:-3,18,18}"
-    PROJECTION_SIZE_VALUE="${PROJECTION_SIZE:-${PATCH_SIZE_VALUE}}"
-    ENV_RESOLUTION_VALUE="${ENV_RESOLUTION:-192}"
-    TRAIN_EPISODES_PER_TASK="${ONLINE_TRAIN_EPISODES_PER_TASK:-1}"
-    VAL_EPISODES="${ONLINE_VAL_EPISODES:-1}"
-    PHASE2_ROLLOUT_STEPS="${PHASE2_ROLLOUT:-6}"
-    VAL_MAX_ENV_STEPS="${VAL_MAX_ENV_STEPS:-60}"
-    LAMBDA_SIGLIP="${LAMBDA_SIGLIP:-0.0}"
-    EVAL_ENABLED_VALUE="${EVAL_ENABLED:-false}"
-    RECORD_ONLINE_VIDEOS_VALUE="${RECORD_ONLINE_VIDEOS:-false}"
-    RECORD_ONLINE_VIDEOS_LAST_ONLY_VALUE="${RECORD_ONLINE_VIDEOS_LAST_ONLY:-true}"
-    RECORD_ONLINE_TRAIN_VIDEO_VALUE="${RECORD_ONLINE_TRAIN_VIDEO:-false}"
-    RECORD_ONLINE_VAL_VIDEO_VALUE="${RECORD_ONLINE_VAL_VIDEO:-false}"
-fi
+echo "Resolved patch source:"
+echo "  source_run_dir=${RESOLVED_SOURCE_RUN_DIR}"
+echo "  patch_path=${RESOLVED_PATCH_PATH}"
+echo "  patch_size=${PATCH_SIZE_VALUE}"
+echo "  projection_size=${PROJECTION_SIZE_VALUE}"
+echo "  output_dir=${OUTPUT_DIR_VALUE}"
+echo "  note=Runs one no-op train iteration (lr=0) to trigger the exact same online val evaluation path."
 
 "${PYTHON_BIN_VALUE}" - <<'PY'
 import importlib.util
 import sys
 
 if importlib.util.find_spec("libero") is None:
-    print("ERROR: `libero` is not installed. Please install LIBERO before running online env rollout.")
+    print("ERROR: `libero` is not installed. Please install LIBERO before running online env eval.")
     sys.exit(1)
 try:
     from libero.libero.envs import OffScreenRenderEnv  # noqa: F401
@@ -244,32 +304,32 @@ PY
     --maskidx 0,1,2 \
     --use_all_joints false \
     --gripper_weight 0.5 \
-    --lr 2e-3 \
-    --server "$current_dir" \
+    --lr 0.0 \
+    --server "${PROJECT_ROOT}" \
     --device "${DEVICE_ID}" \
-    --iter 5000 \
-    --accumulate "${ACCUMULATE_STEPS}" \
+    --iter 1 \
+    --accumulate 1 \
     --bs 1 \
-    --warmup "${WARMUP_STEPS}" \
-    --tags "UADA_rollout_online_env" "fair_compare" \
+    --warmup 1 \
+    --tags "UADA_rollout_online_env" "eval_only_same_as_train_1" \
     --geometry true \
     --attack_mode "projection" \
     --patch_size "${PATCH_SIZE_VALUE}" \
     --projection_size "${PROJECTION_SIZE_VALUE}" \
-    --init_projection_texture_path "${INIT_PROJECTION_TEXTURE_PATH:-}" \
-    "${resume_args[@]}" \
+    --init_projection_texture_path "${RESOLVED_PATCH_PATH}" \
+    --output_dir "${OUTPUT_DIR_VALUE}" \
     --projection_alpha 0.55 \
     --projection_alpha_jitter 0.00 \
     --projection_soft_edge 1.2 \
     --projection_angle "${PROJECTION_ANGLE:-0}" \
     --projection_fixed_angle "${PROJECTION_FIXED_ANGLE:-true}" \
     --projection_shear "${PROJECTION_SHEAR:-0.0}" \
-    --projection_scale_min "${PROJECTION_SCALE_MIN:-1.5}" \
-    --projection_scale_max "${PROJECTION_SCALE_MAX:-5.0}" \
+    --projection_scale_min "${PROJECTION_SCALE_MIN:-1.0}" \
+    --projection_scale_max "${PROJECTION_SCALE_MAX:-1.0}" \
     --projection_region "lower_half_fixed" \
     --projection_lower_start 0.55 \
-    --projection_width_ratio 1.20 \
-    --projection_height_ratio 1.00 \
+    --projection_width_ratio 0.35 \
+    --projection_height_ratio 0.35 \
     --projection_margin_x 0.04 \
     --projection_keystone 0.22 \
     --projection_keystone_jitter "${PROJECTION_KEYSTONE_JITTER:-0.0}" \
@@ -289,8 +349,8 @@ PY
     --dataset "${DATASET_NAME}" \
     --resize_patch false \
     --phase1_ratio 0.4 \
-    --phase1_rollout 8 \
-    --phase2_rollout "${PHASE2_ROLLOUT_STEPS}" \
+    --phase1_rollout 4 \
+    --phase2_rollout "${PHASE2_ROLLOUT:-8}" \
     --lambda_action_gap "${LAMBDA_ACTION_GAP}" \
     --lambda_anti_gt "${LAMBDA_ANTI_GT}" \
     --lambda_logit_margin "${LAMBDA_LOGIT_MARGIN}" \
@@ -310,8 +370,8 @@ PY
     --lambda_siglip "${LAMBDA_SIGLIP}" \
     --siglip_model_name "${SIGLIP_MODEL_NAME_VALUE}" \
     --siglip_input_size "${SIGLIP_INPUT_SIZE_VALUE}" \
-    --save_interval "${SAVE_INTERVAL_STEPS}" \
-    --eval_enabled "${EVAL_ENABLED_VALUE}" \
+    --save_interval 1 \
+    --eval_enabled true \
     --val_deterministic true \
     --val_seed 42 \
     --val_disable_lighting true \
@@ -339,14 +399,14 @@ PY
     --record_online_val_video "${RECORD_ONLINE_VAL_VIDEO_VALUE}" \
     --record_online_video_frame_source "projected_input" \
     --record_online_video_fps 10 \
-    --viz_enabled "${VIZ_ENABLED_VALUE}" \
+    --viz_enabled false \
     --viz_policy "milestone" \
     --viz_samples 2 \
-    --viz_save_best "${VIZ_SAVE_BEST_VALUE}" \
-    --viz_save_last "${VIZ_SAVE_LAST_VALUE}" \
+    --viz_save_best false \
+    --viz_save_last false \
     --task_suite_name "${TASK_SUITE_NAME}" \
-    --online_train_tasks_per_iter "${TRAIN_TASKS_PER_ITER}" \
-    --online_train_episodes_per_task "${TRAIN_EPISODES_PER_TASK}" \
+    --online_train_tasks_per_iter 1 \
+    --online_train_episodes_per_task 1 \
     --online_val_episodes "${VAL_EPISODES}" \
     --num_steps_wait 10 \
     --max_env_steps "auto_by_suite" \

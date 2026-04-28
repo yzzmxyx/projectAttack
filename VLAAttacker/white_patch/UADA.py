@@ -114,7 +114,7 @@ class OpenVLAAttacker(object):
         projection_texture.requires_grad_(True)
         projection_texture.retain_grad()
         if self.optimizer == "adamW":
-            optimizer = transformers.AdamW([projection_texture], lr=lr)
+            optimizer = torch.optim.AdamW([projection_texture], lr=lr)
             scheduler = transformers.get_cosine_schedule_with_warmup(
                 optimizer=optimizer,
                 num_warmup_steps=warmup,

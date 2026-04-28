@@ -134,7 +134,7 @@ class OpenVLAAttacker(object):
                 target_action[idx] = -100
         print(f"target_action: {target_action}")
         if self.optimizer == "adamW":
-            optimizer = transformers.AdamW([projection_texture], lr=alpha)
+            optimizer = torch.optim.AdamW([projection_texture], lr=alpha)
             scheduler = transformers.get_cosine_schedule_with_warmup(
                 optimizer=optimizer,
                 num_warmup_steps=warmup,

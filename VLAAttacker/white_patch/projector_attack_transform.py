@@ -99,16 +99,20 @@ class ProjectorAttackTransform:
             margin_x = min(max(0, margin_x), max(0, img_w // 2))
             usable_w = max(1, img_w - (2 * margin_x))
 
-            target_w = max(1, int(round(usable_w * width_ratio)))
-            target_h = max(1, int(round(lower_h * height_ratio)))
-            target_w = min(target_w, img_w)
-            target_h = min(target_h, lower_h)
+            # In lower_half_fixed mode, region parameters only constrain placement.
+            # Patch size should be determined entirely by projection_scale_min/max.
+            region_w = max(1, int(round(usable_w * width_ratio)))
+            region_h = max(1, int(round(lower_h * height_ratio)))
 
-            x = margin_x + max(0, (usable_w - target_w) // 2)
-            y = start_y + max(0, (lower_h - target_h) // 2)
-            x = min(max(0, x), max(0, img_w - target_w))
-            y = min(max(0, y), max(0, img_h - target_h))
-            return x, y, target_h, target_w
+            x = margin_x + max(0, (usable_w - region_w) // 2)
+            y = start_y + max(0, (lower_h - region_h) // 2)
+
+            x = x + max(0, (region_w - tex_w) // 2)
+            y = y + max(0, (region_h - tex_h) // 2)
+
+            x = min(max(0, x), max(0, img_w - tex_w))
+            y = min(max(0, y), max(0, img_h - tex_h))
+            return x, y, tex_h, tex_w
 
         max_x = max(0, img_w - tex_w)
         max_y = max(0, img_h - tex_h)
@@ -360,12 +364,14 @@ class ProjectorAttackTransform:
                         angle = random.uniform(-float(projection_angle), float(projection_angle))
                         shx = random.uniform(-float(projection_shear), float(projection_shear))
                         shy = random.uniform(-float(projection_shear), float(projection_shear))
-                    scale_geo = random.uniform(float(projection_scale_min), float(projection_scale_max))
                 else:
                     angle = float(projection_angle) if projection_fixed_angle else 0.0
                     shx = float(projection_shear) if projection_fixed_angle else 0.0
                     shy = 0.0
-                    scale_geo = 0.5 * (float(projection_scale_min) + float(projection_scale_max))
+                # Patch size is already controlled by the resize step above.
+                # Keep affine scale fixed so geometry only rotates/shears the full patch
+                # instead of zooming and cropping part of it away.
+                scale_geo = 1.0
                 matrix = self._compose_affine_matrix(angle, shx, shy, scale_geo)
                 # Apply geometry on local patch to avoid rotating around full-image center.
                 patch_rgb = self._apply_affine(patch_rgb, matrix)

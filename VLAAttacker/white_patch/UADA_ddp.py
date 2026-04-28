@@ -164,7 +164,7 @@ class OpenVLAAttacker(object):
 
         model = self.vla.to(rank)
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
-        optimizer = transformers.AdamW([model.module.patch], lr=self.lr)
+        optimizer = torch.optim.AdamW([model.module.patch], lr=self.lr)
         scheduler = transformers.get_cosine_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=self.warmup,

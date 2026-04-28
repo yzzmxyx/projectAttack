@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import cv2
+import imageio.v2 as imageio
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -575,18 +575,16 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
 
         first_rgb = np.array(frames[0].convert("RGB"), dtype=np.uint8)
         height, width = first_rgb.shape[0], first_rgb.shape[1]
-        writer = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*"mp4v"), float(max(1, fps)), (width, height))
-        if not writer.isOpened():
-            raise RuntimeError(f"Failed to open video writer for `{video_path}`.")
-        try:
-            for frame in frames:
-                rgb = np.array(frame.convert("RGB"), dtype=np.uint8)
-                if rgb.shape[0] != height or rgb.shape[1] != width:
-                    rgb = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_LINEAR)
-                bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-                writer.write(bgr)
-        finally:
-            writer.release()
+        video_frames = []
+        for frame in frames:
+            rgb = np.array(frame.convert("RGB"), dtype=np.uint8)
+            if rgb.shape[0] != height or rgb.shape[1] != width:
+                rgb = np.array(
+                    Image.fromarray(rgb).resize((width, height), resample=Image.BILINEAR),
+                    dtype=np.uint8,
+                )
+            video_frames.append(rgb)
+        imageio.mimwrite(video_path, video_frames, fps=float(max(1, fps)))
         return True
 
     def _should_dump_online_episode_video(self, episode):
@@ -1828,7 +1826,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     "lr": float(lr) * float(photometric_lr_ratio),
                 }
             )
-        optimizer = transformers.AdamW(optimizer_param_groups, lr=lr)
+        optimizer = torch.optim.AdamW(optimizer_param_groups, lr=lr)
         scheduler = transformers.get_cosine_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=warmup,
@@ -4093,7 +4091,16 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     if step_idx == 0:
                         clean_branch_pred_tokens = clean_pred_tokens.detach()
                         if gt_candidate_actions is not None:
-                            clean_branch_gt_loss, clean_branch_gt_metric, _, _ = self._compute_gt_action_gap_losses(
+                            (
+                                clean_branch_gt_loss,
+                                clean_branch_gt_metric,
+                                _,
+                                _,
+                                _,
+                                _,
+                                _,
+                                _,
+                            ) = self._compute_gt_action_gap_losses(
                                 adv_logits=output_clean.logits,
                                 labels_full=labels_full,
                                 action_mask_full=action_mask_full,
@@ -4172,7 +4179,16 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                     elif step_idx == 0:
                         deattack_branch_pred_tokens = clean_pred_tokens.detach()
                         if gt_candidate_actions is not None:
-                            deattack_branch_gt_loss, deattack_branch_gt_metric, _, _ = self._compute_gt_action_gap_losses(
+                            (
+                                deattack_branch_gt_loss,
+                                deattack_branch_gt_metric,
+                                _,
+                                _,
+                                _,
+                                _,
+                                _,
+                                _,
+                            ) = self._compute_gt_action_gap_losses(
                                 adv_logits=output_clean.logits,
                                 labels_full=labels_full,
                                 action_mask_full=action_mask_full,

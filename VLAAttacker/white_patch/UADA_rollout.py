@@ -104,6 +104,12 @@ class OpenVLAAttacker(object):
         self._siglip_model_device = ""
         self._gt_action_bank = {}
         self._gt_action_bank_path = ""
+        self._gt_sequence_bank = {}
+        self._gt_sequence_bank_path = ""
+        self._gt_sequence_bank_horizon = 0
+        self._gt_action_sequence_bank = {}
+        self._gt_action_sequence_bank_path = ""
+        self._gt_action_sequence_bank_horizon = 0
 
         self.input_sizes = [[3, 224, 224], [3, 224, 224]]
         self.tvf_resize_params = [
@@ -239,8 +245,15 @@ class OpenVLAAttacker(object):
         siglip_input_size=384,
         gt_softmin_tau=0.05,
         gt_action_bank_path="",
+        gt_sequence_bank_path="",
+        gt_sequence_horizon=4,
+        badseq_enabled=False,
+        badseq_alpha=1.5,
+        lambda_target=1.0,
+        lambda_repel=0.25,
         offline_phase_scope="all",
         phase_state_cache_path="",
+        resume_patch_path="",
         projection_randomization_enabled=True,
         offline_phase_fallback_enabled=True,
     ):
@@ -254,6 +267,33 @@ class OpenVLAAttacker(object):
         projection_size = [int(x) for x in projection_size]
 
         projection_texture = torch.rand(projection_size, device=self.vla.device)
+        resume_patch_path = str(resume_patch_path or "").strip()
+        if resume_patch_path.lower() not in ("", "none", "null"):
+            resume_path = Path(resume_patch_path).expanduser()
+            if resume_path.is_dir():
+                candidate_projection = resume_path / "projection_texture.pt"
+                candidate_patch = resume_path / "patch.pt"
+                if candidate_projection.exists():
+                    resume_path = candidate_projection
+                elif candidate_patch.exists():
+                    resume_path = candidate_patch
+                else:
+                    raise FileNotFoundError(
+                        f"No patch tensor found under resume directory: {resume_path} "
+                        "(expected projection_texture.pt or patch.pt)"
+                    )
+            if not resume_path.exists():
+                raise FileNotFoundError(f"resume patch path not found: {resume_path}")
+            loaded_patch = torch.load(resume_path, map_location="cpu")
+            loaded_patch_tensor = torch.as_tensor(loaded_patch, dtype=torch.float32, device=self.vla.device)
+            if tuple(loaded_patch_tensor.shape) != tuple(projection_texture.shape):
+                raise ValueError(
+                    "resume patch shape mismatch: "
+                    f"expected {tuple(projection_texture.shape)}, got {tuple(loaded_patch_tensor.shape)} "
+                    f"from {resume_path}"
+                )
+            projection_texture = loaded_patch_tensor.clamp(0.0, 1.0).detach().clone()
+            print(f"[ResumePatch] loaded patch from {resume_path}")
         projection_texture.requires_grad_(True)
         projection_texture.retain_grad()
 
@@ -291,12 +331,21 @@ class OpenVLAAttacker(object):
         val_disable_lighting = bool(val_disable_lighting)
         inner_loop_count = max(1, int(innerLoop))
         action_gap_mode = str(action_gap_mode).lower().strip()
-        if action_gap_mode not in ("clean_adv", "gt_farthest"):
-            raise ValueError("--action_gap_mode must be one of {clean_adv, gt_farthest}.")
+        if action_gap_mode not in ("clean_adv", "gt_farthest", "bad_sequence"):
+            raise ValueError("--action_gap_mode must be one of {clean_adv, gt_farthest, bad_sequence}.")
         lambda_siglip = float(max(0.0, lambda_siglip))
         siglip_device = str(siglip_device).strip()
         siglip_input_size = int(max(64, siglip_input_size))
         gt_softmin_tau = float(max(1e-6, gt_softmin_tau))
+        gt_sequence_horizon = int(max(1, gt_sequence_horizon))
+        badseq_enabled = bool(badseq_enabled)
+        if badseq_enabled:
+            print("[BadSeq] `--badseq_enabled` is deprecated and ignored; use --action_gap_mode bad_sequence instead.")
+        badseq_alpha = float(max(0.0, badseq_alpha))
+        lambda_target = float(lambda_target)
+        lambda_repel = float(lambda_repel)
+        use_badseq = bool(action_gap_mode == "bad_sequence")
+        use_gt_set = bool(action_gap_mode in ("gt_farthest", "bad_sequence"))
         projection_randomization_enabled = bool(projection_randomization_enabled)
         self.offline_phase_scope = str(offline_phase_scope).strip().lower()
         milestone_iters = self._build_milestone_iters(num_iter=num_iter, phase1_end_iter=phase1_end_iter)
@@ -364,10 +413,23 @@ class OpenVLAAttacker(object):
         self._gt_action_bank = self._load_gt_action_bank(
             dataset_name=dataset_name,
             action_bank_path=gt_action_bank_path,
-        ) if action_gap_mode == "gt_farthest" else {}
-        if action_gap_mode == "gt_farthest" and len(self._gt_action_bank) <= 0:
+        ) if use_gt_set else {}
+        if use_gt_set and len(self._gt_action_bank) <= 0:
             print("[OfflineGT] GT action bank is empty; fallback to clean_adv action-gap mode.")
             action_gap_mode = "clean_adv"
+            use_badseq = False
+            use_gt_set = False
+
+        self._gt_sequence_bank = self._load_gt_sequence_bank(
+            dataset_name=dataset_name,
+            sequence_bank_path=gt_sequence_bank_path,
+            horizon=gt_sequence_horizon,
+        ) if use_badseq else {}
+        if use_badseq and len(self._gt_sequence_bank) <= 0:
+            print("[OfflineGTSeq] GT sequence bank is empty; fallback to gt_farthest action-gap mode.")
+            action_gap_mode = "gt_farthest"
+            use_badseq = False
+            use_gt_set = True
 
         siglip_model = None
         if lambda_siglip > 0.0:
@@ -434,11 +496,32 @@ class OpenVLAAttacker(object):
             clean_images = self.randomPatchTransform.im_process(pixel_values, mean=self.mean, std=self.std)
 
             gt_candidates_by_sample = None
-            if action_gap_mode == "gt_farthest":
-                gt_phase_name = self.offline_phase_scope if self.offline_phase_scope != "all" else "contact_manipulate"
+            gt_phase_name = self.offline_phase_scope if self.offline_phase_scope != "all" else "contact_manipulate"
+            if use_gt_set:
                 gt_candidates_by_sample = self._get_gt_candidates_for_batch(
                     instructions=filtered_data.get("instructions", []),
                     phase_name=gt_phase_name,
+                )
+            gt_sequence_candidates_by_sample = None
+            A_ref_by_sample = None
+            G_far_by_sample = None
+            A_bad_by_sample = None
+            badseq_active = bool(use_badseq)
+            if badseq_active:
+                gt_sequence_candidates_by_sample = self._get_gt_sequence_candidates_for_batch(
+                    instructions=filtered_data.get("instructions", []),
+                    phase_name=gt_phase_name,
+                    horizon=gt_sequence_horizon,
+                )
+                gt_action_ref_by_sample = self._extract_gt_action_vectors_from_labels(labels_full)
+                A_ref_by_sample, G_far_by_sample, A_bad_by_sample = self._build_badseq_targets_for_batch(
+                    gt_action_ref_by_sample=gt_action_ref_by_sample,
+                    gt_sequence_candidates_by_sample=gt_sequence_candidates_by_sample,
+                    horizon=gt_sequence_horizon,
+                    maskidx=maskidx,
+                    use_all_joints=use_all_joints,
+                    gripper_weight=gripper_weight,
+                    alpha=badseq_alpha,
                 )
 
             total_action_gap = 0.0
@@ -446,6 +529,11 @@ class OpenVLAAttacker(object):
             action_terms = 0
             history_terms = 0
             total_per_joint_gap = None
+            total_badseq_target_loss = 0.0
+            total_badseq_repel_loss = 0.0
+            total_badseq_total_score = 0.0
+            total_badseq_joint_gap = None
+            badseq_terms = 0
             final_output_adv = None
             inner_terms = 0
             avg_projection_alpha = 0.0
@@ -526,7 +614,7 @@ class OpenVLAAttacker(object):
                     )
                     final_output_adv = output_adv
 
-                    if action_gap_mode == "gt_farthest":
+                    if use_gt_set:
                         step_action_gap_loss, step_action_gap_metric, step_per_joint_gap, adv_pred_tokens = (
                             self._compute_gt_action_gap_losses_batch(
                                 adv_logits=output_adv.logits,
@@ -581,16 +669,38 @@ class OpenVLAAttacker(object):
                     step_weight = float(self._get_rollout_step_weight(step_idx))
                     inner_weight_sum += step_weight
 
-                    step_loss = combine_rollout_objective(
-                        action_gap_loss=step_action_gap_loss,
-                        siglip_distance=step_siglip_distance,
-                        lambda_action_gap=lambda_action_gap,
-                        lambda_siglip=lambda_siglip,
-                    )
-                    if need_history:
-                        step_loss = step_loss - (lambda_history * step_history_div)
-                    if step_idx == rollout_steps - 1:
-                        step_loss = step_loss + lambda_ce * output_adv.loss
+                    if badseq_active and (A_bad_by_sample is not None):
+                        adv_soft_actions = self._extract_soft_actions_from_logits(
+                            logits=output_adv.logits,
+                            labels_full=labels_full,
+                            action_mask_full=action_mask_full,
+                        )
+                        step_target_actions = A_bad_by_sample[:, min(step_idx, A_bad_by_sample.shape[1] - 1), :]
+                        step_target_loss, step_target_joint_mse = self._compute_weighted_action_mse(
+                            pred_actions=adv_soft_actions,
+                            target_actions=step_target_actions,
+                            maskidx=maskidx,
+                            use_all_joints=use_all_joints,
+                            gripper_weight=gripper_weight,
+                        )
+                        step_repel_loss = step_action_gap_loss
+                        step_loss = (lambda_target * step_target_loss) - (lambda_repel * step_repel_loss)
+                        total_badseq_target_loss += float(step_target_loss.detach().item())
+                        total_badseq_repel_loss += float(step_repel_loss.detach().item())
+                        total_badseq_total_score += float(step_loss.detach().item())
+                        total_badseq_joint_gap = self._accumulate_joint_values(total_badseq_joint_gap, step_target_joint_mse)
+                        badseq_terms += 1
+                    else:
+                        step_loss = combine_rollout_objective(
+                            action_gap_loss=step_action_gap_loss,
+                            siglip_distance=step_siglip_distance,
+                            lambda_action_gap=lambda_action_gap,
+                            lambda_siglip=lambda_siglip,
+                        )
+                        if need_history:
+                            step_loss = step_loss - (lambda_history * step_history_div)
+                        if step_idx == rollout_steps - 1:
+                            step_loss = step_loss + lambda_ce * output_adv.loss
 
                     weighted_inner_loss_sum = weighted_inner_loss_sum + (step_weight * step_loss)
 
@@ -652,6 +762,10 @@ class OpenVLAAttacker(object):
             avg_action_gap = total_action_gap / float(max(1, action_terms))
             avg_history_div = total_history_div / float(max(1, history_terms))
             avg_per_joint_gap = self._normalize_joint_values(total_per_joint_gap, float(max(1, action_terms)))
+            avg_badseq_target_loss = total_badseq_target_loss / float(max(1, badseq_terms))
+            avg_badseq_repel_loss = total_badseq_repel_loss / float(max(1, badseq_terms))
+            avg_badseq_total_score = total_badseq_total_score / float(max(1, badseq_terms))
+            avg_badseq_joint_gap = self._normalize_joint_values(total_badseq_joint_gap, float(max(1, badseq_terms)))
             rollout_score = (
                 lambda_action_gap * avg_action_gap
                 + lambda_history * avg_history_div
@@ -683,6 +797,10 @@ class OpenVLAAttacker(object):
                 "TRAIN_rollout_score": rollout_score,
                 "TRAIN_action_gap_mode_active": str(action_gap_mode),
                 "TRAIN_lambda_siglip": float(lambda_siglip),
+                "TRAIN_badseq_target_loss": float(avg_badseq_target_loss),
+                "TRAIN_badseq_repel_loss": float(avg_badseq_repel_loss),
+                "TRAIN_badseq_total_score": float(avg_badseq_total_score),
+                "TRAIN_badseq_alpha": float(badseq_alpha),
                 "phase_id": phase_id,
                 "TRAIN_projection_alpha_mean": float(avg_projection_alpha),
                 "TRAIN_projection_coverage_ratio": float(avg_projection_coverage),
@@ -707,6 +825,9 @@ class OpenVLAAttacker(object):
             )
             for joint_idx, joint_gap_value in enumerate(avg_per_joint_gap.detach().cpu().tolist()):
                 train_logdata[f"TRAIN_rollout_action_gap_joint_{joint_idx}"] = float(joint_gap_value)
+            badseq_joint_gap_values = avg_badseq_joint_gap.detach().cpu().tolist()
+            for joint_idx in range(min(4, len(badseq_joint_gap_values))):
+                train_logdata[f"TRAIN_badseq_joint_gap_{joint_idx}"] = float(badseq_joint_gap_values[joint_idx])
             if self.lighting_augmentor is not None:
                 train_logdata["TRAIN_lighting_pool_size"] = self.lighting_augmentor.current_pool_size
                 train_logdata["TRAIN_lighting_backend"] = self.lighting_augmentor.backend
@@ -1493,6 +1614,416 @@ class OpenVLAAttacker(object):
         print(f"[OfflineGT] loaded action bank entries={len(finalized)} path={action_bank_file}")
         return finalized
 
+    def _resolve_default_gt_action_sequence_bank_path(self, dataset_name, horizon):
+        sidecar_dir = self._resolve_default_offline_sidecar_dir(dataset_name)
+        horizon_int = int(max(1, horizon))
+        preferred = sidecar_dir / f"phase_sequence_bank_h{horizon_int}.parquet"
+        if preferred.exists():
+            return preferred
+        fallback = sidecar_dir / "phase_sequence_bank.parquet"
+        return fallback
+
+    def _coerce_action_sequence_array(self, action_seq):
+        if torch.is_tensor(action_seq):
+            return action_seq.detach().to(torch.float32).cpu().numpy()
+
+        # Fast path for regular numeric arrays.
+        if isinstance(action_seq, np.ndarray) and action_seq.dtype != np.object_:
+            return np.asarray(action_seq, dtype=np.float32)
+
+        # Slow path for parquet-loaded nested object arrays/lists.
+        object_array = np.asarray(action_seq, dtype=object)
+        if object_array.ndim == 0:
+            object_array = np.asarray([object_array.item()], dtype=object)
+
+        if object_array.ndim == 2:
+            rows = []
+            for row in object_array:
+                row_array = np.asarray(list(row), dtype=np.float32).reshape(-1)
+                rows.append(row_array)
+            if len(rows) <= 0:
+                return np.empty((0, 0), dtype=np.float32)
+            return np.stack(rows, axis=0).astype(np.float32)
+
+        rows = []
+        for item in object_array.tolist():
+            row_array = np.asarray(item, dtype=np.float32).reshape(-1)
+            rows.append(row_array)
+        if len(rows) <= 0:
+            return np.empty((0, 0), dtype=np.float32)
+        if len(rows) == 1:
+            return rows[0].reshape(1, -1).astype(np.float32)
+        return np.stack(rows, axis=0).astype(np.float32)
+
+    def _fit_continuous_action_seq_tensor(self, action_seq, horizon, action_dim):
+        seq_array = self._coerce_action_sequence_array(action_seq)
+        seq_tensor = torch.as_tensor(seq_array, dtype=torch.float32, device=self.vla.device)
+        if seq_tensor.ndim == 1:
+            seq_tensor = seq_tensor.view(1, -1)
+        if seq_tensor.ndim != 2:
+            raise ValueError(f"Expected action sequence with shape [H, D], got {tuple(seq_tensor.shape)}")
+        expected_horizon = int(max(1, horizon))
+        if seq_tensor.shape[0] > expected_horizon:
+            seq_tensor = seq_tensor[:expected_horizon, :]
+        elif seq_tensor.shape[0] < expected_horizon:
+            pad_rows = expected_horizon - int(seq_tensor.shape[0])
+            if seq_tensor.shape[0] > 0:
+                pad_value = seq_tensor[-1:, :].repeat(pad_rows, 1)
+            else:
+                pad_value = torch.zeros((pad_rows, int(action_dim)), device=self.vla.device, dtype=torch.float32)
+            seq_tensor = torch.cat([seq_tensor, pad_value], dim=0)
+        fitted_rows = [self._fit_continuous_action_dim_tensor(row, action_dim=action_dim) for row in seq_tensor]
+        return torch.stack(fitted_rows, dim=0)
+
+    def _load_gt_sequence_bank(self, dataset_name, sequence_bank_path="", horizon=4):
+        path_value = str(sequence_bank_path or "").strip()
+        horizon_int = int(max(1, horizon))
+        if path_value.lower() in ("", "none", "null", "auto"):
+            path_value = str(self._resolve_default_gt_action_sequence_bank_path(dataset_name, horizon=horizon_int))
+        sequence_bank_file = Path(path_value)
+        if not sequence_bank_file.exists():
+            print(f"[OfflineGTSeq] phase sequence bank not found: {sequence_bank_file}")
+            return {}
+
+        bank = {}
+        suffix = sequence_bank_file.suffix.lower()
+        if suffix == ".pt":
+            payload = torch.load(sequence_bank_file, map_location="cpu")
+            if not isinstance(payload, dict):
+                print("[OfflineGTSeq] malformed pt bank payload; expected dict.")
+                return {}
+            for key, value in payload.items():
+                if not isinstance(key, tuple) or len(key) != 3:
+                    continue
+                instruction_key = canonicalize_instruction(key[0])
+                phase_name = str(key[1]).strip().lower()
+                seq_horizon = int(key[2])
+                if seq_horizon != horizon_int:
+                    continue
+                if instruction_key == "":
+                    continue
+                value_tensor = torch.as_tensor(value, dtype=torch.float32, device=self.vla.device)
+                if value_tensor.ndim != 3:
+                    continue
+                fitted_seq = [
+                    self._fit_continuous_action_seq_tensor(
+                        action_seq=value_tensor[idx],
+                        horizon=horizon_int,
+                        action_dim=self.default_action_dim,
+                    )
+                    for idx in range(int(value_tensor.shape[0]))
+                ]
+                if len(fitted_seq) <= 0:
+                    continue
+                bank[(instruction_key, phase_name, horizon_int)] = torch.stack(fitted_seq, dim=0)
+        else:
+            try:
+                import pandas as pd
+            except Exception:
+                print("[OfflineGTSeq] pandas is unavailable; GT sequence bank disabled.")
+                return {}
+            df = pd.read_parquet(sequence_bank_file)
+            required_cols = {"phase", "horizon", "normalized_action_seq"}
+            if not required_cols.issubset(df.columns):
+                print(f"[OfflineGTSeq] malformed sequence bank columns: {df.columns.tolist()}")
+                return {}
+            if "instruction_key" in df.columns:
+                instruction_col = "instruction_key"
+            elif "instruction" in df.columns:
+                instruction_col = "instruction"
+            else:
+                print(f"[OfflineGTSeq] malformed sequence bank columns: {df.columns.tolist()}")
+                return {}
+
+            for row in df.itertuples(index=False):
+                instruction_key = canonicalize_instruction(getattr(row, instruction_col, ""))
+                phase_name = str(getattr(row, "phase", "contact_manipulate")).strip().lower()
+                seq_horizon = int(getattr(row, "horizon", horizon_int))
+                if instruction_key == "" or seq_horizon != horizon_int:
+                    continue
+                seq_value = getattr(row, "normalized_action_seq", None)
+                if seq_value is None:
+                    continue
+                seq_tensor = self._fit_continuous_action_seq_tensor(
+                    action_seq=seq_value,
+                    horizon=horizon_int,
+                    action_dim=self.default_action_dim,
+                )
+                bank.setdefault((instruction_key, phase_name, horizon_int), []).append(seq_tensor)
+
+            finalized = {}
+            for key, seq_values in bank.items():
+                if len(seq_values) <= 0:
+                    continue
+                finalized[key] = torch.stack(seq_values, dim=0)
+            bank = finalized
+
+        self._gt_sequence_bank = bank
+        self._gt_sequence_bank_path = str(sequence_bank_file)
+        self._gt_sequence_bank_horizon = int(horizon_int)
+        # Backward-compatible aliases for earlier sequence-bank naming.
+        self._gt_action_sequence_bank = self._gt_sequence_bank
+        self._gt_action_sequence_bank_path = self._gt_sequence_bank_path
+        self._gt_action_sequence_bank_horizon = self._gt_sequence_bank_horizon
+        print(
+            "[OfflineGTSeq] loaded sequence bank "
+            f"entries={len(bank)} horizon={horizon_int} path={sequence_bank_file}"
+        )
+        return bank
+
+    def _get_gt_sequence_candidates_for_batch(self, instructions, phase_name, horizon=None):
+        normalized_phase = str(phase_name or "contact_manipulate").strip().lower()
+        seq_horizon = self._gt_sequence_bank_horizon if horizon is None else int(max(1, horizon))
+        candidates = []
+        for instruction in instructions:
+            instruction_key = canonicalize_instruction(instruction)
+            tensor = self._gt_sequence_bank.get((instruction_key, normalized_phase, seq_horizon))
+            candidates.append(tensor)
+        return candidates
+
+    def _extract_gt_action_vectors_from_labels(self, labels_full):
+        temp_label = labels_full[:, 1:]
+        action_mask = temp_label > self.action_tokenizer.action_token_begin_idx
+        batch_size = int(labels_full.shape[0])
+        masked_tokens = temp_label[action_mask]
+        if masked_tokens.numel() <= 0:
+            return torch.zeros((batch_size, 0), device=self.vla.device, dtype=torch.float32)
+        num_actions = int(masked_tokens.shape[0] // max(1, batch_size))
+        if num_actions <= 0:
+            return torch.zeros((batch_size, 0), device=self.vla.device, dtype=torch.float32)
+        token_ids = masked_tokens.view(batch_size, num_actions).to(torch.long)
+        return self._decode_action_tokens(token_ids.reshape(-1), batch_size, num_actions)
+
+    def _extract_soft_actions_from_logits(self, logits, labels_full, action_mask_full):
+        batch_size = int(labels_full.shape[0])
+        action_logits = self._extract_action_logits(logits, labels_full)
+        seq_len = min(action_mask_full.shape[1], action_logits.shape[1])
+        if seq_len <= 0:
+            return torch.zeros((batch_size, 0), device=self.vla.device, dtype=torch.float32)
+        action_logits = action_logits[:, :seq_len, :]
+        action_mask = action_mask_full[:, :seq_len]
+        masked_logits = action_logits[action_mask]
+        if masked_logits.numel() <= 0:
+            return torch.zeros((batch_size, 0), device=self.vla.device, dtype=torch.float32)
+        num_actions = int(masked_logits.shape[0] // max(1, batch_size))
+        if num_actions <= 0:
+            return torch.zeros((batch_size, 0), device=self.vla.device, dtype=torch.float32)
+        probs = F.softmax(masked_logits, dim=-1)
+        soft_actions = (probs * self.action_bin_centers).sum(dim=-1)
+        return soft_actions.view(batch_size, num_actions)
+
+    def _compute_weighted_action_mse(
+        self,
+        pred_actions,
+        target_actions,
+        maskidx,
+        use_all_joints,
+        gripper_weight,
+    ):
+        if pred_actions.numel() <= 0 or target_actions.numel() <= 0:
+            zero = torch.zeros((), device=self.vla.device, dtype=torch.float32)
+            per_joint_zero = torch.zeros((self.default_action_dim,), device=self.vla.device, dtype=torch.float32)
+            return zero, per_joint_zero
+        num_actions = min(int(pred_actions.shape[1]), int(target_actions.shape[1]))
+        if num_actions <= 0:
+            zero = torch.zeros((), device=self.vla.device, dtype=torch.float32)
+            per_joint_zero = torch.zeros((self.default_action_dim,), device=self.vla.device, dtype=torch.float32)
+            return zero, per_joint_zero
+        pred = pred_actions[:, :num_actions]
+        target = target_actions[:, :num_actions]
+        per_joint_mse = torch.square(pred - target).mean(dim=0)
+        idx_tensor, joint_weights = self._select_joint_indices_and_weights(
+            num_actions=num_actions,
+            maskidx=maskidx,
+            use_all_joints=use_all_joints,
+            gripper_weight=gripper_weight,
+        )
+        if idx_tensor.numel() <= 0:
+            zero = torch.zeros((), device=self.vla.device, dtype=torch.float32)
+            per_joint_zero = torch.zeros((self.default_action_dim,), device=self.vla.device, dtype=torch.float32)
+            return zero, per_joint_zero
+        loss = self._weighted_reduce(per_joint_mse.index_select(0, idx_tensor), joint_weights)
+        return loss, per_joint_mse.detach()
+
+    def _build_reference_sequence_from_gt_action(
+        self,
+        gt_action,
+        gt_sequence_candidates,
+        horizon,
+        maskidx,
+        use_all_joints,
+        gripper_weight,
+    ):
+        horizon_int = int(max(1, horizon))
+        gt_action_vec = self._fit_continuous_action_dim_tensor(gt_action, action_dim=self.default_action_dim)
+        if gt_sequence_candidates is None or gt_sequence_candidates.numel() <= 0:
+            return gt_action_vec.unsqueeze(0).repeat(horizon_int, 1)
+        candidate_tensor = torch.as_tensor(gt_sequence_candidates, dtype=torch.float32, device=self.vla.device)
+        if candidate_tensor.ndim != 3 or int(candidate_tensor.shape[0]) <= 0:
+            return gt_action_vec.unsqueeze(0).repeat(horizon_int, 1)
+
+        fitted = [
+            self._fit_continuous_action_seq_tensor(
+                action_seq=candidate_tensor[idx],
+                horizon=horizon_int,
+                action_dim=self.default_action_dim,
+            )
+            for idx in range(int(candidate_tensor.shape[0]))
+        ]
+        candidate_tensor = torch.stack(fitted, dim=0)
+        num_actions = int(candidate_tensor.shape[2])
+        idx_tensor, joint_weights = self._select_joint_indices_and_weights(
+            num_actions=num_actions,
+            maskidx=maskidx,
+            use_all_joints=use_all_joints,
+            gripper_weight=gripper_weight,
+        )
+        if idx_tensor.numel() <= 0:
+            return candidate_tensor[0]
+        first_step = candidate_tensor[:, 0, :].index_select(1, idx_tensor)
+        gt_selected = gt_action_vec.index_select(0, idx_tensor).view(1, -1)
+        weighted_dist = torch.square(first_step - gt_selected) * joint_weights.view(1, -1)
+        nearest_idx = int(weighted_dist.sum(dim=1).argmin().item())
+        return candidate_tensor[nearest_idx]
+
+    def _select_farthest_gt_sequence(
+        self,
+        gt_sequence_candidates,
+        reference_sequence,
+        maskidx,
+        use_all_joints,
+        gripper_weight,
+        phase_weights=None,
+        joint_weights=None,
+    ):
+        candidates = torch.as_tensor(gt_sequence_candidates, dtype=torch.float32, device=self.vla.device)
+        reference = torch.as_tensor(reference_sequence, dtype=torch.float32, device=self.vla.device)
+        if candidates.ndim != 3 or int(candidates.shape[0]) <= 0:
+            return reference, -1, torch.zeros((), device=self.vla.device, dtype=torch.float32)
+        horizon = int(candidates.shape[1])
+        action_dim = int(candidates.shape[2])
+        reference = self._fit_continuous_action_seq_tensor(reference, horizon=horizon, action_dim=action_dim)
+
+        idx_tensor, default_joint_weights = self._select_joint_indices_and_weights(
+            num_actions=action_dim,
+            maskidx=maskidx,
+            use_all_joints=use_all_joints,
+            gripper_weight=gripper_weight,
+        )
+        if idx_tensor.numel() <= 0:
+            return reference, -1, torch.zeros((), device=self.vla.device, dtype=torch.float32)
+
+        if joint_weights is None:
+            selected_joint_weights = default_joint_weights
+        else:
+            joint_weights_tensor = torch.as_tensor(joint_weights, dtype=torch.float32, device=self.vla.device).view(-1)
+            if joint_weights_tensor.shape[0] == action_dim:
+                selected_joint_weights = joint_weights_tensor.index_select(0, idx_tensor)
+            elif joint_weights_tensor.shape[0] == idx_tensor.shape[0]:
+                selected_joint_weights = joint_weights_tensor
+            else:
+                selected_joint_weights = default_joint_weights
+
+        if phase_weights is None:
+            rho = torch.ones((horizon,), device=self.vla.device, dtype=torch.float32)
+        else:
+            rho = torch.as_tensor(phase_weights, dtype=torch.float32, device=self.vla.device).view(-1)
+            if rho.shape[0] < horizon:
+                pad = torch.ones((horizon - rho.shape[0],), device=self.vla.device, dtype=torch.float32)
+                rho = torch.cat([rho, pad], dim=0)
+            rho = rho[:horizon]
+
+        selected_candidates = candidates.index_select(2, idx_tensor)
+        selected_reference = reference.index_select(1, idx_tensor)
+        diff = selected_candidates - selected_reference.unsqueeze(0)
+        per_step_distance = torch.square(diff) * selected_joint_weights.view(1, 1, -1)
+        per_step_distance = per_step_distance.sum(dim=-1)
+        scores = (per_step_distance * rho.view(1, -1)).sum(dim=1)
+        far_idx = int(scores.argmax().item())
+        return candidates[far_idx], far_idx, scores[far_idx]
+
+    def _build_bad_sequence_from_gfar(self, reference_sequence, farthest_sequence, alpha=1.5):
+        reference = torch.as_tensor(reference_sequence, dtype=torch.float32, device=self.vla.device)
+        farthest = torch.as_tensor(farthest_sequence, dtype=torch.float32, device=self.vla.device)
+        alpha_value = float(alpha)
+        bad = reference + alpha_value * (farthest - reference)
+        return bad.clamp(-1.0, 1.0)
+
+    def _build_badseq_targets_for_batch(
+        self,
+        gt_action_ref_by_sample,
+        gt_sequence_candidates_by_sample,
+        horizon,
+        maskidx,
+        use_all_joints,
+        gripper_weight,
+        alpha,
+    ):
+        batch_size = int(gt_action_ref_by_sample.shape[0])
+        horizon_int = int(max(1, horizon))
+        default_action = torch.zeros((self.default_action_dim,), device=self.vla.device, dtype=torch.float32)
+        A_ref_list = []
+        G_far_list = []
+        A_bad_list = []
+
+        for sample_idx in range(batch_size):
+            if gt_action_ref_by_sample.shape[1] > 0:
+                gt_action = gt_action_ref_by_sample[sample_idx]
+            else:
+                gt_action = default_action
+            sample_candidates = None
+            if gt_sequence_candidates_by_sample is not None and sample_idx < len(gt_sequence_candidates_by_sample):
+                sample_candidates = gt_sequence_candidates_by_sample[sample_idx]
+
+            ref_seq = self._build_reference_sequence_from_gt_action(
+                gt_action=gt_action,
+                gt_sequence_candidates=sample_candidates,
+                horizon=horizon_int,
+                maskidx=maskidx,
+                use_all_joints=use_all_joints,
+                gripper_weight=gripper_weight,
+            )
+            if sample_candidates is None or sample_candidates.numel() <= 0:
+                far_seq = ref_seq
+            else:
+                far_seq, _far_idx, _far_score = self._select_farthest_gt_sequence(
+                    gt_sequence_candidates=sample_candidates,
+                    reference_sequence=ref_seq,
+                    maskidx=maskidx,
+                    use_all_joints=use_all_joints,
+                    gripper_weight=gripper_weight,
+                )
+            bad_seq = self._build_bad_sequence_from_gfar(
+                reference_sequence=ref_seq,
+                farthest_sequence=far_seq,
+                alpha=alpha,
+            )
+            A_ref_list.append(ref_seq)
+            G_far_list.append(far_seq)
+            A_bad_list.append(bad_seq)
+
+        return (
+            torch.stack(A_ref_list, dim=0),
+            torch.stack(G_far_list, dim=0),
+            torch.stack(A_bad_list, dim=0),
+        )
+
+    def _load_gt_action_sequence_bank(self, dataset_name, action_sequence_bank_path="", horizon=4):
+        # Backward-compatible alias; prefer `_load_gt_sequence_bank`.
+        return self._load_gt_sequence_bank(
+            dataset_name=dataset_name,
+            sequence_bank_path=action_sequence_bank_path,
+            horizon=horizon,
+        )
+
+    def _get_gt_action_sequence_candidates_for_batch(self, instructions, phase_name, horizon=None):
+        # Backward-compatible alias; prefer `_get_gt_sequence_candidates_for_batch`.
+        return self._get_gt_sequence_candidates_for_batch(
+            instructions=instructions,
+            phase_name=phase_name,
+            horizon=horizon,
+        )
+
     def _get_gt_candidates_for_batch(self, instructions, phase_name):
         normalized_phase = str(phase_name or "contact_manipulate").strip().lower()
         candidates = []
@@ -1754,6 +2285,7 @@ class OpenVLAAttacker(object):
         val_seed,
         val_disable_lighting,
     ):
+        use_gt_set = bool(str(action_gap_mode).lower().strip() in ("gt_farthest", "bad_sequence"))
         avg_ce = 0.0
         avg_mse_distance = 0.0
         avg_uad = 0.0
@@ -1884,7 +2416,7 @@ class OpenVLAAttacker(object):
                 final_output_adv = None
                 need_history = True
                 gt_candidates_by_sample = None
-                if action_gap_mode == "gt_farthest":
+                if use_gt_set:
                     gt_phase_name = self.offline_phase_scope if self.offline_phase_scope != "all" else "contact_manipulate"
                     gt_candidates_by_sample = self._get_gt_candidates_for_batch(
                         instructions=filtered_data.get("instructions", []),
@@ -1910,7 +2442,7 @@ class OpenVLAAttacker(object):
                     )
                     final_output_adv = output_adv
 
-                    if action_gap_mode == "gt_farthest":
+                    if use_gt_set:
                         _, metric_action_gap, step_per_joint_gap, adv_pred_tokens = self._compute_gt_action_gap_losses_batch(
                             adv_logits=output_adv.logits,
                             clean_logits=output_clean.logits,

@@ -35,6 +35,31 @@ class RLDSBatchTransform:
     prompt_builder_fn: Type[PromptBuilder]
     predict_stop_token: bool = True
 
+    @staticmethod
+    def _scalar_from_rlds_field(value, default=None):
+        if value is None:
+            return default
+        if isinstance(value, np.ndarray):
+            if value.size == 0:
+                return default
+            value = value.reshape(-1)[0]
+        elif isinstance(value, (list, tuple)):
+            if len(value) <= 0:
+                return default
+            value = value[0]
+        if isinstance(value, np.generic):
+            value = value.item()
+        return value
+
+    @staticmethod
+    def _decode_optional_text(value, default=""):
+        value = RLDSBatchTransform._scalar_from_rlds_field(value, default=default)
+        if value is None:
+            return str(default)
+        if isinstance(value, bytes):
+            return value.decode("utf-8")
+        return str(value)
+
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
         dataset_name, action = rlds_batch["dataset_name"], rlds_batch["action"][0]
@@ -64,7 +89,33 @@ class RLDSBatchTransform:
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
-        return dict(pixel_values=img, input_ids=input_ids, labels=labels, dataset_name=dataset_name, instructions=lang)
+        timestep = int(
+            self._scalar_from_rlds_field(
+                rlds_batch.get("observation", {}).get("timestep"),
+                default=-1,
+            )
+        )
+        episode_length = int(
+            self._scalar_from_rlds_field(
+                rlds_batch.get("task", {}).get("episode_length"),
+                default=-1,
+            )
+        )
+        source_file_path = self._decode_optional_text(
+            rlds_batch.get("task", {}).get("source_file_path"),
+            default="",
+        )
+
+        return dict(
+            pixel_values=img,
+            input_ids=input_ids,
+            labels=labels,
+            dataset_name=dataset_name,
+            instructions=lang,
+            timestep=timestep,
+            episode_length=episode_length,
+            source_file_path=source_file_path,
+        )
         # return dict(pixel_values=img, input_ids=input_ids, labels=labels, dataset_name=lang)
 
 

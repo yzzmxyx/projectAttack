@@ -138,7 +138,10 @@ class PaddedCollatorForActionPrediction:
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
-            instructions=[instance["instructions"] for instance in instances]
+            instructions=[instance["instructions"] for instance in instances],
+            timesteps=[int(instance.get("timestep", -1)) for instance in instances],
+            episode_lengths=[int(instance.get("episode_length", -1)) for instance in instances],
+            source_file_paths=[str(instance.get("source_file_path", "")) for instance in instances],
         )
         if dataset_names is not None:
             output["dataset_names"] = dataset_names

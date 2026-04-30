@@ -178,6 +178,19 @@ def make_dataset_from_rlds(
                     f"Language key {language_key} has dtype {traj[language_key].dtype}, " "but it must be tf.string."
                 )
             task["language_instruction"] = traj.pop(language_key)
+        task["episode_length"] = tf.repeat(tf.cast(traj_len, tf.int32), traj_len)
+
+        # Best-effort metadata passthrough for downstream sidecar alignment.
+        if "episode_metadata" in traj and isinstance(traj["episode_metadata"], dict):
+            file_path_tensor = traj["episode_metadata"].get("file_path")
+            if file_path_tensor is not None:
+                file_path_tensor = tf.reshape(tf.convert_to_tensor(file_path_tensor, dtype=tf.string), [1])
+                task["source_file_path"] = tf.repeat(file_path_tensor, traj_len)
+        if ("source_file_path" not in task) and ("file_path" in traj):
+            file_path_tensor = tf.reshape(tf.convert_to_tensor(traj["file_path"], dtype=tf.string), [1])
+            task["source_file_path"] = tf.repeat(file_path_tensor, traj_len)
+        if "source_file_path" not in task:
+            task["source_file_path"] = tf.repeat(tf.constant("", dtype=tf.string), traj_len)
 
         traj = {
             "observation": new_obs,

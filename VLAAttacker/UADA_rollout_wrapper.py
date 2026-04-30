@@ -140,6 +140,13 @@ def main(args):
             "siglip_input_size": args.siglip_input_size,
             "gt_softmin_tau": args.gt_softmin_tau,
             "gt_action_bank_path": args.gt_action_bank_path,
+            "gt_sequence_bank_path": args.gt_sequence_bank_path,
+            "gt_sequence_horizon": args.gt_sequence_horizon,
+            "badseq_enabled": args.badseq_enabled,
+            "badseq_alpha": args.badseq_alpha,
+            "lambda_target": args.lambda_target,
+            "lambda_repel": args.lambda_repel,
+            "resume_patch_path": args.resume_patch_path,
             "offline_phase_scope": args.offline_phase_scope,
             "phase_state_cache_path": args.phase_state_cache_path,
             "offline_phase_fallback_enabled": args.offline_phase_fallback_enabled,
@@ -247,8 +254,15 @@ def main(args):
         siglip_input_size=args.siglip_input_size,
         gt_softmin_tau=args.gt_softmin_tau,
         gt_action_bank_path=args.gt_action_bank_path,
+        gt_sequence_bank_path=args.gt_sequence_bank_path,
+        gt_sequence_horizon=args.gt_sequence_horizon,
+        badseq_enabled=args.badseq_enabled,
+        badseq_alpha=args.badseq_alpha,
+        lambda_target=args.lambda_target,
+        lambda_repel=args.lambda_repel,
         offline_phase_scope=args.offline_phase_scope,
         phase_state_cache_path=args.phase_state_cache_path,
+        resume_patch_path=args.resume_patch_path,
         offline_phase_fallback_enabled=args.offline_phase_fallback_enabled,
         viz_enabled=args.viz_enabled,
         viz_policy=args.viz_policy,
@@ -324,15 +338,27 @@ def arg_parser():
     parser.add_argument("--phase1_rollout", default=8, type=int)
     parser.add_argument("--phase2_rollout", default=24, type=int)
     parser.add_argument("--lambda_action_gap", default=1.0, type=float)
-    parser.add_argument("--action_gap_mode", default="gt_farthest", type=str)
+    parser.add_argument(
+        "--action_gap_mode",
+        default="gt_farthest",
+        type=str,
+        help="One of {clean_adv, gt_farthest, bad_sequence}.",
+    )
     parser.add_argument("--lambda_siglip", default=0.15, type=float)
     parser.add_argument("--siglip_model_name", default="google/siglip-so400m-patch14-384", type=str)
     parser.add_argument("--siglip_device", default="auto", type=str)
     parser.add_argument("--siglip_input_size", default=384, type=int)
     parser.add_argument("--gt_softmin_tau", default=0.05, type=float)
     parser.add_argument("--gt_action_bank_path", default="", type=str)
+    parser.add_argument("--gt_sequence_bank_path", default="", type=str)
+    parser.add_argument("--gt_sequence_horizon", default=4, type=int)
+    parser.add_argument("--badseq_enabled", type=str2bool, default=False)
+    parser.add_argument("--badseq_alpha", default=1.5, type=float)
+    parser.add_argument("--lambda_target", default=1.0, type=float)
+    parser.add_argument("--lambda_repel", default=0.25, type=float)
     parser.add_argument("--offline_phase_scope", default="contact_manipulate", type=str)
     parser.add_argument("--phase_state_cache_path", default="", type=str)
+    parser.add_argument("--resume_patch_path", default="", type=str)
     parser.add_argument("--offline_phase_fallback_enabled", type=str2bool, default=True)
     parser.add_argument("--lambda_history", default=0.5, type=float)
     parser.add_argument("--lambda_ce", default=0.1, type=float)
@@ -430,7 +456,10 @@ if __name__ == "__main__":
         f" lambda_siglip:{args.lambda_siglip}\n siglip_model_name:{args.siglip_model_name}\n"
         f" siglip_device:{args.siglip_device}\n"
         f" siglip_input_size:{args.siglip_input_size}\n gt_softmin_tau:{args.gt_softmin_tau}\n"
-        f" gt_action_bank_path:{args.gt_action_bank_path}\n offline_phase_scope:{args.offline_phase_scope}\n"
+        f" gt_action_bank_path:{args.gt_action_bank_path}\n gt_sequence_bank_path:{args.gt_sequence_bank_path}\n"
+        f" gt_sequence_horizon:{args.gt_sequence_horizon}\n badseq_enabled:{args.badseq_enabled}\n"
+        f" badseq_alpha:{args.badseq_alpha}\n lambda_target:{args.lambda_target}\n lambda_repel:{args.lambda_repel}\n"
+        f" offline_phase_scope:{args.offline_phase_scope}\n resume_patch_path:{args.resume_patch_path}\n"
         f" phase_state_cache_path:{args.phase_state_cache_path}\n"
         f" offline_phase_fallback_enabled:{args.offline_phase_fallback_enabled}\n"
         f" lambda_history:{args.lambda_history}\n lambda_ce:{args.lambda_ce}\n"

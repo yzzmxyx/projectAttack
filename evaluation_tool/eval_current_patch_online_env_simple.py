@@ -48,6 +48,10 @@ def list_of_floats(value):
     return [float(item) for item in str(value).split(",")]
 
 
+def is_clean_attack_mode(mode):
+    return str(mode).lower().strip() in ("clean", "no_attack", "none")
+
+
 def resolve_vla_path(dataset):
     dataset = str(dataset)
     if "bridge_orig" in dataset:
@@ -162,7 +166,7 @@ def run_one_episode(
                 attack_texture=projection_texture,
                 mean=attacker.mean,
                 std=attacker.std,
-                attack_mode="projection",
+                attack_mode=args.attack_mode,
                 geometry=True,
                 projection_alpha=args.projection_alpha,
                 projection_alpha_jitter=args.projection_alpha_jitter,
@@ -273,17 +277,25 @@ def main(args):
     unnorm_key = attacker._resolve_unnorm_key(args.task_suite_name)
     action_stats = vla.get_action_stats(unnorm_key)
 
-    patch = torch.load(args.patch_path, map_location=device)
-    projection_texture = torch.as_tensor(patch, device=device, dtype=torch.float32)
-    expected_shape = args.projection_size if args.projection_size is not None else list(projection_texture.shape)
-    if tuple(projection_texture.shape) != tuple(expected_shape):
-        raise ValueError(
-            f"Loaded patch shape mismatch: expected {tuple(expected_shape)}, "
-            f"got {tuple(projection_texture.shape)} from {args.patch_path}"
-        )
+    if is_clean_attack_mode(args.attack_mode):
+        clean_shape = args.projection_size if args.projection_size is not None else [3, 70, 70]
+        projection_texture = torch.zeros(clean_shape, device=device, dtype=torch.float32)
+        expected_shape = list(clean_shape)
+    else:
+        if str(args.patch_path).strip() == "":
+            raise ValueError("`--patch_path` is required unless attack_mode is clean/no_attack/none.")
+        patch = torch.load(args.patch_path, map_location=device)
+        projection_texture = torch.as_tensor(patch, device=device, dtype=torch.float32)
+        expected_shape = args.projection_size if args.projection_size is not None else list(projection_texture.shape)
+        if tuple(projection_texture.shape) != tuple(expected_shape):
+            raise ValueError(
+                f"Loaded patch shape mismatch: expected {tuple(expected_shape)}, "
+                f"got {tuple(projection_texture.shape)} from {args.patch_path}"
+            )
 
     print(f"output_dir:{output_dir}")
-    print(f"patch_path:{args.patch_path}")
+    print(f"attack_mode:{args.attack_mode}")
+    print(f"patch_path:{args.patch_path if str(args.patch_path).strip() else '[clean mode: unused]'}")
     print(f"task_suite_name:{args.task_suite_name}")
     print(f"eval_runs:{args.eval_runs}")
     print(f"max_env_steps:{args.max_env_steps}")
@@ -358,7 +370,8 @@ def main(args):
 
 def build_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--patch_path", required=True, type=str)
+    parser.add_argument("--patch_path", default="", type=str)
+    parser.add_argument("--attack_mode", default="projection", type=str)
     parser.add_argument("--output_dir", required=True, type=str)
     parser.add_argument("--dataset", default="libero_spatial", type=str)
     parser.add_argument("--task_suite_name", default="libero_spatial", type=str)

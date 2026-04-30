@@ -2,6 +2,8 @@ import os
 import pickle
 import random
 import csv
+import math
+from pathlib import Path
 from contextlib import contextmanager
 
 import matplotlib.pyplot as plt
@@ -16,15 +18,28 @@ from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from prismatic.vla.action_tokenizer import ActionTokenizer
 from tqdm import tqdm
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers import SiglipModel
 
 try:
     from white_patch.diffusion_lighting_augmentor import DiffusionLightingAugmentor
     from white_patch.ic_light_augmentor import ICLightAugmentor
     from white_patch.projector_attack_transform import ProjectorAttackTransform
+    from white_patch.offline_phase_utils import (
+        InnerLoopBatchController,
+        OfflinePhaseSelector,
+        canonicalize_instruction,
+        combine_rollout_objective,
+    )
 except Exception:
     from diffusion_lighting_augmentor import DiffusionLightingAugmentor
     from ic_light_augmentor import ICLightAugmentor
     from projector_attack_transform import ProjectorAttackTransform
+    from offline_phase_utils import (
+        InnerLoopBatchController,
+        OfflinePhaseSelector,
+        canonicalize_instruction,
+        combine_rollout_objective,
+    )
 
 try:
     import wandb
@@ -81,6 +96,14 @@ class OpenVLAAttacker(object):
         self.lighting_augmentor = None
         self.lighting_aug_train_only = False
         self.default_action_dim = 7
+        self.offline_phase_selector = None
+        self.offline_phase_scope = "all"
+        self.offline_phase_stats = {}
+        self._siglip_image_model = None
+        self._siglip_model_name = ""
+        self._siglip_model_device = ""
+        self._gt_action_bank = {}
+        self._gt_action_bank_path = ""
 
         self.input_sizes = [[3, 224, 224], [3, 224, 224]]
         self.tvf_resize_params = [
@@ -155,6 +178,7 @@ class OpenVLAAttacker(object):
         eval_rollout=24,
         save_interval=100,
         eval_enabled=True,
+        eval_visual_only=False,
         val_max_batches=1000,
         lighting_aug_enabled=False,
         lighting_model_id="stabilityai/sdxl-turbo",
@@ -204,9 +228,23 @@ class OpenVLAAttacker(object):
         val_deterministic=False,
         val_seed=42,
         val_disable_lighting=False,
+        sanity_mode=False,
+        sanity_num_batches=1,
+        sanity_report_interval=1,
+        sanity_disable_randomization=True,
+        action_gap_mode="clean_adv",
+        lambda_siglip=0.0,
+        siglip_model_name="google/siglip-so400m-patch14-384",
+        siglip_device="auto",
+        siglip_input_size=384,
+        gt_softmin_tau=0.05,
+        gt_action_bank_path="",
+        offline_phase_scope="all",
+        phase_state_cache_path="",
+        projection_randomization_enabled=True,
+        offline_phase_fallback_enabled=True,
     ):
         del target_action
-        del innerLoop
 
         self._reset_metric_buffers()
 
@@ -251,6 +289,16 @@ class OpenVLAAttacker(object):
         val_deterministic = bool(val_deterministic)
         val_seed = int(val_seed)
         val_disable_lighting = bool(val_disable_lighting)
+        inner_loop_count = max(1, int(innerLoop))
+        action_gap_mode = str(action_gap_mode).lower().strip()
+        if action_gap_mode not in ("clean_adv", "gt_farthest"):
+            raise ValueError("--action_gap_mode must be one of {clean_adv, gt_farthest}.")
+        lambda_siglip = float(max(0.0, lambda_siglip))
+        siglip_device = str(siglip_device).strip()
+        siglip_input_size = int(max(64, siglip_input_size))
+        gt_softmin_tau = float(max(1e-6, gt_softmin_tau))
+        projection_randomization_enabled = bool(projection_randomization_enabled)
+        self.offline_phase_scope = str(offline_phase_scope).strip().lower()
         milestone_iters = self._build_milestone_iters(num_iter=num_iter, phase1_end_iter=phase1_end_iter)
 
         if viz_enabled and not eval_enabled:
@@ -258,6 +306,29 @@ class OpenVLAAttacker(object):
         if self.lighting_aug_train_only and lighting_aug_enabled:
             print("[LightingAugmentor] train-only mode enabled; validation lighting augmentation disabled.")
 
+        if sanity_mode:
+            print("[OfflineSanity] Enabled fixed-batch offline sanity pass.")
+
+            # 只测试梯度链路，不做复杂时序和 online rollout
+            eval_enabled = False
+            lighting_aug_enabled = False
+            lighting_aug_train_only = False
+
+            phase1_end_iter = int(num_iter)  # 全程使用 phase1_rollout
+
+            lambda_history = 0.0
+            lambda_ce = 0.0
+
+            # 关闭投影随机性，保证 loss 曲线可解释
+            if sanity_disable_randomization:
+                geometry = False
+                projection_alpha_jitter = 0.0
+                projection_fixed_angle = True
+                projection_shear = 0.0
+                projection_scale_min = 1.0
+                projection_scale_max = 1.0
+                projection_keystone_jitter = 0.0
+        
         self._setup_lighting_augmentor(
             enabled=lighting_aug_enabled,
             backend=lighting_backend,
@@ -275,22 +346,83 @@ class OpenVLAAttacker(object):
             ic_light_scope=ic_light_scope,
             ic_light_bg_control=ic_light_bg_control,
         )
+        dataset_name = getattr(args, "dataset", "libero_spatial") if args is not None else "libero_spatial"
+        if self.offline_phase_scope == "contact_manipulate_only":
+            self.offline_phase_scope = "contact_manipulate"
+        if self.offline_phase_scope not in ("all", "pre_contact", "contact_manipulate", "post_contact"):
+            raise ValueError(
+                "--offline_phase_scope must be one of {all, pre_contact, contact_manipulate, post_contact}."
+            )
+        self.offline_phase_selector = self._init_offline_phase_selector(
+            offline_phase_scope=self.offline_phase_scope,
+            dataset_name=dataset_name,
+            phase_sidecar_path=phase_state_cache_path,
+            fallback_enabled=offline_phase_fallback_enabled,
+        )
+        self.offline_phase_stats = dict(self.offline_phase_selector.stats) if self.offline_phase_selector is not None else {}
+
+        self._gt_action_bank = self._load_gt_action_bank(
+            dataset_name=dataset_name,
+            action_bank_path=gt_action_bank_path,
+        ) if action_gap_mode == "gt_farthest" else {}
+        if action_gap_mode == "gt_farthest" and len(self._gt_action_bank) <= 0:
+            print("[OfflineGT] GT action bank is empty; fallback to clean_adv action-gap mode.")
+            action_gap_mode = "clean_adv"
+
+        siglip_model = None
+        if lambda_siglip > 0.0:
+            siglip_model = self._load_siglip_image_model(siglip_model_name, siglip_device=siglip_device)
 
         train_iterator = iter(train_dataloader)
         val_iterator = iter(val_dataloader)
         optimizer.zero_grad()
 
+
+        frozen_train_batches = None
+
+        if sanity_mode:
+            frozen_train_batches = []
+            train_iter_for_sanity = iter(train_dataloader)
+
+            for _ in range(max(1, int(sanity_num_batches))):
+                try:
+                    batch = next(train_iter_for_sanity)
+                except StopIteration:
+                    train_iter_for_sanity = iter(train_dataloader)
+                    batch = next(train_iter_for_sanity)
+
+                frozen_train_batches.append(batch)
+
+            print(f"[OfflineSanity] Frozen {len(frozen_train_batches)} train batch(es).")
+
         for i in tqdm(range(num_iter)):
             phase_id = 1 if i < phase1_end_iter else 2
             rollout_steps = phase1_rollout if phase_id == 1 else phase2_rollout
 
-            data, train_iterator = self._next_batch(train_iterator, train_dataloader)
+            if sanity_mode:
+                data = frozen_train_batches[i % len(frozen_train_batches)]
+            else:
+                data, train_iterator = self._next_batch(train_iterator, train_dataloader)
+
             pixel_values, labels_full, attention_mask, input_ids = self._prepare_batch(
                 data=data,
                 maskidx=maskidx,
                 filterGripTrainTo1=filterGripTrainTo1,
                 use_all_joints=use_all_joints,
             )
+            keep_indices, phase_stats = self._select_offline_phase_indices(data, pixel_values)
+            if len(keep_indices) <= 0:
+                self.offline_phase_stats = dict(phase_stats)
+                continue
+            pixel_values, labels_full, attention_mask, input_ids, filtered_data = self._slice_batch_by_indices(
+                pixel_values=pixel_values,
+                labels_full=labels_full,
+                attention_mask=attention_mask,
+                input_ids=input_ids,
+                data=data,
+                indices=keep_indices,
+            )
+            self.offline_phase_stats = dict(phase_stats)
             pixel_values = self._apply_lighting_augmentation(pixel_values, iteration_idx=i, split="train")
 
             labels_masked = self.mask_labels(labels_full.clone(), maskidx=maskidx, use_all_joints=use_all_joints)
@@ -300,201 +432,44 @@ class OpenVLAAttacker(object):
                 continue
 
             clean_images = self.randomPatchTransform.im_process(pixel_values, mean=self.mean, std=self.std)
-            adv_images, attack_aux = self.randomPatchTransform.apply_attack_batch(
-                images=pixel_values,
-                attack_texture=projection_texture,
-                mean=self.mean,
-                std=self.std,
-                attack_mode=attack_mode,
-                geometry=geometry,
-                projection_alpha=projection_alpha,
-                projection_alpha_jitter=projection_alpha_jitter,
-                projection_soft_edge=projection_soft_edge,
-                projection_angle=projection_angle,
-                projection_fixed_angle=projection_fixed_angle,
-                projection_shear=projection_shear,
-                projection_scale_min=projection_scale_min,
-                projection_scale_max=projection_scale_max,
-                projection_region=projection_region,
-                projection_lower_start=projection_lower_start,
-                projection_width_ratio=projection_width_ratio,
-                projection_height_ratio=projection_height_ratio,
-                projection_margin_x=projection_margin_x,
-                projection_keystone=projection_keystone,
-                projection_keystone_jitter=projection_keystone_jitter,
-                projector_gamma=projector_gamma,
-                projector_gain=projector_gain,
-                projector_channel_gain=projector_channel_gain,
-                projector_ambient=projector_ambient,
-                projector_vignetting=projector_vignetting,
-                projector_distance_falloff=projector_distance_falloff,
-                projector_psf=projector_psf,
-                return_aux=True,
-            )
 
-            clean_rollout_input_ids = input_ids.clone()
-            adv_rollout_input_ids = input_ids.clone()
+            gt_candidates_by_sample = None
+            if action_gap_mode == "gt_farthest":
+                gt_phase_name = self.offline_phase_scope if self.offline_phase_scope != "all" else "contact_manipulate"
+                gt_candidates_by_sample = self._get_gt_candidates_for_batch(
+                    instructions=filtered_data.get("instructions", []),
+                    phase_name=gt_phase_name,
+                )
+
             total_action_gap = 0.0
             total_history_div = 0.0
             action_terms = 0
             history_terms = 0
             total_per_joint_gap = None
             final_output_adv = None
-            weighted_train_loss_sum = torch.zeros((), device=self.vla.device, dtype=torch.float32)
-            train_weight_sum = 0.0
+            inner_terms = 0
+            avg_projection_alpha = 0.0
+            avg_projection_coverage = 0.0
+            avg_projection_bottom = 0.0
+            avg_projection_keystone = 0.0
+            attack_aux = {
+                "projection_alpha_mean": 0.0,
+                "projection_coverage_ratio": 0.0,
+                "projection_bottom_ratio": 0.0,
+                "projection_keystone": 0.0,
+                "projection_backend": "projection",
+            }
             need_history = lambda_history > 0
 
-            for step_idx in range(rollout_steps):
-                with torch.no_grad():
-                    output_clean: CausalLMOutputWithPast = self.vla(
-                        input_ids=clean_rollout_input_ids,
-                        attention_mask=attention_mask,
-                        pixel_values=clean_images.to(torch.bfloat16),
-                        labels=labels_masked,
-                        output_hidden_states=need_history,
-                        use_cache=False,
-                    )
-
-                output_adv: CausalLMOutputWithPast = self.vla(
-                    input_ids=adv_rollout_input_ids,
-                    attention_mask=attention_mask,
-                    pixel_values=adv_images.to(torch.bfloat16),
-                    labels=labels_masked,
-                    output_hidden_states=need_history,
-                    use_cache=False,
-                )
-                final_output_adv = output_adv
-
-                step_action_gap_loss, step_action_gap_metric, step_per_joint_gap, adv_pred_tokens = self._compute_action_gap_losses(
-                    adv_logits=output_adv.logits,
-                    clean_logits=output_clean.logits,
-                    labels_full=labels_full,
-                    action_mask_full=action_mask_full,
-                    maskidx=maskidx,
-                    use_all_joints=use_all_joints,
-                    gripper_weight=gripper_weight,
-                )
-                total_action_gap += step_action_gap_metric.item()
-                action_terms += 1
-                total_per_joint_gap = self._accumulate_joint_values(total_per_joint_gap, step_per_joint_gap)
-
-                clean_pred_tokens = self._extract_pred_action_tokens_from_logits(output_clean.logits, labels_full)
-                step_history_div = torch.zeros((), device=self.vla.device, dtype=torch.float32)
-                if need_history:
-                    step_history_div, _clean_history_state, _adv_history_state = self._compute_clean_adv_history_divergence(
-                        clean_hidden_states=output_clean.hidden_states[-1],
-                        adv_hidden_states=output_adv.hidden_states[-1],
-                        labels_full=labels_full,
-                        action_mask_full=action_mask_full,
-                    )
-                    total_history_div += step_history_div.detach().item()
-                    history_terms += 1
-
-                step_weight = float(self._get_rollout_step_weight(step_idx))
-                train_weight_sum += step_weight
-
-                step_loss = -(lambda_action_gap * step_action_gap_loss)
-                if need_history:
-                    step_loss = step_loss - (lambda_history * step_history_div)
-                if step_idx == rollout_steps - 1:
-                    step_loss = step_loss + lambda_ce * output_adv.loss
-
-                weighted_train_loss_sum = weighted_train_loss_sum + (step_weight * step_loss)
-
-                clean_rollout_input_ids = self._update_rollout_inputs(
-                    rollout_input_ids=clean_rollout_input_ids,
-                    pred_action_tokens=clean_pred_tokens,
-                    action_mask_full=action_mask_full,
-                )
-                adv_rollout_input_ids = self._update_rollout_inputs(
-                    rollout_input_ids=adv_rollout_input_ids,
-                    pred_action_tokens=adv_pred_tokens,
-                    action_mask_full=action_mask_full,
-                )
-
-            total_train_loss = weighted_train_loss_sum / float(max(train_weight_sum, 1e-8))
-            (total_train_loss / float(accumulate_steps)).backward()
-
-            log_patch_grad = 0.0
-            if projection_texture.grad is not None:
-                log_patch_grad = projection_texture.grad.detach().abs().mean().item()
-
-            optimizer_step = ((i + 1) % accumulate_steps == 0) or ((i + 1) == num_iter)
-            if optimizer_step:
-                optimizer.step()
-                projection_texture.data = projection_texture.data.clamp(0, 1)
-                optimizer.zero_grad()
-                scheduler.step()
-
-            if final_output_adv is None:
-                continue
-
-            final_ce = final_output_adv.loss
-            final_mse_distance, final_uad = self.weighted_loss(final_output_adv.logits, labels_masked)
-            avg_action_gap = total_action_gap / float(max(1, action_terms))
-            avg_history_div = total_history_div / float(max(1, history_terms))
-            avg_per_joint_gap = self._normalize_joint_values(total_per_joint_gap, float(max(1, action_terms)))
-            rollout_score = lambda_action_gap * avg_action_gap + lambda_history * avg_history_div
-
-            self.train_CE_loss.append(final_ce.item())
-            self.train_MSE_distance_loss.append(final_mse_distance.item())
-            self.train_UAD.append(final_uad.item())
-            self.train_rollout_action_gap.append(avg_action_gap)
-            self.train_rollout_action_gap_joints.append(avg_per_joint_gap.detach().cpu().tolist())
-            self.train_rollout_history_div.append(avg_history_div)
-            self.train_rollout_score.append(rollout_score)
-            self.train_phase_id.append(phase_id)
-            self.loss_buffer.append(rollout_score)
-
-            train_logdata = {
-                "TRAIN_attack_loss(CE)": final_ce.item(),
-                "TRAIN_attack_loss (MSE_Distance)": final_mse_distance.item(),
-                "TRAIN_UAD": final_uad.item(),
-                "TRAIN_patch_gradient": log_patch_grad,
-                "TRAIN_LR": optimizer.param_groups[0]["lr"],
-                "TRAIN_rollout_action_gap": avg_action_gap,
-                "TRAIN_rollout_history_div": avg_history_div,
-                "TRAIN_rollout_score": rollout_score,
-                "phase_id": phase_id,
-                "TRAIN_projection_alpha_mean": float(attack_aux["projection_alpha_mean"]),
-                "TRAIN_projection_coverage_ratio": float(attack_aux["projection_coverage_ratio"]),
-                "TRAIN_projection_bottom_ratio": float(attack_aux["projection_bottom_ratio"]),
-                "TRAIN_projection_keystone": float(attack_aux["projection_keystone"]),
-                "attack_mode": attack_mode,
-            }
-            for joint_idx, joint_gap_value in enumerate(avg_per_joint_gap.detach().cpu().tolist()):
-                train_logdata[f"TRAIN_rollout_action_gap_joint_{joint_idx}"] = float(joint_gap_value)
-            if self.lighting_augmentor is not None:
-                train_logdata["TRAIN_lighting_pool_size"] = self.lighting_augmentor.current_pool_size
-                train_logdata["TRAIN_lighting_backend"] = self.lighting_augmentor.backend
-                train_logdata["ic_light_scope"] = getattr(self.lighting_augmentor, "scope", "n/a")
-                train_logdata["ic_light_bg_control"] = getattr(self.lighting_augmentor, "bg_control", "n/a")
-            train_logdata["TRAIN_projection_backend"] = str(attack_aux["projection_backend"])
-            if args is not None and args.wandb_project != "false" and wandb is not None:
-                wandb.log(train_logdata, step=i)
-
-            eval_due_to_interval = ((i + 1) % save_interval == 0) or (i == num_iter - 1)
-            eval_due_to_milestone = viz_enabled and (viz_policy == "milestone") and (i in milestone_iters)
-            if eval_enabled and (eval_due_to_interval or eval_due_to_milestone):
-                if i % (save_interval * 2) == 0:
-                    self.plot_loss()
-
-                val_stats, val_iterator, visual_triplets, lighting_backend, projection_backend = self._evaluate_rollout(
-                    projection_texture=projection_texture,
-                    val_iterator=val_iterator,
-                    val_dataloader=val_dataloader,
-                    maskidx=maskidx,
-                    eval_rollout=eval_rollout,
-                    geometry=geometry,
-                    filterGripTrainTo1=filterGripTrainTo1,
-                    use_all_joints=use_all_joints,
-                    gripper_weight=gripper_weight,
-                    lambda_action_gap=lambda_action_gap,
-                    lambda_history=lambda_history,
-                    val_max_batches=val_max_batches,
-                    global_iter=i,
-                    viz_samples=viz_samples,
+            inner_controller = InnerLoopBatchController(inner_loop=inner_loop_count)
+            for inner_idx, _ in enumerate(inner_controller.iter_batches_for_outer(filtered_data)):
+                adv_images, attack_aux = self.randomPatchTransform.apply_attack_batch(
+                    images=pixel_values,
+                    attack_texture=projection_texture,
+                    mean=self.mean,
+                    std=self.std,
                     attack_mode=attack_mode,
+                    geometry=geometry,
                     projection_alpha=projection_alpha,
                     projection_alpha_jitter=projection_alpha_jitter,
                     projection_soft_edge=projection_soft_edge,
@@ -517,29 +492,335 @@ class OpenVLAAttacker(object):
                     projector_vignetting=projector_vignetting,
                     projector_distance_falloff=projector_distance_falloff,
                     projector_psf=projector_psf,
-                    val_deterministic=val_deterministic,
-                    val_seed=val_seed,
-                    val_disable_lighting=val_disable_lighting,
+                    projection_randomization_enabled=projection_randomization_enabled,
+                    return_aux=True,
                 )
+                avg_projection_alpha += float(attack_aux["projection_alpha_mean"])
+                avg_projection_coverage += float(attack_aux["projection_coverage_ratio"])
+                avg_projection_bottom += float(attack_aux["projection_bottom_ratio"])
+                avg_projection_keystone += float(attack_aux["projection_keystone"])
 
-                self.val_CE_loss.append(val_stats["VAL_CE_loss"])
-                self.val_MSE_Distance.append(val_stats["VAL_MSE_Distance"])
-                self.val_UAD.append(val_stats["VAL_UAD"])
-                self.val_rollout_action_gap.append(val_stats["VAL_rollout_action_gap"])
-                self.val_rollout_action_gap_joints.append(
-                    self._extract_joint_metric_list(val_stats, prefix="VAL_rollout_action_gap_joint_")
-                )
-                self.val_rollout_history_div.append(val_stats["VAL_rollout_history_div"])
-                self.val_rollout_history_div_legacy.append(val_stats["VAL_rollout_history_div_legacy"])
-                self.val_rollout_score.append(val_stats["VAL_rollout_score"])
-                self.val_rollout_score_legacy.append(val_stats["VAL_rollout_score_legacy"])
+                clean_rollout_input_ids = input_ids.clone()
+                adv_rollout_input_ids = input_ids.clone()
+                weighted_inner_loss_sum = torch.zeros((), device=self.vla.device, dtype=torch.float32)
+                inner_weight_sum = 0.0
 
-                if args is not None and args.wandb_project != "false" and wandb is not None:
-                    wandb.log(val_stats, step=i)
+                for step_idx in range(rollout_steps):
+                    with torch.no_grad():
+                        output_clean: CausalLMOutputWithPast = self.vla(
+                            input_ids=clean_rollout_input_ids,
+                            attention_mask=attention_mask,
+                            pixel_values=clean_images.to(torch.bfloat16),
+                            labels=labels_masked,
+                            output_hidden_states=need_history,
+                            use_cache=False,
+                        )
 
-                improved = val_stats["VAL_rollout_score"] > self.best_rollout_score
+                    output_adv: CausalLMOutputWithPast = self.vla(
+                        input_ids=adv_rollout_input_ids,
+                        attention_mask=attention_mask,
+                        pixel_values=adv_images.to(torch.bfloat16),
+                        labels=labels_masked,
+                        output_hidden_states=need_history,
+                        use_cache=False,
+                    )
+                    final_output_adv = output_adv
+
+                    if action_gap_mode == "gt_farthest":
+                        step_action_gap_loss, step_action_gap_metric, step_per_joint_gap, adv_pred_tokens = (
+                            self._compute_gt_action_gap_losses_batch(
+                                adv_logits=output_adv.logits,
+                                clean_logits=output_clean.logits,
+                                labels_full=labels_full,
+                                action_mask_full=action_mask_full,
+                                gt_candidates_by_sample=gt_candidates_by_sample,
+                                maskidx=maskidx,
+                                use_all_joints=use_all_joints,
+                                gripper_weight=gripper_weight,
+                                gt_softmin_tau=gt_softmin_tau,
+                            )
+                        )
+                    else:
+                        step_action_gap_loss, step_action_gap_metric, step_per_joint_gap, adv_pred_tokens = (
+                            self._compute_action_gap_losses(
+                                adv_logits=output_adv.logits,
+                                clean_logits=output_clean.logits,
+                                labels_full=labels_full,
+                                action_mask_full=action_mask_full,
+                                maskidx=maskidx,
+                                use_all_joints=use_all_joints,
+                                gripper_weight=gripper_weight,
+                            )
+                        )
+
+                    total_action_gap += step_action_gap_metric.item()
+                    action_terms += 1
+                    total_per_joint_gap = self._accumulate_joint_values(total_per_joint_gap, step_per_joint_gap)
+
+                    clean_pred_tokens = self._extract_pred_action_tokens_from_logits(output_clean.logits, labels_full)
+                    step_history_div = torch.zeros((), device=self.vla.device, dtype=torch.float32)
+                    if need_history:
+                        step_history_div, _clean_history_state, _adv_history_state = self._compute_clean_adv_history_divergence(
+                            clean_hidden_states=output_clean.hidden_states[-1],
+                            adv_hidden_states=output_adv.hidden_states[-1],
+                            labels_full=labels_full,
+                            action_mask_full=action_mask_full,
+                        )
+                        total_history_div += step_history_div.detach().item()
+                        history_terms += 1
+
+                    step_siglip_distance = torch.zeros((), device=self.vla.device, dtype=torch.float32)
+                    if (siglip_model is not None) and (lambda_siglip > 0.0):
+                        step_siglip_distance = self._compute_siglip_embedding_distance(
+                            siglip_model=siglip_model,
+                            reference_images=attack_aux["pre_projection_tensors"],
+                            projected_images=attack_aux["projected_input_tensors"],
+                            input_size=siglip_input_size,
+                        )
+
+                    step_weight = float(self._get_rollout_step_weight(step_idx))
+                    inner_weight_sum += step_weight
+
+                    step_loss = combine_rollout_objective(
+                        action_gap_loss=step_action_gap_loss,
+                        siglip_distance=step_siglip_distance,
+                        lambda_action_gap=lambda_action_gap,
+                        lambda_siglip=lambda_siglip,
+                    )
+                    if need_history:
+                        step_loss = step_loss - (lambda_history * step_history_div)
+                    if step_idx == rollout_steps - 1:
+                        step_loss = step_loss + lambda_ce * output_adv.loss
+
+                    weighted_inner_loss_sum = weighted_inner_loss_sum + (step_weight * step_loss)
+
+                    clean_rollout_input_ids = self._update_rollout_inputs(
+                        rollout_input_ids=clean_rollout_input_ids,
+                        pred_action_tokens=clean_pred_tokens,
+                        action_mask_full=action_mask_full,
+                    )
+                    adv_rollout_input_ids = self._update_rollout_inputs(
+                        rollout_input_ids=adv_rollout_input_ids,
+                        pred_action_tokens=adv_pred_tokens,
+                        action_mask_full=action_mask_full,
+                    )
+
+                inner_loss = weighted_inner_loss_sum / float(max(inner_weight_sum, 1e-8))
+                scaled_inner_loss = inner_loss / float(max(1, accumulate_steps) * max(1, inner_loop_count))
+                if scaled_inner_loss.requires_grad:
+                    scaled_inner_loss.backward()
+                inner_terms += 1
+
+            if inner_terms <= 0:
+                continue
+
+            log_patch_grad = 0.0
+            if projection_texture.grad is not None:
+                log_patch_grad = projection_texture.grad.detach().abs().mean().item()
+
+            with torch.no_grad():
+                patch_saturation_ratio = (
+                    (projection_texture <= 1e-4) | (projection_texture >= 1.0 - 1e-4)
+                ).float().mean().item()
+
+                patch_mean = projection_texture.mean().item()
+                patch_std = projection_texture.std().item()
+            
+            
+            optimizer_step = ((i + 1) % accumulate_steps == 0) or ((i + 1) == num_iter)
+            if optimizer_step:
+
+                prev_projection_texture = projection_texture.detach().clone()
+
+                optimizer.step()
+                projection_texture.data = projection_texture.data.clamp(0, 1)
+
+                patch_update_l2 = (
+                    projection_texture.detach() - prev_projection_texture
+                ).norm().item()
+
+                optimizer.zero_grad()
+                scheduler.step()
+            else:
+                patch_update_l2 = 0.0
+
+            if final_output_adv is None:
+                continue
+
+            final_ce = final_output_adv.loss
+            final_mse_distance, final_uad = self.weighted_loss(final_output_adv.logits, labels_masked)
+            avg_action_gap = total_action_gap / float(max(1, action_terms))
+            avg_history_div = total_history_div / float(max(1, history_terms))
+            avg_per_joint_gap = self._normalize_joint_values(total_per_joint_gap, float(max(1, action_terms)))
+            rollout_score = (
+                lambda_action_gap * avg_action_gap
+                + lambda_history * avg_history_div
+            )
+            projection_divisor = float(max(1, inner_terms))
+            avg_projection_alpha = avg_projection_alpha / projection_divisor
+            avg_projection_coverage = avg_projection_coverage / projection_divisor
+            avg_projection_bottom = avg_projection_bottom / projection_divisor
+            avg_projection_keystone = avg_projection_keystone / projection_divisor
+
+            self.train_CE_loss.append(final_ce.item())
+            self.train_MSE_distance_loss.append(final_mse_distance.item())
+            self.train_UAD.append(final_uad.item())
+            self.train_rollout_action_gap.append(avg_action_gap)
+            self.train_rollout_action_gap_joints.append(avg_per_joint_gap.detach().cpu().tolist())
+            self.train_rollout_history_div.append(avg_history_div)
+            self.train_rollout_score.append(rollout_score)
+            self.train_phase_id.append(phase_id)
+            self.loss_buffer.append(rollout_score)
+
+            train_logdata = {
+                "TRAIN_attack_loss(CE)": final_ce.item(),
+                "TRAIN_attack_loss (MSE_Distance)": final_mse_distance.item(),
+                "TRAIN_UAD": final_uad.item(),
+                "TRAIN_patch_gradient": log_patch_grad,
+                "TRAIN_LR": optimizer.param_groups[0]["lr"],
+                "TRAIN_rollout_action_gap": avg_action_gap,
+                "TRAIN_rollout_history_div": avg_history_div,
+                "TRAIN_rollout_score": rollout_score,
+                "TRAIN_action_gap_mode_active": str(action_gap_mode),
+                "TRAIN_lambda_siglip": float(lambda_siglip),
+                "phase_id": phase_id,
+                "TRAIN_projection_alpha_mean": float(avg_projection_alpha),
+                "TRAIN_projection_coverage_ratio": float(avg_projection_coverage),
+                "TRAIN_projection_bottom_ratio": float(avg_projection_bottom),
+                "TRAIN_projection_keystone": float(avg_projection_keystone),
+                "attack_mode": attack_mode,
+                "TRAIN_inner_loop_count": int(inner_terms),
+                "TRAIN_phase_filter_total": int(self.offline_phase_stats.get("total", 0)),
+                "TRAIN_phase_filter_kept": int(self.offline_phase_stats.get("kept", 0)),
+                "TRAIN_phase_filter_dropped": int(self.offline_phase_stats.get("dropped", 0)),
+                "TRAIN_phase_filter_exact_hits": int(self.offline_phase_stats.get("exact_hits", 0)),
+                "TRAIN_phase_filter_exact_hits_basename": int(self.offline_phase_stats.get("exact_hits_basename", 0)),
+                "TRAIN_phase_filter_fallback_hits": int(self.offline_phase_stats.get("fallback_hits", 0)),
+                "TRAIN_phase_filter_unknown": int(self.offline_phase_stats.get("unknown", 0)),
+            }
+            train_filter_total = float(max(1, train_logdata["TRAIN_phase_filter_total"]))
+            train_logdata["TRAIN_phase_filter_keep_rate"] = (
+                float(train_logdata["TRAIN_phase_filter_kept"]) / train_filter_total
+            )
+            train_logdata["TRAIN_phase_filter_fallback_rate"] = (
+                float(train_logdata["TRAIN_phase_filter_fallback_hits"]) / train_filter_total
+            )
+            for joint_idx, joint_gap_value in enumerate(avg_per_joint_gap.detach().cpu().tolist()):
+                train_logdata[f"TRAIN_rollout_action_gap_joint_{joint_idx}"] = float(joint_gap_value)
+            if self.lighting_augmentor is not None:
+                train_logdata["TRAIN_lighting_pool_size"] = self.lighting_augmentor.current_pool_size
+                train_logdata["TRAIN_lighting_backend"] = self.lighting_augmentor.backend
+                train_logdata["ic_light_scope"] = getattr(self.lighting_augmentor, "scope", "n/a")
+                train_logdata["ic_light_bg_control"] = getattr(self.lighting_augmentor, "bg_control", "n/a")
+            train_logdata["TRAIN_projection_backend"] = str(attack_aux["projection_backend"])
+            train_logdata.update({
+                "SANITY_patch_saturation_ratio": patch_saturation_ratio,
+                "SANITY_patch_mean": patch_mean,
+                "SANITY_patch_std": patch_std,
+                "SANITY_patch_update_l2": patch_update_l2,
+            })
+            
+            if args is not None and args.wandb_project != "false" and wandb is not None:
+                wandb.log(train_logdata, step=i)
+
+
+
+
+            eval_due_to_interval = ((i + 1) % save_interval == 0) or (i == num_iter - 1)
+            eval_due_to_milestone = viz_enabled and (viz_policy == "milestone") and (i in milestone_iters)
+            if eval_enabled and (eval_due_to_interval or eval_due_to_milestone):
+                if i % (save_interval * 2) == 0:
+                    self.plot_loss()
+
+                if bool(eval_visual_only):
+                    visual_triplets = self._build_visual_triplets(
+                        original_images=attack_aux["pre_projection_tensors"],
+                        projected_input_images=attack_aux["projected_inputs"],
+                        adv_images=adv_images,
+                        max_samples=viz_samples,
+                        relight_images=None,
+                    )
+                    lighting_backend = (
+                        self.lighting_augmentor.backend
+                        if self.lighting_augmentor is not None and self._is_lighting_enabled_for_split("train")
+                        else "disabled"
+                    )
+                    projection_backend = str(attack_aux["projection_backend"])
+                    val_rollout_score = rollout_score
+                    improved = val_rollout_score > self.best_rollout_score
+                    if improved:
+                        self.best_rollout_score = val_rollout_score
+                else:
+                    val_stats, val_iterator, visual_triplets, lighting_backend, projection_backend = self._evaluate_rollout(
+                        projection_texture=projection_texture,
+                        val_iterator=val_iterator,
+                        val_dataloader=val_dataloader,
+                        maskidx=maskidx,
+                        eval_rollout=eval_rollout,
+                        geometry=geometry,
+                        filterGripTrainTo1=filterGripTrainTo1,
+                        use_all_joints=use_all_joints,
+                        gripper_weight=gripper_weight,
+                        lambda_action_gap=lambda_action_gap,
+                        lambda_history=lambda_history,
+                        lambda_siglip=lambda_siglip,
+                        val_max_batches=val_max_batches,
+                        global_iter=i,
+                        viz_samples=viz_samples,
+                        action_gap_mode=action_gap_mode,
+                        siglip_model=siglip_model,
+                        siglip_input_size=siglip_input_size,
+                        gt_softmin_tau=gt_softmin_tau,
+                        attack_mode=attack_mode,
+                        projection_alpha=projection_alpha,
+                        projection_alpha_jitter=projection_alpha_jitter,
+                        projection_soft_edge=projection_soft_edge,
+                        projection_angle=projection_angle,
+                        projection_fixed_angle=projection_fixed_angle,
+                        projection_shear=projection_shear,
+                        projection_scale_min=projection_scale_min,
+                        projection_scale_max=projection_scale_max,
+                        projection_region=projection_region,
+                        projection_lower_start=projection_lower_start,
+                        projection_width_ratio=projection_width_ratio,
+                        projection_height_ratio=projection_height_ratio,
+                        projection_margin_x=projection_margin_x,
+                        projection_keystone=projection_keystone,
+                        projection_keystone_jitter=projection_keystone_jitter,
+                        projector_gamma=projector_gamma,
+                        projector_gain=projector_gain,
+                        projector_channel_gain=projector_channel_gain,
+                        projector_ambient=projector_ambient,
+                        projector_vignetting=projector_vignetting,
+                        projector_distance_falloff=projector_distance_falloff,
+                        projector_psf=projector_psf,
+                        projection_randomization_enabled=projection_randomization_enabled,
+                        val_deterministic=val_deterministic,
+                        val_seed=val_seed,
+                        val_disable_lighting=val_disable_lighting,
+                    )
+
+                    self.val_CE_loss.append(val_stats["VAL_CE_loss"])
+                    self.val_MSE_Distance.append(val_stats["VAL_MSE_Distance"])
+                    self.val_UAD.append(val_stats["VAL_UAD"])
+                    self.val_rollout_action_gap.append(val_stats["VAL_rollout_action_gap"])
+                    self.val_rollout_action_gap_joints.append(
+                        self._extract_joint_metric_list(val_stats, prefix="VAL_rollout_action_gap_joint_")
+                    )
+                    self.val_rollout_history_div.append(val_stats["VAL_rollout_history_div"])
+                    self.val_rollout_history_div_legacy.append(val_stats["VAL_rollout_history_div_legacy"])
+                    self.val_rollout_score.append(val_stats["VAL_rollout_score"])
+                    self.val_rollout_score_legacy.append(val_stats["VAL_rollout_score_legacy"])
+
+                    if args is not None and args.wandb_project != "false" and wandb is not None:
+                        wandb.log(val_stats, step=i)
+
+                    val_rollout_score = val_stats["VAL_rollout_score"]
+                    improved = val_rollout_score > self.best_rollout_score
+                    if improved:
+                        self.best_rollout_score = val_rollout_score
+
                 if improved:
-                    self.best_rollout_score = val_stats["VAL_rollout_score"]
                     temp_save_dir = os.path.join(self.save_dir, f"{str(i)}")
                     os.makedirs(temp_save_dir, exist_ok=True)
                     torch.save(projection_texture.detach().cpu(), os.path.join(temp_save_dir, "projection_texture.pt"))
@@ -566,7 +847,7 @@ class OpenVLAAttacker(object):
                             iter_idx=i,
                             phase_id=phase_id,
                             is_best=improved,
-                            val_rollout_score=val_stats["VAL_rollout_score"],
+                            val_rollout_score=val_rollout_score,
                             reason=vis_reason,
                             lighting_backend=lighting_backend,
                             projection_backend=projection_backend,
@@ -1097,6 +1378,333 @@ class OpenVLAAttacker(object):
         updated_ids[:, 1 : 1 + seq_len] = target_slice
         return updated_ids
 
+    def _resolve_default_offline_sidecar_dir(self, dataset_name):
+        normalized = str(dataset_name).strip().lower()
+        mapping = {
+            "libero_spatial": "libero_spatial_no_noops",
+            "libero_object": "libero_object_no_noops",
+            "libero_goal": "libero_goal_no_noops",
+            "libero_10": "libero_10_no_noops",
+        }
+        sidecar_dataset = mapping.get(normalized, "libero_spatial_no_noops")
+        project_root = Path(__file__).resolve().parents[2]
+        return project_root / "data" / "libero_sidecars" / sidecar_dataset
+
+    def _init_offline_phase_selector(
+        self,
+        offline_phase_scope,
+        dataset_name,
+        phase_sidecar_path,
+        fallback_enabled,
+    ):
+        if str(offline_phase_scope).lower() == "all":
+            return None
+        sidecar_path = str(phase_sidecar_path or "").strip()
+        if sidecar_path.lower() in ("", "none", "null", "auto"):
+            sidecar_path = str(self._resolve_default_offline_sidecar_dir(dataset_name) / "phases.parquet")
+        selector = OfflinePhaseSelector.from_phase_parquet(
+            phase_parquet_path=sidecar_path,
+            target_phase=offline_phase_scope,
+            fallback_enabled=fallback_enabled,
+        )
+        if not selector.ready:
+            print(f"[OfflinePhase] phase selector disabled (missing/invalid sidecar: {sidecar_path}).")
+            return None
+        print(f"[OfflinePhase] enabled scope={offline_phase_scope} sidecar={sidecar_path}")
+        return selector
+
+    def _select_offline_phase_indices(self, data, pixel_values):
+        if self.offline_phase_selector is None:
+            all_idx = list(range(len(pixel_values)))
+            return all_idx, self.offline_phase_stats
+        instructions = data.get("instructions", [])
+        timesteps = data.get("timesteps", [-1 for _ in range(len(pixel_values))])
+        source_file_paths = data.get("source_file_paths", ["" for _ in range(len(pixel_values))])
+        episode_lengths = data.get("episode_lengths", [-1 for _ in range(len(pixel_values))])
+        mask, stats = self.offline_phase_selector.select_mask(
+            instructions=instructions,
+            timesteps=timesteps,
+            source_file_paths=source_file_paths,
+            episode_lengths=episode_lengths,
+        )
+        keep_indices = [idx for idx, keep in enumerate(mask) if bool(keep)]
+        return keep_indices, stats
+
+    def _slice_batch_by_indices(
+        self,
+        pixel_values,
+        labels_full,
+        attention_mask,
+        input_ids,
+        data,
+        indices,
+    ):
+        if len(indices) <= 0:
+            return [], labels_full[:0], attention_mask[:0], input_ids[:0], {}
+        pixel_values_sliced = [pixel_values[i] for i in indices]
+        labels_sliced = labels_full[indices, :]
+        attention_sliced = attention_mask[indices, :]
+        input_ids_sliced = input_ids[indices, :]
+        sliced_data = {}
+        for key, value in data.items():
+            if isinstance(value, list):
+                sliced_data[key] = [value[i] for i in indices]
+            else:
+                sliced_data[key] = value
+        return pixel_values_sliced, labels_sliced, attention_sliced, input_ids_sliced, sliced_data
+
+    def _load_gt_action_bank(self, dataset_name, action_bank_path):
+        path_value = str(action_bank_path or "").strip()
+        if path_value.lower() in ("", "none", "null", "auto"):
+            path_value = str(self._resolve_default_offline_sidecar_dir(dataset_name) / "action_bank.parquet")
+        action_bank_file = Path(path_value)
+        if not action_bank_file.exists():
+            print(f"[OfflineGT] action bank not found: {action_bank_file}")
+            return {}
+        try:
+            import pandas as pd
+        except Exception:
+            print("[OfflineGT] pandas is unavailable; GT action bank disabled.")
+            return {}
+        df = pd.read_parquet(action_bank_file)
+        if not {"instruction", "phase", "normalized_action"}.issubset(df.columns):
+            print(f"[OfflineGT] malformed action bank columns: {df.columns.tolist()}")
+            return {}
+
+        bank = {}
+        for row in df.itertuples(index=False):
+            instruction_key = canonicalize_instruction(getattr(row, "instruction", ""))
+            phase_name = str(getattr(row, "phase", "contact_manipulate"))
+            phase_name = phase_name.strip().lower()
+            if instruction_key == "":
+                continue
+            action = getattr(row, "normalized_action", None)
+            if action is None:
+                continue
+            action_tensor = torch.tensor(list(action), dtype=torch.float32, device=self.vla.device)
+            bank.setdefault((instruction_key, phase_name), []).append(action_tensor)
+
+        finalized = {}
+        for key, values in bank.items():
+            if len(values) <= 0:
+                continue
+            finalized[key] = torch.stack(values, dim=0)
+        self._gt_action_bank_path = str(action_bank_file)
+        print(f"[OfflineGT] loaded action bank entries={len(finalized)} path={action_bank_file}")
+        return finalized
+
+    def _get_gt_candidates_for_batch(self, instructions, phase_name):
+        normalized_phase = str(phase_name or "contact_manipulate").strip().lower()
+        candidates = []
+        for instruction in instructions:
+            instruction_key = canonicalize_instruction(instruction)
+            tensor = self._gt_action_bank.get((instruction_key, normalized_phase))
+            candidates.append(tensor)
+        return candidates
+
+    def _fit_continuous_action_dim_tensor(self, action, action_dim):
+        action_tensor = torch.as_tensor(action, device=self.vla.device, dtype=torch.float32).view(-1)
+        if action_tensor.shape[0] == int(action_dim):
+            return action_tensor
+        if action_tensor.shape[0] > int(action_dim):
+            return action_tensor[: int(action_dim)]
+        padded = torch.zeros((int(action_dim),), device=self.vla.device, dtype=torch.float32)
+        padded[: action_tensor.shape[0]] = action_tensor
+        return padded
+
+    @staticmethod
+    def _compute_weighted_action_set_objective(
+        adv_soft_actions,
+        adv_hard_actions,
+        gt_candidate_actions,
+        idx_tensor,
+        joint_weights,
+        tau,
+    ):
+        selected_adv_soft = adv_soft_actions.index_select(1, idx_tensor)
+        selected_adv_hard = adv_hard_actions.index_select(1, idx_tensor)
+        selected_gt_candidates = gt_candidate_actions.index_select(1, idx_tensor)
+        weight_denom = joint_weights.sum().clamp(min=1e-6)
+
+        soft_squared = torch.square(selected_adv_soft[:, None, :] - selected_gt_candidates[None, :, :])
+        weighted_soft_squared = (soft_squared * joint_weights.view(1, 1, -1)).sum(dim=-1) / weight_denom
+        tau = max(float(tau), 1e-6)
+        num_candidates = max(1, int(selected_gt_candidates.shape[0]))
+        soft_min_distance = -tau * (
+            torch.logsumexp(-weighted_soft_squared / tau, dim=1) - math.log(float(num_candidates))
+        )
+        loss_action_gap = soft_min_distance.mean()
+
+        hard_squared = torch.square(selected_adv_hard[:, None, :] - selected_gt_candidates[None, :, :])
+        weighted_hard_squared = (hard_squared * joint_weights.view(1, 1, -1)).sum(dim=-1) / weight_denom
+        nearest_idx = weighted_hard_squared.argmin(dim=1)
+        nearest_actions = gt_candidate_actions.index_select(0, nearest_idx)
+        per_joint_l1 = torch.abs(adv_hard_actions - nearest_actions).mean(dim=0)
+        metric_action_gap = weighted_hard_squared.min(dim=1).values.mean()
+        return loss_action_gap, metric_action_gap, per_joint_l1
+
+    def _compute_gt_action_gap_losses_batch(
+        self,
+        adv_logits,
+        clean_logits,
+        labels_full,
+        action_mask_full,
+        gt_candidates_by_sample,
+        maskidx,
+        use_all_joints,
+        gripper_weight,
+        gt_softmin_tau,
+    ):
+        del clean_logits
+        batch_size = labels_full.shape[0]
+        adv_action_logits = self._extract_action_logits(adv_logits, labels_full)
+        seq_len = min(action_mask_full.shape[1], adv_action_logits.shape[1])
+        action_mask = action_mask_full[:, :seq_len]
+        adv_action_logits = adv_action_logits[:, :seq_len, :]
+        adv_pred_tokens = adv_action_logits.argmax(dim=-1) + 31744
+
+        total_loss = torch.zeros((), device=self.vla.device, dtype=torch.float32)
+        total_metric = 0.0
+        total_per_joint = None
+        valid_samples = 0
+
+        for batch_idx in range(batch_size):
+            sample_mask = action_mask[batch_idx]
+            sample_logits = adv_action_logits[batch_idx][sample_mask]
+            if sample_logits.numel() <= 0:
+                continue
+            num_actions = int(sample_logits.shape[0])
+            if num_actions <= 0:
+                continue
+            sample_candidates = None
+            if gt_candidates_by_sample is not None and batch_idx < len(gt_candidates_by_sample):
+                sample_candidates = gt_candidates_by_sample[batch_idx]
+            if sample_candidates is None or sample_candidates.numel() <= 0:
+                continue
+
+            sample_candidates = sample_candidates.to(self.vla.device, dtype=torch.float32)
+            if sample_candidates.ndim != 2:
+                continue
+            if sample_candidates.shape[1] != num_actions:
+                sample_candidates = torch.stack(
+                    [
+                        self._fit_continuous_action_dim_tensor(action, action_dim=num_actions)
+                        for action in sample_candidates
+                    ],
+                    dim=0,
+                ).to(self.vla.device, dtype=torch.float32)
+
+            idx_tensor, joint_weights = self._select_joint_indices_and_weights(
+                num_actions=num_actions,
+                maskidx=maskidx,
+                use_all_joints=use_all_joints,
+                gripper_weight=gripper_weight,
+            )
+            if idx_tensor.numel() <= 0:
+                continue
+
+            adv_probs = F.softmax(sample_logits, dim=-1)
+            adv_soft_actions = (adv_probs * self.action_bin_centers).sum(dim=-1).view(1, num_actions)
+            adv_hard_tokens = sample_logits.argmax(dim=-1) + 31744
+            adv_hard_actions = self._decode_action_tokens(adv_hard_tokens, 1, num_actions)
+            sample_loss, sample_metric, sample_per_joint = self._compute_weighted_action_set_objective(
+                adv_soft_actions=adv_soft_actions,
+                adv_hard_actions=adv_hard_actions,
+                gt_candidate_actions=sample_candidates,
+                idx_tensor=idx_tensor,
+                joint_weights=joint_weights,
+                tau=gt_softmin_tau,
+            )
+            total_loss = total_loss + sample_loss
+            total_metric += float(sample_metric.detach().item())
+            total_per_joint = self._accumulate_joint_values(total_per_joint, sample_per_joint.detach())
+            valid_samples += 1
+
+        if valid_samples <= 0:
+            zero = torch.zeros((), device=self.vla.device, dtype=torch.float32)
+            per_joint_zero = torch.zeros((self.default_action_dim,), device=self.vla.device, dtype=torch.float32)
+            return zero, zero.detach(), per_joint_zero, adv_pred_tokens.detach()
+
+        avg_loss = total_loss / float(valid_samples)
+        avg_metric = torch.tensor(total_metric / float(valid_samples), device=self.vla.device, dtype=torch.float32)
+        avg_per_joint = self._normalize_joint_values(total_per_joint, float(valid_samples))
+        return avg_loss, avg_metric.detach(), avg_per_joint.detach(), adv_pred_tokens.detach()
+
+    def _resolve_siglip_device(self, siglip_device):
+        requested = str(siglip_device or "").strip().lower()
+        if requested in ("", "auto", "same", "vla"):
+            return torch.device(self.vla.device)
+        if requested.isdigit():
+            return torch.device(f"cuda:{int(requested)}")
+        return torch.device(str(siglip_device))
+
+    def _load_siglip_image_model(self, model_name, siglip_device="auto"):
+        target_device = self._resolve_siglip_device(siglip_device)
+        if (
+            self._siglip_image_model is not None
+            and self._siglip_model_name == str(model_name)
+            and self._siglip_model_device == str(target_device)
+        ):
+            return self._siglip_image_model
+        model = SiglipModel.from_pretrained(str(model_name)).to(target_device)
+        model.eval()
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        self._siglip_image_model = model
+        self._siglip_model_name = str(model_name)
+        self._siglip_model_device = str(target_device)
+        print(f"[SigLIP] loaded model={model_name} device={target_device}")
+        return model
+
+    def _as_siglip_image_batch(self, images, device):
+        if isinstance(images, (list, tuple)):
+            if len(images) <= 0:
+                raise ValueError("Expected non-empty image list for SigLIP distance.")
+            batch = torch.stack([image.to(device, dtype=torch.float32) for image in images], dim=0)
+        else:
+            batch = images.to(device, dtype=torch.float32)
+        if batch.ndim == 3:
+            batch = batch.unsqueeze(0)
+        if batch.ndim != 4:
+            raise ValueError(f"Expected SigLIP image batch with 3 or 4 dims, got shape {tuple(batch.shape)}.")
+        return batch
+
+    def _siglip_resize_center_crop(self, images, input_size):
+        if images.numel() == 0:
+            return images
+        height = int(images.shape[-2])
+        width = int(images.shape[-1])
+        if height <= 0 or width <= 0:
+            raise ValueError(f"Invalid SigLIP image shape: {tuple(images.shape)}.")
+        target = int(max(64, input_size))
+        scale = float(target) / float(min(height, width))
+        resized_h = int(round(height * scale))
+        resized_w = int(round(width * scale))
+        resized = F.interpolate(images, size=(resized_h, resized_w), mode="bilinear", align_corners=False)
+        crop_top = max(0, (resized_h - target) // 2)
+        crop_left = max(0, (resized_w - target) // 2)
+        return resized[:, :, crop_top : crop_top + target, crop_left : crop_left + target]
+
+    def _compute_siglip_embedding_distance(self, siglip_model, reference_images, projected_images, input_size=384):
+        siglip_device = next(siglip_model.parameters()).device
+        reference_batch = self._siglip_resize_center_crop(
+            self._as_siglip_image_batch(reference_images, device=siglip_device).detach(),
+            input_size=input_size,
+        )
+        projected_batch = self._siglip_resize_center_crop(
+            self._as_siglip_image_batch(projected_images, device=siglip_device),
+            input_size=input_size,
+        )
+        reference_batch = reference_batch.to(torch.bfloat16)
+        projected_batch = projected_batch.to(torch.bfloat16)
+        with torch.no_grad():
+            reference_features = siglip_model.get_image_features(pixel_values=reference_batch)
+        projected_features = siglip_model.get_image_features(pixel_values=projected_batch)
+        reference_features = F.normalize(reference_features.to(torch.float32), dim=-1)
+        projected_features = F.normalize(projected_features.to(torch.float32), dim=-1)
+        distance = 1.0 - F.cosine_similarity(reference_features, projected_features, dim=-1).mean()
+        return distance.to(self.vla.device)
+
     def _evaluate_rollout(
         self,
         projection_texture,
@@ -1110,9 +1718,14 @@ class OpenVLAAttacker(object):
         gripper_weight,
         lambda_action_gap,
         lambda_history,
+        lambda_siglip,
         val_max_batches,
         global_iter,
         viz_samples,
+        action_gap_mode,
+        siglip_model,
+        siglip_input_size,
+        gt_softmin_tau,
         attack_mode,
         projection_alpha,
         projection_alpha_jitter,
@@ -1136,6 +1749,7 @@ class OpenVLAAttacker(object):
         projector_vignetting,
         projector_distance_falloff,
         projector_psf,
+        projection_randomization_enabled,
         val_deterministic,
         val_seed,
         val_disable_lighting,
@@ -1147,6 +1761,7 @@ class OpenVLAAttacker(object):
         avg_action_gap_joints = None
         avg_history_div = 0.0
         avg_history_div_legacy = 0.0
+        avg_siglip_distance = 0.0
         avg_projection_alpha = 0.0
         avg_projection_coverage = 0.0
         avg_projection_bottom = 0.0
@@ -1175,6 +1790,19 @@ class OpenVLAAttacker(object):
                     filterGripTrainTo1=filterGripTrainTo1,
                     use_all_joints=use_all_joints,
                 )
+                keep_indices, phase_stats = self._select_offline_phase_indices(data, pixel_values)
+                if len(keep_indices) <= 0:
+                    self.offline_phase_stats = dict(phase_stats)
+                    continue
+                pixel_values, labels_full, attention_mask, input_ids, filtered_data = self._slice_batch_by_indices(
+                    pixel_values=pixel_values,
+                    labels_full=labels_full,
+                    attention_mask=attention_mask,
+                    input_ids=input_ids,
+                    data=data,
+                    indices=keep_indices,
+                )
+                self.offline_phase_stats = dict(phase_stats)
                 original_pixel_values = list(pixel_values)
                 batch_seed = (int(val_seed) + int(val_batch_idx)) if val_deterministic else None
                 val_lighting_enabled = (not val_disable_lighting) and self._is_lighting_enabled_for_split("val")
@@ -1229,6 +1857,7 @@ class OpenVLAAttacker(object):
                         projector_vignetting=projector_vignetting,
                         projector_distance_falloff=projector_distance_falloff,
                         projector_psf=projector_psf,
+                        projection_randomization_enabled=projection_randomization_enabled,
                         return_aux=True,
                     )
                 projection_backend = str(attack_aux["projection_backend"])
@@ -1247,12 +1876,20 @@ class OpenVLAAttacker(object):
                 sample_action_gap_joints = None
                 sample_history_div = 0.0
                 sample_history_div_legacy = 0.0
+                sample_siglip_distance = 0.0
                 action_terms = 0
                 history_terms = 0
                 history_terms_legacy = 0
                 prev_adv_history_state = None
                 final_output_adv = None
                 need_history = True
+                gt_candidates_by_sample = None
+                if action_gap_mode == "gt_farthest":
+                    gt_phase_name = self.offline_phase_scope if self.offline_phase_scope != "all" else "contact_manipulate"
+                    gt_candidates_by_sample = self._get_gt_candidates_for_batch(
+                        instructions=filtered_data.get("instructions", []),
+                        phase_name=gt_phase_name,
+                    )
 
                 for _step_idx in range(eval_rollout):
                     output_clean: CausalLMOutputWithPast = self.vla(
@@ -1273,15 +1910,28 @@ class OpenVLAAttacker(object):
                     )
                     final_output_adv = output_adv
 
-                    _, metric_action_gap, step_per_joint_gap, adv_pred_tokens = self._compute_action_gap_losses(
-                        adv_logits=output_adv.logits,
-                        clean_logits=output_clean.logits,
-                        labels_full=labels_full,
-                        action_mask_full=action_mask_full,
-                        maskidx=maskidx,
-                        use_all_joints=use_all_joints,
-                        gripper_weight=gripper_weight,
-                    )
+                    if action_gap_mode == "gt_farthest":
+                        _, metric_action_gap, step_per_joint_gap, adv_pred_tokens = self._compute_gt_action_gap_losses_batch(
+                            adv_logits=output_adv.logits,
+                            clean_logits=output_clean.logits,
+                            labels_full=labels_full,
+                            action_mask_full=action_mask_full,
+                            gt_candidates_by_sample=gt_candidates_by_sample,
+                            maskidx=maskidx,
+                            use_all_joints=use_all_joints,
+                            gripper_weight=gripper_weight,
+                            gt_softmin_tau=gt_softmin_tau,
+                        )
+                    else:
+                        _, metric_action_gap, step_per_joint_gap, adv_pred_tokens = self._compute_action_gap_losses(
+                            adv_logits=output_adv.logits,
+                            clean_logits=output_clean.logits,
+                            labels_full=labels_full,
+                            action_mask_full=action_mask_full,
+                            maskidx=maskidx,
+                            use_all_joints=use_all_joints,
+                            gripper_weight=gripper_weight,
+                        )
                     sample_action_gap += metric_action_gap.item()
                     action_terms += 1
                     sample_action_gap_joints = self._accumulate_joint_values(sample_action_gap_joints, step_per_joint_gap)
@@ -1300,6 +1950,15 @@ class OpenVLAAttacker(object):
                         sample_history_div_legacy += legacy_history_div.item()
                         history_terms_legacy += 1
                     prev_adv_history_state = adv_history_state.detach()
+
+                    if (siglip_model is not None) and (lambda_siglip > 0.0):
+                        _siglip_distance = self._compute_siglip_embedding_distance(
+                            siglip_model=siglip_model,
+                            reference_images=attack_aux["pre_projection_tensors"],
+                            projected_images=attack_aux["projected_input_tensors"],
+                            input_size=siglip_input_size,
+                        )
+                        sample_siglip_distance += float(_siglip_distance.detach().item())
 
                     clean_rollout_input_ids = self._update_rollout_inputs(
                         rollout_input_ids=clean_rollout_input_ids,
@@ -1328,6 +1987,7 @@ class OpenVLAAttacker(object):
                 avg_action_gap_joints = self._accumulate_joint_values(avg_action_gap_joints, sample_avg_joint_gap)
                 avg_history_div += sample_history_div / float(max(1, history_terms))
                 avg_history_div_legacy += sample_history_div_legacy / float(max(1, history_terms_legacy))
+                avg_siglip_distance += sample_siglip_distance / float(max(1, eval_rollout))
                 avg_projection_alpha += float(attack_aux["projection_alpha_mean"])
                 avg_projection_coverage += float(attack_aux["projection_coverage_ratio"])
                 avg_projection_bottom += float(attack_aux["projection_bottom_ratio"])
@@ -1342,12 +2002,21 @@ class OpenVLAAttacker(object):
         avg_action_gap_joints = self._normalize_joint_values(avg_action_gap_joints, divisor)
         avg_history_div /= divisor
         avg_history_div_legacy /= divisor
+        avg_siglip_distance /= divisor
         avg_projection_alpha /= divisor
         avg_projection_coverage /= divisor
         avg_projection_bottom /= divisor
         avg_projection_keystone /= divisor
-        avg_rollout_score = lambda_action_gap * avg_action_gap + lambda_history * avg_history_div
-        avg_rollout_score_legacy = lambda_action_gap * avg_action_gap + lambda_history * avg_history_div_legacy
+        avg_rollout_score = (
+            lambda_action_gap * avg_action_gap
+            + lambda_history * avg_history_div
+            + lambda_siglip * avg_siglip_distance
+        )
+        avg_rollout_score_legacy = (
+            lambda_action_gap * avg_action_gap
+            + lambda_history * avg_history_div_legacy
+            + lambda_siglip * avg_siglip_distance
+        )
 
         log_data = {
             "VAL_CE_loss": avg_ce,
@@ -1356,21 +2025,34 @@ class OpenVLAAttacker(object):
             "VAL_rollout_action_gap": avg_action_gap,
             "VAL_rollout_history_div": avg_history_div,
             "VAL_rollout_history_div_legacy": avg_history_div_legacy,
+            "VAL_rollout_siglip_distance": avg_siglip_distance,
             "VAL_rollout_score": avg_rollout_score,
             "VAL_rollout_score_legacy": avg_rollout_score_legacy,
             "VAL_projection_alpha_mean": avg_projection_alpha,
             "VAL_projection_coverage_ratio": avg_projection_coverage,
             "VAL_projection_bottom_ratio": avg_projection_bottom,
             "VAL_projection_keystone": avg_projection_keystone,
+            "VAL_action_gap_mode_active": str(action_gap_mode),
             "attack_mode": str(attack_mode),
             "VAL_effective_lighting_enabled": int(bool(val_lighting_enabled)),
+            "VAL_effective_projection_randomization_enabled": int(bool(projection_randomization_enabled)),
             "VAL_lighting_backend": str(lighting_backend),
+            "VAL_phase_filter_total": int(self.offline_phase_stats.get("total", 0)),
+            "VAL_phase_filter_kept": int(self.offline_phase_stats.get("kept", 0)),
+            "VAL_phase_filter_dropped": int(self.offline_phase_stats.get("dropped", 0)),
+            "VAL_phase_filter_exact_hits": int(self.offline_phase_stats.get("exact_hits", 0)),
+            "VAL_phase_filter_exact_hits_basename": int(self.offline_phase_stats.get("exact_hits_basename", 0)),
+            "VAL_phase_filter_fallback_hits": int(self.offline_phase_stats.get("fallback_hits", 0)),
+            "VAL_phase_filter_unknown": int(self.offline_phase_stats.get("unknown", 0)),
             "ic_light_scope": getattr(self.lighting_augmentor, "scope", "n/a") if self.lighting_augmentor is not None else "n/a",
             "ic_light_bg_control": getattr(self.lighting_augmentor, "bg_control", "n/a")
             if self.lighting_augmentor is not None
             else "n/a",
             "projection_backend": projection_backend,
         }
+        val_filter_total = float(max(1, log_data["VAL_phase_filter_total"]))
+        log_data["VAL_phase_filter_keep_rate"] = float(log_data["VAL_phase_filter_kept"]) / val_filter_total
+        log_data["VAL_phase_filter_fallback_rate"] = float(log_data["VAL_phase_filter_fallback_hits"]) / val_filter_total
         for joint_idx, joint_gap_value in enumerate(avg_action_gap_joints.detach().cpu().tolist()):
             log_data[f"VAL_rollout_action_gap_joint_{joint_idx}"] = float(joint_gap_value)
         return log_data, val_iterator, visual_triplets, lighting_backend, projection_backend

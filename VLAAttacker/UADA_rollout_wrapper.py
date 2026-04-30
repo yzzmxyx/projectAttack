@@ -87,6 +87,7 @@ def main(args):
             "eval_rollout": args.eval_rollout,
             "save_interval": args.save_interval,
             "eval_enabled": args.eval_enabled,
+            "eval_visual_only": args.eval_visual_only,
             "val_max_batches": args.val_max_batches,
             "val_deterministic": args.val_deterministic,
             "val_seed": args.val_seed,
@@ -124,6 +125,7 @@ def main(args):
             "projection_margin_x": args.projection_margin_x,
             "projection_keystone": args.projection_keystone,
             "projection_keystone_jitter": args.projection_keystone_jitter,
+            "projection_randomization_enabled": args.projection_randomization_enabled,
             "projector_gamma": args.projector_gamma,
             "projector_gain": args.projector_gain,
             "projector_channel_gain": args.projector_channel_gain,
@@ -131,6 +133,16 @@ def main(args):
             "projector_vignetting": args.projector_vignetting,
             "projector_distance_falloff": args.projector_distance_falloff,
             "projector_psf": args.projector_psf,
+            "action_gap_mode": args.action_gap_mode,
+            "lambda_siglip": args.lambda_siglip,
+            "siglip_model_name": args.siglip_model_name,
+            "siglip_device": args.siglip_device,
+            "siglip_input_size": args.siglip_input_size,
+            "gt_softmin_tau": args.gt_softmin_tau,
+            "gt_action_bank_path": args.gt_action_bank_path,
+            "offline_phase_scope": args.offline_phase_scope,
+            "phase_state_cache_path": args.phase_state_cache_path,
+            "offline_phase_fallback_enabled": args.offline_phase_fallback_enabled,
             "viz_enabled": args.viz_enabled,
             "viz_policy": args.viz_policy,
             "viz_samples": args.viz_samples,
@@ -186,6 +198,7 @@ def main(args):
         eval_rollout=args.eval_rollout,
         save_interval=args.save_interval,
         eval_enabled=args.eval_enabled,
+        eval_visual_only=args.eval_visual_only,
         val_max_batches=args.val_max_batches,
         lighting_aug_enabled=args.lighting_aug_enabled,
         lighting_aug_train_only=args.lighting_aug_train_only,
@@ -226,6 +239,17 @@ def main(args):
         projector_vignetting=args.projector_vignetting,
         projector_distance_falloff=args.projector_distance_falloff,
         projector_psf=args.projector_psf,
+        projection_randomization_enabled=args.projection_randomization_enabled,
+        action_gap_mode=args.action_gap_mode,
+        lambda_siglip=args.lambda_siglip,
+        siglip_model_name=args.siglip_model_name,
+        siglip_device=args.siglip_device,
+        siglip_input_size=args.siglip_input_size,
+        gt_softmin_tau=args.gt_softmin_tau,
+        gt_action_bank_path=args.gt_action_bank_path,
+        offline_phase_scope=args.offline_phase_scope,
+        phase_state_cache_path=args.phase_state_cache_path,
+        offline_phase_fallback_enabled=args.offline_phase_fallback_enabled,
         viz_enabled=args.viz_enabled,
         viz_policy=args.viz_policy,
         viz_samples=args.viz_samples,
@@ -234,6 +258,10 @@ def main(args):
         val_deterministic=args.val_deterministic,
         val_seed=args.val_seed,
         val_disable_lighting=args.val_disable_lighting,
+        sanity_mode=args.sanity_mode,
+        sanity_num_batches=args.sanity_num_batches,
+        sanity_report_interval=args.sanity_report_interval,
+        sanity_disable_randomization=args.sanity_disable_randomization,
     )
     print("Rollout-v2 attack done!")
 
@@ -276,6 +304,7 @@ def arg_parser():
     parser.add_argument("--projection_margin_x", default=0.02, type=float)
     parser.add_argument("--projection_keystone", default=0.12, type=float)
     parser.add_argument("--projection_keystone_jitter", default=0.03, type=float)
+    parser.add_argument("--projection_randomization_enabled", type=str2bool, default=True)
     parser.add_argument("--projector_gamma", default=2.2, type=float)
     parser.add_argument("--projector_gain", default=1.0, type=float)
     parser.add_argument("--projector_channel_gain", default="1.00,0.97,0.94", type=list_of_floats)
@@ -295,11 +324,22 @@ def arg_parser():
     parser.add_argument("--phase1_rollout", default=8, type=int)
     parser.add_argument("--phase2_rollout", default=24, type=int)
     parser.add_argument("--lambda_action_gap", default=1.0, type=float)
+    parser.add_argument("--action_gap_mode", default="gt_farthest", type=str)
+    parser.add_argument("--lambda_siglip", default=0.15, type=float)
+    parser.add_argument("--siglip_model_name", default="google/siglip-so400m-patch14-384", type=str)
+    parser.add_argument("--siglip_device", default="auto", type=str)
+    parser.add_argument("--siglip_input_size", default=384, type=int)
+    parser.add_argument("--gt_softmin_tau", default=0.05, type=float)
+    parser.add_argument("--gt_action_bank_path", default="", type=str)
+    parser.add_argument("--offline_phase_scope", default="contact_manipulate", type=str)
+    parser.add_argument("--phase_state_cache_path", default="", type=str)
+    parser.add_argument("--offline_phase_fallback_enabled", type=str2bool, default=True)
     parser.add_argument("--lambda_history", default=0.5, type=float)
     parser.add_argument("--lambda_ce", default=0.1, type=float)
     parser.add_argument("--eval_rollout", default=24, type=int)
     parser.add_argument("--save_interval", default=100, type=int)
     parser.add_argument("--eval_enabled", type=str2bool, default=True)
+    parser.add_argument("--eval_visual_only", type=str2bool, default=False)
     parser.add_argument("--val_max_batches", default=1000, type=int)
     parser.add_argument("--val_deterministic", type=str2bool, default=False)
     parser.add_argument("--val_seed", default=42, type=int)
@@ -329,6 +369,10 @@ def arg_parser():
     parser.add_argument("--viz_samples", default=4, type=int)
     parser.add_argument("--viz_save_best", type=str2bool, default=True)
     parser.add_argument("--viz_save_last", type=str2bool, default=True)
+    parser.add_argument("--sanity_mode", type=str2bool, default=False)
+    parser.add_argument("--sanity_num_batches", default=1, type=int)
+    parser.add_argument("--sanity_report_interval", default=1, type=int)
+    parser.add_argument("--sanity_disable_randomization", type=str2bool, default=True)
     return parser.parse_args()
 
 
@@ -376,14 +420,23 @@ if __name__ == "__main__":
         f" projection_lower_start:{args.projection_lower_start}\n projection_width_ratio:{args.projection_width_ratio}\n"
         f" projection_height_ratio:{args.projection_height_ratio}\n projection_margin_x:{args.projection_margin_x}\n"
         f" projection_keystone:{args.projection_keystone}\n projection_keystone_jitter:{args.projection_keystone_jitter}\n"
+        f" projection_randomization_enabled:{args.projection_randomization_enabled}\n"
         f" projector_gamma:{args.projector_gamma}\n projector_gain:{args.projector_gain}\n"
         f" projector_channel_gain:{args.projector_channel_gain}\n projector_ambient:{args.projector_ambient}\n"
         f" projector_vignetting:{args.projector_vignetting}\n projector_distance_falloff:{args.projector_distance_falloff}\n"
         f" projector_psf:{args.projector_psf}\n"
         f" phase1_ratio:{args.phase1_ratio}\n phase1_rollout:{args.phase1_rollout}\n phase2_rollout:{args.phase2_rollout}\n"
-        f" lambda_action_gap:{args.lambda_action_gap}\n lambda_history:{args.lambda_history}\n lambda_ce:{args.lambda_ce}\n"
+        f" action_gap_mode:{args.action_gap_mode}\n lambda_action_gap:{args.lambda_action_gap}\n"
+        f" lambda_siglip:{args.lambda_siglip}\n siglip_model_name:{args.siglip_model_name}\n"
+        f" siglip_device:{args.siglip_device}\n"
+        f" siglip_input_size:{args.siglip_input_size}\n gt_softmin_tau:{args.gt_softmin_tau}\n"
+        f" gt_action_bank_path:{args.gt_action_bank_path}\n offline_phase_scope:{args.offline_phase_scope}\n"
+        f" phase_state_cache_path:{args.phase_state_cache_path}\n"
+        f" offline_phase_fallback_enabled:{args.offline_phase_fallback_enabled}\n"
+        f" lambda_history:{args.lambda_history}\n lambda_ce:{args.lambda_ce}\n"
         f" eval_rollout:{args.eval_rollout}\n save_interval:{args.save_interval}\n"
-        f" eval_enabled:{args.eval_enabled}\n val_max_batches:{args.val_max_batches}\n"
+        f" eval_enabled:{args.eval_enabled}\n eval_visual_only:{args.eval_visual_only}\n"
+        f" val_max_batches:{args.val_max_batches}\n"
         f" val_deterministic:{args.val_deterministic}\n val_seed:{args.val_seed}\n"
         f" val_disable_lighting:{args.val_disable_lighting}\n"
         f" lighting_aug_enabled:{args.lighting_aug_enabled}\n"

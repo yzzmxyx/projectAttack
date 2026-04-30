@@ -5,6 +5,7 @@ import os
 import pickle
 import random
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -4958,7 +4959,7 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
         return step_idx in (0, mid, max_steps - 1)
 
     def _require_libero_modules(self):
-        try:
+        def _import_libero_modules():
             from libero.libero import benchmark
             from libero.libero.envs import OffScreenRenderEnv  # noqa: F401
             from experiments.robot.libero.libero_utils import (
@@ -4966,12 +4967,51 @@ class OpenVLAOnlineEnvAttacker(OpenVLAAttacker):
                 get_libero_env,
                 get_libero_image,
             )
+
+            return benchmark, get_libero_env, get_libero_image, get_libero_dummy_action
+
+        def _bootstrap_libero_path():
+            candidates = []
+            env_root = os.environ.get("LIBERO_ROOT", "").strip()
+            if env_root:
+                candidates.append(Path(env_root).expanduser())
+
+            project_root = Path(__file__).resolve().parents[2]
+            candidates.extend(
+                [
+                    project_root / "LIBERO",
+                    Path("/home/ubuntu/libero_pipeline/LIBERO"),
+                ]
+            )
+
+            added = []
+            for candidate in candidates:
+                root = candidate.resolve()
+                if not root.is_dir():
+                    continue
+                if not (root / "libero").exists():
+                    continue
+                root_str = str(root)
+                if root_str in sys.path:
+                    continue
+                sys.path.insert(0, root_str)
+                added.append(root_str)
+            return added
+
+        try:
+            return _import_libero_modules()
         except Exception as exc:
+            added_paths = _bootstrap_libero_path()
+            if added_paths:
+                try:
+                    return _import_libero_modules()
+                except Exception as retry_exc:
+                    exc = retry_exc
             raise RuntimeError(
                 "LIBERO online rollout dependencies are missing. "
-                "Please install/import `libero` and ensure `OffScreenRenderEnv` is available."
+                "Please install/import `libero` and ensure `OffScreenRenderEnv` is available. "
+                f"python={sys.executable}, LIBERO_ROOT={os.environ.get('LIBERO_ROOT', '')!r}, err={exc}"
             ) from exc
-        return benchmark, get_libero_env, get_libero_image, get_libero_dummy_action
 
     def _online_visualization_root(self):
         visual_root = os.path.join(self.save_dir, "visualization")

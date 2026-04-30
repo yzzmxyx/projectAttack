@@ -5,11 +5,57 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
-PYTHON_BIN="${PYTHON_BIN:-python}"
+PYTHON_BIN="${PYTHON_BIN:-}"
+if [[ -z "${PYTHON_BIN}" ]]; then
+    if [[ -n "${CONDA_PREFIX:-}" && "${CONDA_DEFAULT_ENV:-}" != "base" && -x "${CONDA_PREFIX}/bin/python" ]]; then
+        PYTHON_BIN="${CONDA_PREFIX}/bin/python"
+    elif [[ -x "/home/ubuntu/anaconda3/envs/roboticAttack/bin/python" ]]; then
+        PYTHON_BIN="/home/ubuntu/anaconda3/envs/roboticAttack/bin/python"
+    elif [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
+        PYTHON_BIN="${CONDA_PREFIX}/bin/python"
+    else
+        PYTHON_BIN="python3.10"
+    fi
+fi
+
 if ! "${PYTHON_BIN}" -V >/dev/null 2>&1; then
     echo "Python interpreter not runnable: ${PYTHON_BIN}" >&2
     exit 1
 fi
+
+# Resolve a usable LIBERO source root and expose it to Python import path.
+LIBERO_ROOT_VALUE="${LIBERO_ROOT:-}"
+if [[ -z "${LIBERO_ROOT_VALUE}" ]]; then
+    for candidate in "${PROJECT_ROOT}/LIBERO" "/home/ubuntu/libero_pipeline/LIBERO"; do
+        if [[ -d "${candidate}" ]]; then
+            LIBERO_ROOT_VALUE="${candidate}"
+            break
+        fi
+    done
+fi
+
+if [[ -n "${LIBERO_ROOT_VALUE}" && -d "${LIBERO_ROOT_VALUE}" ]]; then
+    export PYTHONPATH="${LIBERO_ROOT_VALUE}${PYTHONPATH:+:${PYTHONPATH}}"
+fi
+
+"${PYTHON_BIN}" - <<'PY'
+import importlib.util
+import os
+import sys
+
+if importlib.util.find_spec("libero") is None:
+    print("ERROR: `libero` is not importable in current Python.", file=sys.stderr)
+    print(f"  python={sys.executable}", file=sys.stderr)
+    print(f"  LIBERO_ROOT={os.environ.get('LIBERO_ROOT', '')}", file=sys.stderr)
+    print("  tip: set LIBERO_ROOT to your LIBERO repo root (directory containing `libero/`).", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    from libero.libero.envs import OffScreenRenderEnv  # noqa: F401
+except Exception as exc:
+    print(f"ERROR: `libero` is visible but OffScreenRenderEnv import failed: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
 
 PYTORCH_CUDA_ALLOC_CONF_DEFAULT="max_split_size_mb:128,garbage_collection_threshold:0.8"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF_OVERRIDE:-${PYTORCH_CUDA_ALLOC_CONF_DEFAULT}}"
@@ -18,6 +64,7 @@ INPUT_REF="${1:-}"
 PATCH_PATH="${PATCH_PATH:-}"
 SOURCE_RUN_DIR="${SOURCE_RUN_DIR:-}"
 SOURCE_EXP_ID="${SOURCE_EXP_ID:-}"
+NO_PATCH_CLEAN="${NO_PATCH_CLEAN:-false}"
 
 if [[ -n "${INPUT_REF}" && -z "${PATCH_PATH}" && -z "${SOURCE_RUN_DIR}" && -z "${SOURCE_EXP_ID}" ]]; then
     if [[ -f "${INPUT_REF}" ]]; then
@@ -38,6 +85,7 @@ EVAL_ROOT="${PROJECT_ROOT}/run/UADA_eval_current_patch_libero_spatial/${EVAL_ID}
 LOG_PATH="${EVAL_ROOT}/eval.log"
 mkdir -p "${EVAL_ROOT}"
 
+if [[ "${NO_PATCH_CLEAN}" != "true" ]]; then
 mapfile -t PATCH_INFO < <(
     PROJECT_ROOT="${PROJECT_ROOT}" \
     PATCH_PATH="${PATCH_PATH}" \
@@ -118,6 +166,13 @@ if [[ "${PROJECTION_SIZE_RAW}" == "auto" ]]; then
 else
     PROJECTION_SIZE_VALUE="${PROJECTION_SIZE_RAW}"
 fi
+ATTACK_MODE_VALUE="${ATTACK_MODE:-projection}"
+else
+RESOLVED_SOURCE_RUN_DIR=""
+RESOLVED_PATCH_PATH=""
+PROJECTION_SIZE_VALUE="${PROJECTION_SIZE:-3,70,70}"
+ATTACK_MODE_VALUE="${ATTACK_MODE:-clean}"
+fi
 
 echo "Eval root: ${EVAL_ROOT}"
 echo "  python_bin=$("${PYTHON_BIN}" - <<'PY'
@@ -127,6 +182,7 @@ PY
 )"
 echo "  source_run_dir=${RESOLVED_SOURCE_RUN_DIR}"
 echo "  patch_path=${RESOLVED_PATCH_PATH}"
+echo "  attack_mode=${ATTACK_MODE_VALUE}"
 echo "  projection_size=${PROJECTION_SIZE_VALUE}"
 echo "  eval_runs=${EVAL_RUNS:-25}"
 echo "  max_env_steps=${MAX_ENV_STEPS:-180}"
@@ -134,6 +190,7 @@ echo "  rollouts=${EVAL_ROOT}/rollouts"
 
 "${PYTHON_BIN}" "${PROJECT_ROOT}/evaluation_tool/eval_current_patch_online_env_simple.py" \
     --patch_path "${RESOLVED_PATCH_PATH}" \
+    --attack_mode "${ATTACK_MODE_VALUE}" \
     --output_dir "${EVAL_ROOT}" \
     --dataset "${DATASET:-libero_spatial}" \
     --task_suite_name "${TASK_SUITE_NAME:-libero_spatial}" \
@@ -152,12 +209,12 @@ echo "  rollouts=${EVAL_ROOT}/rollouts"
     --projection_angle "${PROJECTION_ANGLE:-25}" \
     --projection_fixed_angle "${PROJECTION_FIXED_ANGLE:-false}" \
     --projection_shear "${PROJECTION_SHEAR:-0.15}" \
-    --projection_scale_min "${PROJECTION_SCALE_MIN:-0.8}" \
-    --projection_scale_max "${PROJECTION_SCALE_MAX:-1.2}" \
+    --projection_scale_min "${PROJECTION_SCALE_MIN:-1.0}" \
+    --projection_scale_max "${PROJECTION_SCALE_MAX:-1.0}" \
     --projection_region "${PROJECTION_REGION:-lower_half_fixed}" \
     --projection_lower_start "${PROJECTION_LOWER_START:-0.55}" \
-    --projection_width_ratio "${PROJECTION_WIDTH_RATIO:-0.35}" \
-    --projection_height_ratio "${PROJECTION_HEIGHT_RATIO:-0.35}" \
+    --projection_width_ratio "${PROJECTION_WIDTH_RATIO:-1.20}" \
+    --projection_height_ratio "${PROJECTION_HEIGHT_RATIO:-1.00}" \
     --projection_margin_x "${PROJECTION_MARGIN_X:-0.04}" \
     --projection_keystone "${PROJECTION_KEYSTONE:-0.22}" \
     --projection_keystone_jitter "${PROJECTION_KEYSTONE_JITTER:-0.03}" \
